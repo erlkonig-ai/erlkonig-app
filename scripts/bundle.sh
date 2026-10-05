@@ -48,6 +48,9 @@ fi
 for f in "$release/erlkonig" "$release/erlkonig-node" "$faculties" "$trible"; do
     [ -x "$f" ] || die "missing executable: $f"
 done
+# Record where the tools really come from, not the symlink that named them.
+faculties=$(readlink -f "$faculties")
+trible=$(readlink -f "$trible")
 
 mkdir -p "$out"
 out=$(CDPATH= cd -- "$out" && pwd -P)
