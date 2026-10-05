@@ -7,7 +7,7 @@
 #
 #   --release-dir  where erlkonig and erlkonig-node were built
 #                  (default: $CARGO_TARGET_DIR/release, else target/release)
-#   --out          where Erlkonig.app goes (default: dist/)
+#   --out          where Erlkonig.app goes (default: dist.noindex/)
 #   --tools-dir    where the lean faculties and trible were built (default:
 #                  $ERLKONIG_TOOLS_DIR, else ~/Erlkonig/build/out); a
 #                  SHA256SUMS file there is checked before anything is copied
@@ -27,8 +27,11 @@
 #
 # Inner executables are signed first, then the bundle; the result must pass
 # codesign --verify --deep --strict. Unnotarized: for JP's machines only.
-# The output folder gets a .metadata_never_index file, so Spotlight does not
-# register a second copy of ai.erlkonig.app next to the installed one.
+# Spotlight indexes (and so registers) every app bundle it finds, which puts a
+# second ai.erlkonig.app next to the installed one. A folder whose name ends
+# in .noindex is skipped; a .metadata_never_index file inside an ordinary
+# folder is not honoured (checked with mdfind on macOS 26.4). So the default
+# output folder is dist.noindex, and another name gets a warning.
 set -eu
 
 say() { printf 'bundle: %s\n' "$*"; }
@@ -36,7 +39,7 @@ die() { printf 'bundle: %s\n' "$*" >&2; exit 1; }
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 release=${CARGO_TARGET_DIR:-$repo/target}/release
-out=$repo/dist
+out=$repo/dist.noindex
 tools=${ERLKONIG_TOOLS_DIR:-$HOME/Erlkonig/build/out}
 faculties=${FACULTIES_BIN:-}
 trible=${TRIBLE_BIN:-}
@@ -86,7 +89,10 @@ trible_sha=$(shasum -a 256 "$trible" | cut -d' ' -f1)
 
 mkdir -p "$out"
 out=$(CDPATH= cd -- "$out" && pwd -P)
-touch "$out/.metadata_never_index"
+case $out in
+    *.noindex) ;;
+    *) say "warning: Spotlight will index $out/Erlkonig.app as a second copy of ai.erlkonig.app; an output folder named *.noindex avoids that" ;;
+esac
 app=$out/Erlkonig.app
 tmp=$out/.Erlkonig.app.tmp-$$
 trap 'rm -rf "$tmp"' EXIT

@@ -7,7 +7,7 @@
 set -u
 B=$HOME/Erlkonig/build
 HELPERS=$(CDPATH= cd -- "$(dirname -- "$0")/accept" && pwd -P)
-APP=${1:-$B/dist/Erlkonig.app}
+APP=${1:-$B/dist.noindex/Erlkonig.app}
 M=$APP/Contents/MacOS
 A=$B/accept
 CODEX=/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex
