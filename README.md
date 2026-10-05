@@ -12,6 +12,9 @@ and installs thin plugins into ChatGPT and Claude.
   (manifests, `.mcp.json`, skill; no binary).
 - `macos/`: `Info.plist` and the node's LaunchAgent plist.
 - `scripts/bundle.sh`: assembles and ad-hoc signs `Erlkonig.app`.
+- `scripts/check-node.sh`: read-only report of the node on this Mac (LaunchAgent,
+  `node.status`, processes, recent log lines), for checking over ssh.
+- `TESTING-for-JP.md`: the GUI steps for milestone 1.
 
 The app links neither triblespace nor faculties; it runs the bundled `trible`
 and `faculties` executables. See `erlkonig-node help` for the node's commands
