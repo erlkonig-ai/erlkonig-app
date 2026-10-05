@@ -63,7 +63,7 @@ pub struct PeerStatus {
 pub fn parse_reconciled(line: &str) -> Option<(String, u64)> {
     let rest = &line[line.find("reconciled with peer ")? + "reconciled with peer ".len()..];
     let (peer, rest) = rest.split_once(':')?;
-    let n = rest.trim_start().split_whitespace().next()?.parse().ok()?;
+    let n = rest.split_whitespace().next()?.parse().ok()?;
     let peer = peer.trim();
     (!peer.is_empty() && !peer.contains(char::is_whitespace)).then(|| (peer.to_string(), n))
 }

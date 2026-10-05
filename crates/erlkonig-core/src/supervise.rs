@@ -117,13 +117,8 @@ fn pump(
             if let Ok(mut log) = log.lock() {
                 let _ = log.line(&format!("{} {tag} {line}", rfc3339(now)));
             }
-            if let Some((peer, collections)) = parse_reconciled(&line) {
-                if let Ok(mut peers) = peers.lock() {
-                    peers.insert(
-                        peer.clone(),
-                        PeerStatus { peer, collections, at: now, line: line.clone() },
-                    );
-                }
+            if let (Some((peer, collections)), Ok(mut peers)) = (parse_reconciled(&line), peers.lock()) {
+                peers.insert(peer.clone(), PeerStatus { peer, collections, at: now, line: line.clone() });
             }
             if let Ok(mut last) = last_line.lock() {
                 *last = Some(line.chars().take(400).collect());

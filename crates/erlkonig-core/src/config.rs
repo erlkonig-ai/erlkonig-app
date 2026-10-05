@@ -105,10 +105,8 @@ impl NodeConfig {
             }
         }
         for (field, path) in [("pile", &self.pile), ("key", &self.key)] {
-            if let Some(p) = path {
-                if p.as_os_str().is_empty() {
-                    return Err(format!("{field} is empty"));
-                }
+            if path.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
+                return Err(format!("{field} is empty"));
             }
         }
         Ok(())

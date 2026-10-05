@@ -92,10 +92,10 @@ impl App {
             );
             return;
         }
-        if self.tool("erlkonig-node").is_file() {
-            if let Err(e) = ensure_symlink(&self.layout.bin_link(), &self.exe_dir) {
-                self.setup_problem = Some(format!("Cannot link the tools: {e}"));
-            }
+        if self.tool("erlkonig-node").is_file()
+            && let Err(e) = ensure_symlink(&self.layout.bin_link(), &self.exe_dir)
+        {
+            self.setup_problem = Some(format!("Cannot link the tools: {e}"));
         }
         let marker = self.layout.dir.join(ASKED_MARKER);
         if !marker.exists() && agent_status() != SMAppServiceStatus::Enabled {
@@ -139,8 +139,7 @@ You can change this later with Open at login.",
             "Move Erlkönig to Applications to finish setup".to_string()
         } else if let Some(p) = &self.setup_problem {
             p.clone()
-        } else if let Some((msg, until)) = self.flash.as_ref().filter(|(_, until)| Instant::now() < *until) {
-            let _ = until;
+        } else if let Some((msg, _)) = self.flash.as_ref().filter(|(_, until)| Instant::now() < *until) {
             msg.clone()
         } else {
             let agent = agent_status();
@@ -161,10 +160,8 @@ You can change this later with Open at login.",
     }
 
     fn node_id(&self) -> Result<String, String> {
-        if let Ok(s) = NodeStatus::read(&self.layout.status()) {
-            if let Some(id) = s.node_id {
-                return Ok(id);
-            }
+        if let Some(id) = NodeStatus::read(&self.layout.status()).ok().and_then(|s| s.node_id) {
+            return Ok(id);
         }
         let r = NodeConfig::load(&self.layout.config())?.resolve(&self.layout.dir);
         let trible = self.tool("trible");
