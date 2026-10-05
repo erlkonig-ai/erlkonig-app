@@ -93,6 +93,10 @@ fn describe_exit(status: ExitStatus) -> String {
     }
 }
 
+/// The longest line a child's output is cut into, so a child that never
+/// prints a newline cannot grow the node's memory.
+pub const MAX_LINE: usize = 64 * 1024;
+
 fn pump(
     stream: impl Read + Send + 'static,
     tag: &'static str,
@@ -105,7 +109,7 @@ fn pump(
         let mut buf = Vec::new();
         loop {
             buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
+            match (&mut reader).take(MAX_LINE as u64).read_until(b'\n', &mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
@@ -186,8 +190,11 @@ impl Supervisor {
     }
 
     /// Reaps exited children and starts the ones whose backoff has elapsed.
-    pub fn tick(&mut self) {
+    /// Returns true when it started a child, so the caller can record the new
+    /// pid in the status file at once rather than at its next periodic write.
+    pub fn tick(&mut self) -> bool {
         let now = Instant::now();
+        let mut started = false;
         for i in 0..self.slots.len() {
             let backoff = self.backoff;
             let slot = &mut self.slots[i];
@@ -227,12 +234,13 @@ impl Supervisor {
                 }
             }
             if slot.child.is_none() && now >= slot.next_start {
-                self.spawn(i);
+                started |= self.spawn(i);
             }
         }
+        started
     }
 
-    fn spawn(&mut self, i: usize) {
+    fn spawn(&mut self, i: usize) -> bool {
         let peers = self.peers.clone();
         let backoff = self.backoff;
         let slot = &mut self.slots[i];
@@ -271,11 +279,13 @@ impl Supervisor {
                 }
                 slot.started = Some((Instant::now(), now_unix()));
                 slot.child = Some(child);
+                true
             }
             Err(e) => {
                 slot.failures += 1;
                 slot.last_error = Some(format!("cannot start {}: {e}", slot.spec.program.display()));
                 slot.next_start = Instant::now() + backoff.delay(slot.failures);
+                false
             }
         }
     }
@@ -338,14 +348,14 @@ fn stop_slot(slot: &mut Slot, grace: Duration) {
     }
 }
 
-/// Stops children a crashed predecessor left running. Only pids recorded in
-/// its status file are touched, and only when the kernel says that pid still
-/// runs the very program that was recorded.
+/// Stops children a crashed predecessor left running. The caller holds the
+/// node lock, so the predecessor is dead whatever its recorded pid now
+/// runs (a live pid there is a reused one). Only pids recorded in its status
+/// file are touched, and only when the kernel says that pid is an orphan
+/// (parent 1: its node is gone) running the very program that was recorded,
+/// so a reused pid, or a live child of another node, is left alone.
 pub fn reap_stale(previous: &NodeStatus, grace: Duration) -> Vec<String> {
     let mut notes = Vec::new();
-    if procs::alive(previous.pid) && previous.pid != std::process::id() {
-        return notes; // its owner is alive; not ours to touch
-    }
     for c in &previous.children {
         let Some(pid) = c.pid else { continue };
         if pid == std::process::id() || !procs::alive(pid) {
@@ -354,6 +364,10 @@ pub fn reap_stale(previous: &NodeStatus, grace: Duration) -> Vec<String> {
         let running: Option<PathBuf> = procs::exe_path(pid).and_then(|p| fs::canonicalize(p).ok());
         let recorded = fs::canonicalize(&c.program).unwrap_or_else(|_| c.program.clone());
         if running.as_deref() != Some(recorded.as_path()) {
+            continue;
+        }
+        if procs::parent_pid(pid) != Some(1) {
+            notes.push(format!("left {} pid {pid} alone: it runs {} but is not an orphan", c.name, recorded.display()));
             continue;
         }
         procs::signal_group(pid, libc::SIGTERM);
@@ -463,6 +477,67 @@ mod tests {
         sup.stop_all();
         assert!(t1.elapsed() < Duration::from_secs(2), "sleep should die on SIGTERM");
         assert!(!procs::alive(pid));
+    }
+
+    #[test]
+    fn a_line_without_a_newline_is_cut_into_bounded_pieces() {
+        let d = scratch("long");
+        let mut sup = Supervisor::new(&d, Backoff::default());
+        // 200 KiB with no newline, then exit.
+        sup.set_specs(vec![sh("long", "head -c 204800 /dev/zero | tr '\\0' x; exit 0")]);
+        assert!(sup.tick(), "tick reports the start");
+        let t0 = Instant::now();
+        while sup.statuses()[0].last_exit.is_none() && t0.elapsed() < Duration::from_secs(5) {
+            sup.tick();
+            thread::sleep(Duration::from_millis(20));
+        }
+        sup.stop_all();
+        thread::sleep(Duration::from_millis(200));
+        let log = fs::read_to_string(d.join("long.log")).unwrap();
+        let pieces: Vec<&str> = log.lines().filter(|l| l.contains(" out x")).collect();
+        assert_eq!(pieces.len(), 4, "200 KiB in 64 KiB pieces");
+        assert!(pieces.iter().all(|l| l.len() <= MAX_LINE + 40));
+        assert_eq!(pieces.iter().map(|l| l.matches('x').count()).sum::<usize>(), 204_800);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reap_stops_an_orphan_even_when_the_recorded_owner_pid_is_alive() {
+        use crate::status::ChildStatus;
+        // A live process standing in for a reused owner pid.
+        let mut owner = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        // An orphan: its shell exits at once, so launchd (pid 1) adopts it.
+        let out = Command::new("/bin/sh").args(["-c", "/bin/sleep 30 >/dev/null 2>&1 & echo $!"]).output().unwrap();
+        let orphan: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        // A live child of this process: same program, not an orphan.
+        let mut ours = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let t0 = Instant::now();
+        // The shell has exited, but its forked child may not have exec'd sleep yet.
+        let ready = || procs::parent_pid(orphan) == Some(1) && procs::exe_path(orphan).as_deref() == Some(Path::new("/bin/sleep"));
+        while !ready() && t0.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let child = |name: &str, pid: u32| ChildStatus {
+            name: name.into(),
+            pid: Some(pid),
+            program: "/bin/sleep".into(),
+            ..Default::default()
+        };
+        let previous = NodeStatus {
+            pid: owner.id(),
+            children: vec![child("maintain", orphan), child("sync", ours.id())],
+            ..Default::default()
+        };
+        let notes = reap_stale(&previous, Duration::from_secs(3));
+        assert!(notes.iter().any(|n| n.contains(&format!("stopped stale maintain child pid {orphan}"))), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("is not an orphan")), "{notes:?}");
+        assert!(!procs::alive(orphan));
+        assert!(ours.try_wait().unwrap().is_none(), "a live child of a live parent is left alone");
+        assert!(owner.try_wait().unwrap().is_none(), "the recorded owner is never touched");
+        let _ = ours.kill();
+        let _ = owner.kill();
+        let _ = ours.wait();
+        let _ = owner.wait();
     }
 
     #[test]

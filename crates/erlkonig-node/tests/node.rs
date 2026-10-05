@@ -71,11 +71,16 @@ impl Fixture {
         Fixture { root, bin, data }
     }
 
+    /// `erlkonig-node <args> --bin-dir <fake tools>`, with ERLKONIG_DATA_DIR
+    /// naming the fixture's D, and a planted ERLKONIG_BIN_DIR that must be
+    /// ignored (if it were honoured, nothing would start).
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(NODE);
         c.args(args)
+            .arg("--bin-dir")
+            .arg(&self.bin)
             .env("ERLKONIG_DATA_DIR", &self.data)
-            .env("ERLKONIG_BIN_DIR", &self.bin)
+            .env("ERLKONIG_BIN_DIR", self.root.join("planted-bin"))
             .env("TRIBLESPACE_KEY", "/must/not/leak")
             .env("PERSONA", "must-not-leak")
             .stdin(Stdio::null())
@@ -86,6 +91,10 @@ impl Fixture {
 
     fn start(&self) -> Child {
         self.cmd(&["run"]).spawn().unwrap()
+    }
+
+    fn log(&self) -> String {
+        fs::read_to_string(self.data.join("logs/node.log")).unwrap_or_default()
     }
 
     fn status(&self) -> Option<serde_json::Value> {
@@ -255,8 +264,121 @@ fn mcp_execs_faculties_with_a_scrubbed_environment() {
 fn mcp_without_faculties_fails_clearly() {
     let fx = Fixture::new("mcp-missing");
     fs::remove_file(fx.bin.join("faculties")).unwrap();
-    let out = fx.cmd(&["mcp"]).output().unwrap();
+    let out = fx.cmd(&["mcp", "--data-dir", fx.data.to_str().unwrap()]).output().unwrap();
     assert!(!out.status.success());
     assert!(out.stdout.is_empty(), "stdout belongs to MCP");
     assert!(String::from_utf8_lossy(&out.stderr).contains("not installed correctly"));
+    assert!(!fx.data.exists(), "a broken install creates no data folder");
+}
+
+#[test]
+fn mcp_ignores_erlkonig_bin_dir() {
+    // The plugin's launcher inherits the host app's environment: a leftover
+    // ERLKONIG_BIN_DIR must not make it run tools from another folder.
+    let fx = Fixture::new("mcp-bin-env");
+    let out = Command::new(NODE)
+        .args(["mcp", "--data-dir", fx.data.to_str().unwrap()])
+        .env("ERLKONIG_BIN_DIR", &fx.bin)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty(), "the fake faculties in ERLKONIG_BIN_DIR ran: {out:?}");
+    let own = Path::new(NODE).parent().unwrap().join("faculties");
+    assert!(stderr.contains(&format!("{} is missing", own.display())), "{stderr}");
+}
+
+#[test]
+fn a_failed_prepare_is_retried_without_an_edit() {
+    // A pile on a disk that mounts after login: the node must pick it up by
+    // itself, not only when node.toml changes.
+    let fx = Fixture::new("retry");
+    fs::create_dir_all(&fx.data).unwrap();
+    let named = fx.root.join("late.pile");
+    fs::write(fx.data.join("node.toml"), format!("pile = \"{}\"\nmaintain_targets = [\"{HANDLE}\"]\n", named.display())).unwrap();
+    let node = fx.cmd(&["run", "--retry-secs", "1"]).spawn().unwrap();
+    wait_for("problem", Duration::from_secs(10), || fx.status().filter(|s| s["problem"].is_string()));
+    sleep(Duration::from_millis(1500));
+    assert!(!named.exists(), "retrying never creates a named pile");
+    fs::write(&named, b"").unwrap();
+    let s = wait_for("maintain running after the pile appeared", Duration::from_secs(10), || {
+        fx.status().filter(|s| {
+            s["problem"].is_null() && s["children"].as_array().is_some_and(|c| c.iter().any(|c| c["state"] == "running"))
+        })
+    });
+    assert_eq!(s["children"][0]["name"], "maintain");
+    assert!(sigterm_and_wait(node).success());
+    let log = fx.log();
+    assert_eq!(log.matches("does not exist").count(), 1, "the same problem is logged once: {log}");
+    assert!(log.contains("node.toml applied"), "{log}");
+}
+
+#[test]
+fn a_launchd_node_waits_for_the_lock_and_takes_over() {
+    let fx = Fixture::new("launchd");
+    let first = fx.start();
+    let first_pid = first.id();
+    wait_for("first node running", Duration::from_secs(10), || {
+        fx.status().filter(|s| s["pid"] == first_pid && s["state"] == "running")
+    });
+    // --data-dir, because --launchd otherwise ignores ERLKONIG_DATA_DIR and
+    // would use the real default folder.
+    let mut waiting = fx.cmd(&["run", "--launchd", "--data-dir", fx.data.to_str().unwrap()]).spawn().unwrap();
+    let waiting_pid = waiting.id();
+    sleep(Duration::from_secs(3));
+    assert!(waiting.try_wait().unwrap().is_none(), "a launchd node must wait, not exit (launchd would restart it)");
+    assert_eq!(fx.status().unwrap()["pid"], first_pid);
+    assert!(fx.log().contains(&format!("waiting for it (pid {waiting_pid})")), "{}", fx.log());
+
+    assert!(sigterm_and_wait(first).success());
+    wait_for("the waiting node took over", Duration::from_secs(10), || {
+        fx.status().filter(|s| s["pid"] == waiting_pid && s["state"] == "running")
+    });
+    assert!(sigterm_and_wait(waiting).success());
+
+    // SIGTERM also stops a node that is still waiting.
+    let holder = fx.start();
+    let holder_pid = holder.id();
+    wait_for("holder running", Duration::from_secs(10), || fx.status().filter(|s| s["pid"] == holder_pid));
+    let waiter = fx.cmd(&["run", "--launchd", "--data-dir", fx.data.to_str().unwrap()]).spawn().unwrap();
+    sleep(Duration::from_secs(2));
+    let t0 = Instant::now();
+    assert!(sigterm_and_wait(waiter).success());
+    assert!(t0.elapsed() < Duration::from_secs(3));
+    assert!(sigterm_and_wait(holder).success());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_orphaned_child_is_stopped_even_when_the_recorded_owner_pid_is_reused() {
+    let fx = Fixture::new("reap");
+    fs::create_dir_all(&fx.data).unwrap();
+    // The dead node's pid, now reused by some unrelated live process.
+    let mut owner = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    // Its child, orphaned when it died: launchd (pid 1) adopted it.
+    let out = Command::new("/bin/sh").args(["-c", "/bin/sleep 60 >/dev/null 2>&1 & echo $!"]).output().unwrap();
+    let orphan: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+    // The shell has exited, but its forked child may not have exec'd sleep yet.
+    wait_for("orphan runs /bin/sleep", Duration::from_secs(5), || {
+        let ps = Command::new("/bin/ps").args(["-o", "ppid=,comm=", "-p", &orphan.to_string()]).output().ok()?;
+        let line = String::from_utf8_lossy(&ps.stdout).split_whitespace().collect::<Vec<_>>().join(" ");
+        (line == "1 /bin/sleep").then_some(())
+    });
+    let status = serde_json::json!({
+        "format": 1, "pid": owner.id(), "state": "running", "started_at": 0, "updated_at": 0,
+        "updated": "", "data_dir": fx.data, "pile": null, "key": null, "node_id": null, "problem": null,
+        "configured_peers": 0, "sync_collections": 0, "maintain_targets": 1, "peers": [],
+        "children": [{ "name": "maintain", "state": "running", "pid": orphan, "program": "/bin/sleep",
+                       "running_since": 0, "restarts": 0, "last_exit": null, "last_error": null,
+                       "next_start_in_secs": null, "log": "" }]
+    });
+    fs::write(fx.data.join("node.status"), serde_json::to_vec(&status).unwrap()).unwrap();
+    let node = fx.start();
+    wait_for("orphan stopped", Duration::from_secs(10), || (unsafe { libc_kill(orphan, 0) } != 0).then_some(()));
+    assert!(fx.log().contains(&format!("stopped stale maintain child pid {orphan}")), "{}", fx.log());
+    assert!(owner.try_wait().unwrap().is_none(), "the process now holding the old owner pid is not touched");
+    assert!(sigterm_and_wait(node).success());
+    let _ = owner.kill();
+    let _ = owner.wait();
 }

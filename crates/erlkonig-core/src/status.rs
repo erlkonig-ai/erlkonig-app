@@ -28,6 +28,10 @@ pub struct NodeStatus {
     pub node_id: Option<String>,
     /// Why the node cannot do what node.toml asks, if it cannot.
     pub problem: Option<String>,
+    /// What may still go wrong with what node.toml asks (a pile in a folder
+    /// macOS protects, say).
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub configured_peers: usize,
     pub sync_collections: usize,
     pub maintain_targets: usize,

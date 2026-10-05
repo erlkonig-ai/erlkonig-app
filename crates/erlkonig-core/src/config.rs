@@ -126,6 +126,33 @@ impl NodeConfig {
     }
 }
 
+/// Folders below `$HOME` that macOS guards with privacy prompts (TCC). A
+/// LaunchAgent is subject to them too, so a pile or key there may be refused
+/// or prompt for access, and with an ad hoc signature prompt again after every
+/// rebuild.
+pub const PROTECTED_FOLDERS: &[&str] = &["Desktop", "Documents", "Downloads"];
+
+impl Resolved {
+    /// Warnings for a pile or key inside a folder macOS protects. They are
+    /// warnings, not errors: a colony pile may well live there, and the
+    /// person can grant the access.
+    pub fn protected_folder_warnings(&self, home: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        for (what, path) in [("pile", &self.pile), ("key", &self.key)] {
+            for folder in PROTECTED_FOLDERS {
+                if path.starts_with(home.join(folder)) {
+                    out.push(format!(
+                        "the {what} {} is inside {folder}, which macOS protects: the background node may be \
+refused access or macOS may ask for permission (again after every rebuild while the app is signed ad hoc)",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +196,22 @@ mod tests {
     fn unknown_fields_are_refused() {
         let e = NodeConfig::parse("peer = []").unwrap_err();
         assert!(e.contains("unknown field"), "{e}");
+    }
+
+    #[test]
+    fn protected_folders_are_warned_about() {
+        let home = Path::new("/Users/jp");
+        let named = NodeConfig::parse("pile = \"/Users/jp/Desktop/chatbot/liora/self.pile\"\nkey = \"/Users/jp/k\"")
+            .unwrap()
+            .resolve(Path::new("/Users/jp/Library/Application Support/Erlkonig"));
+        let w = named.protected_folder_warnings(home);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("pile") && w[0].contains("Desktop"), "{w:?}");
+        let default = NodeConfig::default().resolve(Path::new("/Users/jp/Library/Application Support/Erlkonig"));
+        assert!(default.protected_folder_warnings(home).is_empty());
+        // A sibling whose name merely starts with "Desktop" is not inside it.
+        let sibling = NodeConfig::parse("pile = \"/Users/jp/Desktop2/p\"").unwrap().resolve(Path::new("/d"));
+        assert!(sibling.protected_folder_warnings(home).is_empty());
     }
 
     #[test]

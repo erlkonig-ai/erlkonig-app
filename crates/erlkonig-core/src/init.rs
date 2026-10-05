@@ -11,7 +11,20 @@ use std::process::{Command, Stdio};
 /// Makes sure `pile` exists. With `create` false the pile must already exist.
 /// Returns true when this call created it. A 0-byte file is a valid pile, and
 /// opening for append never truncates, so a concurrent creator is harmless.
+///
+/// With `create` true (Erlkonig's own default pile) a symlink at `pile` is
+/// refused, dangling or not: the default must never reach another pile, and
+/// creating through a dangling link would make its target. Creation also uses
+/// `O_NOFOLLOW`, so a link that appears in between is not followed either. A
+/// pile that node.toml names (`create` false) may be a link.
 pub fn ensure_pile(pile: &Path, create: bool) -> Result<bool, String> {
+    if create && fs::symlink_metadata(pile).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!(
+            "{} is a symlink; Erlkonig does not follow a link at its own default pile. \
+To use another pile, name it in node.toml.",
+            pile.display()
+        ));
+    }
     match fs::metadata(pile) {
         Ok(meta) if meta.is_file() => return Ok(false),
         Ok(_) => return Err(format!("{} exists but is not a file", pile.display())),
@@ -28,6 +41,7 @@ pub fn ensure_pile(pile: &Path, create: bool) -> Result<bool, String> {
         .append(true)
         .create(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(pile)
         .map_err(|e| format!("cannot create {}: {e}", pile.display()))?;
     Ok(true)
@@ -126,6 +140,22 @@ mod tests {
         let p = d.join("colony.pile");
         assert!(ensure_pile(&p, false).is_err());
         assert!(!p.exists());
+    }
+
+    #[test]
+    fn a_symlink_at_the_default_pile_is_refused_and_never_followed() {
+        let d = scratch("link");
+        let target = d.join("elsewhere.pile");
+        let p = d.join("self.pile");
+        std::os::unix::fs::symlink(&target, &p).unwrap();
+        let e = ensure_pile(&p, true).unwrap_err();
+        assert!(e.contains("symlink"), "{e}");
+        assert!(!target.exists(), "a dangling link's target must not be created");
+        fs::write(&target, b"colony").unwrap();
+        assert!(ensure_pile(&p, true).is_err(), "nor may the default reach an existing pile");
+        assert_eq!(fs::read(&target).unwrap(), b"colony");
+        // A pile that node.toml names may be a link to an existing file.
+        assert!(!ensure_pile(&p, false).unwrap());
     }
 
     #[test]

@@ -7,10 +7,11 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-/// Overrides the data directory (tests, or a second node on one account).
+/// Overrides the data directory for the node's own commands when run by hand
+/// (tests, or a second node on one account). The menu app, the plugin's
+/// `mcp` launcher and the LaunchAgent ignore it: they must all agree on the
+/// one folder that `.mcp.json` names.
 pub const DATA_DIR_ENV: &str = "ERLKONIG_DATA_DIR";
-/// Overrides the directory holding `trible` and `faculties` (tests).
-pub const BIN_DIR_ENV: &str = "ERLKONIG_BIN_DIR";
 
 /// The per-OS default data directory below `home`.
 pub fn default_data_dir_for(home: &Path) -> PathBuf {
@@ -29,6 +30,11 @@ pub fn data_dir() -> io::Result<PathBuf> {
     if let Some(dir) = env::var_os(DATA_DIR_ENV).filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(dir));
     }
+    default_data_dir()
+}
+
+/// The per-OS default below `$HOME`, whatever `ERLKONIG_DATA_DIR` says.
+pub fn default_data_dir() -> io::Result<PathBuf> {
     let home = env::var_os("HOME")
         .filter(|v| !v.is_empty())
         .ok_or_else(|| io::Error::other("HOME is not set, so there is no data directory"))?;
@@ -74,33 +80,56 @@ impl Layout {
     }
 }
 
-/// Creates `dir` (and missing parents) and makes `dir` itself mode 0700.
+/// Files whose presence marks a folder as an Erlkonig data or log folder.
+const OUR_FILES: &[&str] = &["node.toml", "node.lock", "node.status", "self.pile", "self.key", "node.log"];
+
+/// True when `dir` is empty or holds one of Erlkonig's own files.
+fn looks_like_ours(dir: &Path) -> io::Result<bool> {
+    let mut empty = true;
+    for entry in fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        if OUR_FILES.iter().any(|f| name == *f) {
+            return Ok(true);
+        }
+        empty = false;
+    }
+    Ok(empty)
+}
+
+/// Creates `dir` (and missing parents, all 0700) and makes `dir` itself mode
+/// 0700. An existing folder that others can read is tightened only when it
+/// is empty or already holds Erlkonig's files; any other folder (a mistyped
+/// `--data-dir ~`, say) is refused rather than having its permissions changed.
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    let existed = fs::symlink_metadata(dir).is_ok();
     fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     let meta = fs::metadata(dir)?;
     if !meta.is_dir() {
         return Err(io::Error::other(format!("{} is not a directory", dir.display())));
     }
-    if meta.permissions().mode() & 0o777 != 0o700 {
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    if meta.permissions().mode() & 0o777 == 0o700 {
+        return Ok(());
     }
-    Ok(())
+    if existed && !looks_like_ours(dir)? {
+        return Err(io::Error::other(format!(
+            "{} already exists, is not an Erlkonig folder and is not private (mode {:o}); \
+Erlkonig leaves its permissions alone. Use a new or empty folder.",
+            dir.display(),
+            meta.permissions().mode() & 0o777
+        )));
+    }
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
 }
 
 /// The directory holding the bundled `trible` and `faculties`: the running
-/// executable's own directory, or `ERLKONIG_BIN_DIR`.
+/// executable's own directory. (Tests name another with `--bin-dir`; there is
+/// deliberately no environment override, because the plugin's MCP launcher
+/// inherits the host app's environment.)
 pub fn tool_dir() -> io::Result<PathBuf> {
-    if let Some(dir) = env::var_os(BIN_DIR_ENV).filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(dir));
-    }
     let exe = env::current_exe()?;
     exe.parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| io::Error::other("the running executable has no parent directory"))
-}
-
-pub fn tool(name: &str) -> io::Result<PathBuf> {
-    Ok(tool_dir()?.join(name))
 }
 
 /// The plugin template inside the bundle: `Contents/MacOS/../Resources/plugin`.
@@ -177,6 +206,22 @@ mod tests {
         ensure_private_dir(&d).unwrap();
         assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
         fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&d).unwrap();
+        assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn a_foreign_folder_is_refused_not_chmodded() {
+        let root = scratch("foreign");
+        let d = root.join("shared");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("notes.txt"), "x").unwrap();
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+        let e = ensure_private_dir(&d).unwrap_err();
+        assert!(e.to_string().contains("leaves its permissions alone"), "{e}");
+        assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o755);
+        // The same folder once it holds a node.toml is ours, and is tightened.
+        fs::write(d.join("node.toml"), "").unwrap();
         ensure_private_dir(&d).unwrap();
         assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
     }
