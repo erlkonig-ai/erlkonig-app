@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "faculties": {
+      "type": "stdio",
+      "command": "/bin/sh",
+      "args": [
+        "-c",
+        "case $(uname -s) in Darwin) d=\"$HOME/Library/Application Support/Erlkonig\" ;; Linux) d=$XDG_DATA_HOME; [ -n \"$d\" ] || d=\"$HOME/.local/share\"; d=\"$d/erlkonig\" ;; *) d= ;; esac; b=\"$d/bin/erlkonig-node\"; if [ -z \"$d\" ] || [ ! -x \"$b\" ]; then echo \"Erlkonig is not installed on this $(uname -s) computer. Install the Erlkonig app and open it once.\" >&2; exit 1; fi; exec \"$b\" mcp --data-dir \"$d\""
+      ]
+    }
+  }
+}

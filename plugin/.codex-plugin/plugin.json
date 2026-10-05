@@ -1,0 +1,20 @@
+{
+  "name": "erlkonig",
+  "version": "0.1.0",
+  "description": "Goals, wiki, journal, people, files and messages in the Erlkönig pile on this computer. Needs the Erlkönig app, which owns the pile and keeps it in sync.",
+  "keywords": ["memory", "wiki", "goals", "local-first", "triblespace"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Erlkönig",
+    "shortDescription": "Your goals, wiki and journal in the Erlkönig pile on this computer",
+    "longDescription": "Starts the faculties tools of the Erlkönig app on this computer. Everything is kept in one append-only pile that the app owns and, when you set it up, syncs with your other computers and your team.",
+    "developerName": "Erlkönig",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": [
+      "Show my open goals.",
+      "Write what we just decided into the wiki."
+    ]
+  }
+}
