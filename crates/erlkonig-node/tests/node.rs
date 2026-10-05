@@ -375,8 +375,10 @@ fn an_orphaned_child_is_stopped_even_when_the_recorded_owner_pid_is_reused() {
     });
     fs::write(fx.data.join("node.status"), serde_json::to_vec(&status).unwrap()).unwrap();
     let node = fx.start();
-    wait_for("orphan stopped", Duration::from_secs(10), || (unsafe { libc_kill(orphan, 0) } != 0).then_some(()));
-    assert!(fx.log().contains(&format!("stopped stale maintain child pid {orphan}")), "{}", fx.log());
+    // The node logs the note after the orphan is gone; wait for the note.
+    let line = format!("stopped stale maintain child pid {orphan}");
+    wait_for("the stale child note", Duration::from_secs(10), || fx.log().contains(&line).then_some(()));
+    assert_ne!(unsafe { libc_kill(orphan, 0) }, 0, "orphan {orphan} still runs");
     assert!(owner.try_wait().unwrap().is_none(), "the process now holding the old owner pid is not touched");
     assert!(sigterm_and_wait(node).success());
     let _ = owner.kill();
