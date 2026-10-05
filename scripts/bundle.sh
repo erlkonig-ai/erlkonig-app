@@ -3,6 +3,7 @@
 #
 # Usage: scripts/bundle.sh [--release-dir DIR] [--out DIR] [--tools-dir DIR]
 #                          [--faculties PATH] [--trible PATH] [--no-strip]
+#                          [--sign IDENTITY]
 #
 #   --release-dir  where erlkonig and erlkonig-node were built
 #                  (default: $CARGO_TARGET_DIR/release, else target/release)
@@ -15,12 +16,19 @@
 #   --trible       a trible binary instead (default: $TRIBLE_BIN, else
 #                  <tools-dir>/trible)
 #   --no-strip     bundle faculties and trible unstripped
+#   --sign         codesign identity (default: $ERLKONIG_SIGN_IDENTITY, else
+#                  "-", ad hoc). Ad hoc builds get a new code identity on
+#                  every rebuild, so macOS treats each as a new app (Login
+#                  Items approval, privacy prompts); one stable certificate
+#                  keeps that identity across rebuilds.
 #
 # There is no fallback to whatever faculties or trible is installed: the
 # bundle carries the tools you name, or the lean build lane's, or nothing.
 #
 # Inner executables are signed first, then the bundle; the result must pass
 # codesign --verify --deep --strict. Unnotarized: for JP's machines only.
+# The output folder gets a .metadata_never_index file, so Spotlight does not
+# register a second copy of ai.erlkonig.app next to the installed one.
 set -eu
 
 say() { printf 'bundle: %s\n' "$*"; }
@@ -33,6 +41,7 @@ tools=${ERLKONIG_TOOLS_DIR:-$HOME/Erlkonig/build/out}
 faculties=${FACULTIES_BIN:-}
 trible=${TRIBLE_BIN:-}
 strip_tools=1
+identity=${ERLKONIG_SIGN_IDENTITY:--}
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -42,7 +51,8 @@ while [ $# -gt 0 ]; do
         --faculties) [ $# -ge 2 ] || die "$1 needs a value"; faculties=$2; shift 2 ;;
         --trible) [ $# -ge 2 ] || die "$1 needs a value"; trible=$2; shift 2 ;;
         --no-strip) strip_tools=0; shift ;;
-        -h | --help) sed -n '2,26p' "$0"; exit 0 ;;
+        --sign) [ $# -ge 2 ] || die "$1 needs a value"; identity=$2; shift 2 ;;
+        -h | --help) sed -n '2,34p' "$0"; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -59,8 +69,12 @@ trible=$(readlink -f "$trible")
 # The build lane's SHA256SUMS vouches for its outputs; check each tool that
 # comes from that directory against it, so a half-copied binary never ships.
 sums=$(readlink -f "$tools" 2>/dev/null || true)/SHA256SUMS
+[ -f "$sums" ] || say "no $sums: the tools are bundled without a checksum check"
 for f in "$faculties" "$trible"; do
-    [ -f "$sums" ] && [ "$(dirname "$f")/SHA256SUMS" = "$sums" ] || continue
+    if [ ! -f "$sums" ] || [ "$(dirname "$f")/SHA256SUMS" != "$sums" ]; then
+        [ ! -f "$sums" ] || say "${f##*/} does not come from $(dirname "$sums"): not checked against its SHA256SUMS"
+        continue
+    fi
     want=$(awk -v n="${f##*/}" '$2 == n || $2 == "*" n { print $1 }' "$sums")
     [ -n "$want" ] || die "$sums has no line for ${f##*/}"
     have=$(shasum -a 256 "$f" | cut -d' ' -f1)
@@ -72,6 +86,7 @@ trible_sha=$(shasum -a 256 "$trible" | cut -d' ' -f1)
 
 mkdir -p "$out"
 out=$(CDPATH= cd -- "$out" && pwd -P)
+touch "$out/.metadata_never_index"
 app=$out/Erlkonig.app
 tmp=$out/.Erlkonig.app.tmp-$$
 trap 'rm -rf "$tmp"' EXIT
@@ -97,7 +112,10 @@ cp -R "$repo/plugin" "$tmp/Contents/Resources/plugin"
 
 {
     printf 'built %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf 'app %s\n' "$(git -C "$repo" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)$(git -C "$repo" diff --quiet 2>/dev/null || echo -dirty)"
+    # Staged and untracked changes count as dirty too, not only unstaged ones.
+    dirty=$(git -C "$repo" status --porcelain 2>/dev/null | head -1)
+    printf 'app %s%s\n' "$(git -C "$repo" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)" "${dirty:+-dirty}"
+    printf 'signed %s\n' "$([ "$identity" = - ] && echo 'ad hoc' || echo "$identity")"
     printf 'faculties source %s\n' "$faculties"
     printf 'faculties source-sha256 %s\n' "$faculties_sha"
     printf 'faculties version %s\n' "$("$tmp/Contents/MacOS/faculties" --version 2>&1 | head -1)"
@@ -111,9 +129,9 @@ cp -R "$repo/plugin" "$tmp/Contents/Resources/plugin"
 
 xattr -cr "$tmp"
 for f in erlkonig-node faculties trible; do
-    codesign --force --sign - --timestamp=none --identifier "ai.erlkonig.$f" "$tmp/Contents/MacOS/$f"
+    codesign --force --sign "$identity" --timestamp=none --identifier "ai.erlkonig.$f" "$tmp/Contents/MacOS/$f"
 done
-codesign --force --sign - --timestamp=none "$tmp"
+codesign --force --sign "$identity" --timestamp=none "$tmp"
 codesign --verify --deep --strict --verbose=2 "$tmp"
 
 rm -rf "$app"

@@ -14,6 +14,9 @@ and installs thin plugins into ChatGPT and Claude.
 - `scripts/bundle.sh`: assembles and ad-hoc signs `Erlkonig.app`.
 - `scripts/check-node.sh`: read-only report of the node on this Mac (LaunchAgent,
   `node.status`, processes, recent log lines), for checking over ssh.
+- `scripts/accept.sh`: headless acceptance tests against an assembled bundle
+  (scratch data folders, scratch `HOME`/`CODEX_HOME`/`CLAUDE_CONFIG_DIR`; the
+  real `~/.codex` and `~/.claude` are checksummed before and after).
 - `TESTING-for-JP.md`: the GUI steps for milestone 1.
 
 The app links neither triblespace nor faculties; it runs the bundled `trible`

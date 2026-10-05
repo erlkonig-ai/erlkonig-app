@@ -73,6 +73,8 @@ print(f"pile {s.get('pile')}\nkey  {s.get('key')}")
 print(f"peers {s.get('configured_peers')}  sync collections {s.get('sync_collections')}  maintain targets {s.get('maintain_targets')}")
 if s.get("problem"):
     print(f"PROBLEM: {s['problem']}")
+for w in s.get("warnings", []):
+    print(f"WARNING: {w}")
 for c in s.get("children", []):
     print(f"child {c['name']}: {c['state']} pid {c.get('pid')} restarts {c.get('restarts')} "
           f"last_exit {c.get('last_exit')} last_error {c.get('last_error')} next_start_in {c.get('next_start_in_secs')}")
