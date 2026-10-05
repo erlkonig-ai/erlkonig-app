@@ -184,18 +184,19 @@ fn run_ok(report: &mut Report, program: &Path, args: &[&str]) -> Result<Output, 
 }
 
 /// Adds `root` as the `erlkonig-local` marketplace unless the CLI already
-/// lists it at that root (a listing at another root is replaced).
-fn ensure_marketplace(report: &mut Report, cli: &Path, root: &str, remove: &str) -> Result<(), String> {
+/// lists it at that root; a listing at another root is replaced. Codex prints
+/// `name  root` on one line and Claude puts the source on the next line, so
+/// the listing is read as a whole.
+fn ensure_marketplace(report: &mut Report, cli: &Path, root: &str) -> Result<(), String> {
     let listed = run(report, cli, &["plugin", "marketplace", "list"])
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
-    let ours = listed.lines().find(|l| l.contains(MARKETPLACE));
-    match ours {
-        Some(line) if line.contains(root) => return Ok(()),
-        Some(_) => {
-            run_ok(report, cli, &["plugin", "marketplace", remove, MARKETPLACE])?;
-        }
-        None => {}
+    let ours = listed.split(char::is_whitespace).any(|w| w == MARKETPLACE);
+    if ours && listed.contains(root) {
+        return Ok(());
+    }
+    if ours {
+        run_ok(report, cli, &["plugin", "marketplace", "remove", MARKETPLACE])?;
     }
     run_ok(report, cli, &["plugin", "marketplace", "add", root]).map(drop)
 }
@@ -206,7 +207,7 @@ pub fn install_chatgpt(layout: &Layout, plugin_src: &Path, codex: &Path) -> Resu
     let mut report = Report::default();
     let root = stage_plugin(layout, plugin_src)?;
     let root = root.to_string_lossy().into_owned();
-    ensure_marketplace(&mut report, codex, &root, "remove")?;
+    ensure_marketplace(&mut report, codex, &root)?;
     let id = format!("{PLUGIN}@{MARKETPLACE}");
     run_ok(&mut report, codex, &["plugin", "add", &id])?;
     report.message = "Erlkönig is installed in ChatGPT. Quit ChatGPT completely (ChatGPT menu > Quit ChatGPT) \
@@ -221,7 +222,7 @@ pub fn install_claude_code(layout: &Layout, plugin_src: &Path, claude: &Path) ->
     let mut report = Report::default();
     let root = stage_plugin(layout, plugin_src)?;
     let root = root.to_string_lossy().into_owned();
-    ensure_marketplace(&mut report, claude, &root, "remove")?;
+    ensure_marketplace(&mut report, claude, &root)?;
     let id = format!("{PLUGIN}@{MARKETPLACE}");
     run_ok(&mut report, claude, &["plugin", "install", &id])?;
     report.message = "Erlkönig is installed in Claude Code. Start a new session to load it.".into();
@@ -370,5 +371,43 @@ mod tests {
         copy_tree(&template(), &d.join("p")).unwrap();
         fs::create_dir_all(d.join("p/bin")).unwrap();
         assert!(check_plugin_source(&d.join("p")).unwrap_err().contains("bin/"));
+    }
+
+    /// A fake CLI that prints `listing` for `plugin marketplace list` and
+    /// records every call.
+    fn fake_cli(dir: &Path, listing: &str) -> PathBuf {
+        let cli = dir.join("cli");
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$3\" = list ]; then cat <<'L'\n{listing}\nL\nfi\n",
+            dir.join("calls").display()
+        );
+        fs::write(&cli, script).unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+        cli
+    }
+
+    fn calls(dir: &Path) -> Vec<String> {
+        fs::read_to_string(dir.join("calls")).unwrap_or_default().lines().map(String::from).collect()
+    }
+
+    #[test]
+    fn marketplace_is_added_once_in_both_listing_formats() {
+        let root = "/D/Application Support/Erlkonig/plugins";
+        let list = "plugin marketplace list".to_string();
+        let add = format!("plugin marketplace add {root}");
+        let codex = format!("MARKETPLACE     ROOT\nerlkonig-local  {root}");
+        let claude = format!("Configured marketplaces:\n\n  \u{276f} erlkonig-local\n    Source: Directory ({root})");
+        for (name, listing) in [("codex", codex), ("claude", claude)] {
+            let d = scratch(&format!("mk-{name}"));
+            ensure_marketplace(&mut Report::default(), &fake_cli(&d, &listing), root).unwrap();
+            assert_eq!(calls(&d), vec![list.clone()], "{name}");
+        }
+        let d = scratch("mk-empty");
+        ensure_marketplace(&mut Report::default(), &fake_cli(&d, "No plugin marketplaces in scope."), root).unwrap();
+        assert_eq!(calls(&d), vec![list.clone(), add.clone()]);
+        let d = scratch("mk-moved");
+        ensure_marketplace(&mut Report::default(), &fake_cli(&d, "MARKETPLACE  ROOT\nerlkonig-local  /old"), root)
+            .unwrap();
+        assert_eq!(calls(&d), vec![list, "plugin marketplace remove erlkonig-local".into(), add]);
     }
 }
