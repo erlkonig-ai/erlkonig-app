@@ -8,14 +8,20 @@
 //! only takes an uploaded zip, so that path writes one.
 
 use crate::paths::{Layout, ensure_private_dir};
+use crate::procs;
 use crate::supervise::is_executable;
 use serde_json::json;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub const MARKETPLACE: &str = "erlkonig-local";
 pub const PLUGIN: &str = "erlkonig";
@@ -23,6 +29,8 @@ pub const PLUGIN_DIR: &str = "erlkonig-plugin";
 /// Claude's upload limit for a plugin zip.
 pub const CLAUDE_ZIP_LIMIT: u64 = 200 * 1000 * 1000;
 pub const CHATGPT_CODEX: &str = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex";
+/// How long one `codex` or `claude` command may take before it is stopped.
+pub const CLI_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Default, Clone)]
 pub struct Report {
@@ -68,6 +76,23 @@ pub fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Removes `dir/<prefix><pid>` leftovers whose process is gone (an install
+/// that crashed between its copy and its rename).
+fn remove_stale(dir: &Path, prefixes: &[String]) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = prefixes.iter().find_map(|p| name.strip_prefix(p.as_str())?.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == std::process::id() || procs::alive(pid) {
+            continue;
+        }
+        let path = entry.path();
+        let _ = if entry.file_type().is_ok_and(|t| t.is_dir()) { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+    }
+}
+
 /// Copies the plugin to `D/plugins/erlkonig-plugin` (replacing an older copy
 /// in one rename) and writes both marketplace files. Returns the marketplace
 /// root, `D/plugins`.
@@ -76,6 +101,7 @@ pub fn stage_plugin(layout: &Layout, src: &Path) -> Result<PathBuf, String> {
     let root = layout.plugins();
     ensure_private_dir(&layout.dir).map_err(|e| e.to_string())?;
     fs::create_dir_all(&root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
+    remove_stale(&root, &[format!(".{PLUGIN_DIR}.new-"), format!(".{PLUGIN_DIR}.old-")]);
     let pid = std::process::id();
     let fresh = root.join(format!(".{PLUGIN_DIR}.new-{pid}"));
     let retired = root.join(format!(".{PLUGIN_DIR}.old-{pid}"));
@@ -152,12 +178,95 @@ pub fn find_claude() -> Option<PathBuf> {
     })
 }
 
-fn run(report: &mut Report, program: &Path, args: &[&str]) -> Result<Output, String> {
-    let out = Command::new(program)
+/// The PATH a CLI runs with: the caller's, then the CLI's own folder and the
+/// usual install places. A menu-bar app started by launchd has a bare PATH, and
+/// an npm-installed `claude` starts with `#!/usr/bin/env node`.
+pub fn cli_path(program: &Path) -> OsString {
+    let mut dirs: Vec<PathBuf> = env::var_os("PATH").map(|p| env::split_paths(&p).collect()).unwrap_or_default();
+    let mut extra: Vec<PathBuf> = program.parent().map(Path::to_path_buf).into_iter().collect();
+    if let Some(home) = env::var_os("HOME").filter(|h| !h.is_empty()) {
+        extra.push(Path::new(&home).join(".local/bin"));
+    }
+    extra.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from));
+    for d in extra {
+        if !d.as_os_str().is_empty() && !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    env::join_paths(dirs).unwrap_or_default()
+}
+
+/// What one CLI run produced.
+pub struct Ran {
+    pub status: ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+fn collect(stream: impl Read + Send + 'static) -> (Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>) {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let sink = buf.clone();
+    let handle = thread::spawn(move || {
+        let mut stream = stream;
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = stream.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            if let Ok(mut b) = sink.lock() {
+                b.extend_from_slice(&chunk[..n]);
+            }
+        }
+    });
+    (buf, handle)
+}
+
+/// Runs `program args` in its own process group with `cli_path`, and stops
+/// the group if it has not finished within `timeout`.
+pub fn run_with_timeout(program: &Path, args: &[&str], timeout: Duration) -> Result<Ran, String> {
+    let mut child = Command::new(program)
         .args(args)
+        .env("PATH", cli_path(program))
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
         .map_err(|e| format!("cannot run {}: {e}", program.display()))?;
+    let (out, out_t) = collect(child.stdout.take().expect("piped stdout"));
+    let (err, err_t) = collect(child.stderr.take().expect("piped stderr"));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                procs::signal_group(child.id(), libc::SIGKILL);
+                let _ = child.wait();
+                return Err(format!(
+                    "`{} {}` did not finish within {} s and was stopped",
+                    program.file_name().unwrap_or_default().to_string_lossy(),
+                    args.join(" "),
+                    timeout.as_secs()
+                ));
+            }
+            Err(e) => return Err(format!("cannot wait for {}: {e}", program.display())),
+        }
+    };
+    // A helper the CLI left running may hold its pipes open; do not wait for
+    // it longer than a moment.
+    let settle = Instant::now() + Duration::from_secs(2);
+    while !(out_t.is_finished() && err_t.is_finished()) && Instant::now() < settle {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let take = |b: &Arc<Mutex<Vec<u8>>>| b.lock().map(|b| b.clone()).unwrap_or_default();
+    Ok(Ran { status, stdout: take(&out), stderr: take(&err) })
+}
+
+fn run(report: &mut Report, program: &Path, args: &[&str]) -> Result<Ran, String> {
+    let out = run_with_timeout(program, args, CLI_TIMEOUT).inspect_err(|e| {
+        report.steps.push(format!("$ {} {}\n[{e}]", program.display(), args.join(" ")));
+    })?;
     report.steps.push(format!(
         "$ {} {}\n{}{}[{}]",
         program.display(),
@@ -169,7 +278,7 @@ fn run(report: &mut Report, program: &Path, args: &[&str]) -> Result<Output, Str
     Ok(out)
 }
 
-fn run_ok(report: &mut Report, program: &Path, args: &[&str]) -> Result<Output, String> {
+fn run_ok(report: &mut Report, program: &Path, args: &[&str]) -> Result<Ran, String> {
     let out = run(report, program, args)?;
     if out.status.success() {
         Ok(out)
@@ -183,6 +292,17 @@ fn run_ok(report: &mut Report, program: &Path, args: &[&str]) -> Result<Output, 
     }
 }
 
+/// True when a marketplace listing shows `root` exactly: Codex prints
+/// `name  root` (the root last on its line, and it may contain spaces), and
+/// Claude prints `Source: Directory (root)`. A root that merely starts with
+/// `root` (`.../plugins-old`) does not count.
+pub fn lists_root(listed: &str, root: &str) -> bool {
+    listed.lines().map(str::trim_end).any(|line| {
+        line.strip_suffix(root).is_some_and(|head| head.ends_with(char::is_whitespace))
+            || line.contains(&format!("({root})"))
+    })
+}
+
 /// Adds `root` as the `erlkonig-local` marketplace unless the CLI already
 /// lists it at that root; a listing at another root is replaced. Codex prints
 /// `name  root` on one line and Claude puts the source on the next line, so
@@ -192,7 +312,7 @@ fn ensure_marketplace(report: &mut Report, cli: &Path, root: &str) -> Result<(),
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
     let ours = listed.split(char::is_whitespace).any(|w| w == MARKETPLACE);
-    if ours && listed.contains(root) {
+    if ours && lists_root(&listed, root) {
         return Ok(());
     }
     if ours {
@@ -232,15 +352,30 @@ pub fn install_claude_code(layout: &Layout, plugin_src: &Path, claude: &Path) ->
 /// Writes `D/erlkonig-claude-plugin.zip` for Claude's Upload plugin dialog.
 /// Returns its path and size.
 pub fn build_claude_zip(layout: &Layout, plugin_src: &Path) -> Result<(PathBuf, u64), String> {
-    use zip::write::SimpleFileOptions;
     check_plugin_source(plugin_src)?;
     ensure_private_dir(&layout.dir).map_err(|e| e.to_string())?;
     let dest = layout.claude_zip();
+    remove_stale(&layout.dir, &[".erlkonig-claude-plugin.zip.tmp-".to_string()]);
     let tmp = dest.with_file_name(format!(".erlkonig-claude-plugin.zip.tmp-{}", std::process::id()));
-    let file = fs::File::create(&tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+    let result = write_zip(plugin_src, &tmp).and_then(|size| {
+        if size > CLAUDE_ZIP_LIMIT {
+            return Err(format!("the plugin zip is {size} bytes, over Claude's 200 MB limit"));
+        }
+        fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+        Ok((dest, size))
+    });
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Zips the plugin folder, its contents at the zip's root, into `tmp`.
+fn write_zip(plugin_src: &Path, tmp: &Path) -> Result<u64, String> {
+    use zip::write::SimpleFileOptions;
+    let file = fs::File::create(tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
     let mut zip = zip::ZipWriter::new(file);
     let mut stack = vec![PathBuf::new()];
-    let mut entries = Vec::new();
     while let Some(rel) = stack.pop() {
         let dir = plugin_src.join(&rel);
         let mut children: Vec<_> = fs::read_dir(&dir)
@@ -264,20 +399,13 @@ pub fn build_claude_zip(layout: &Layout, plugin_src: &Path) -> Result<(PathBuf, 
                 zip.start_file(&name, opts).map_err(|e| e.to_string())?;
                 let bytes = fs::read(entry.path()).map_err(|e| e.to_string())?;
                 zip.write_all(&bytes).map_err(|e| e.to_string())?;
-                entries.push(name);
             } else {
                 return Err(format!("{} is not a plain file", entry.path().display()));
             }
         }
     }
     zip.finish().map_err(|e| e.to_string())?;
-    let size = fs::metadata(&tmp).map_err(|e| e.to_string())?.len();
-    if size > CLAUDE_ZIP_LIMIT {
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("the plugin zip is {size} bytes, over Claude's 200 MB limit"));
-    }
-    fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
-    Ok((dest, size))
+    fs::metadata(tmp).map(|m| m.len()).map_err(|e| e.to_string())
 }
 
 /// The entry names of a zip file, for checks.
@@ -408,6 +536,51 @@ mod tests {
         let d = scratch("mk-moved");
         ensure_marketplace(&mut Report::default(), &fake_cli(&d, "MARKETPLACE  ROOT\nerlkonig-local  /old"), root)
             .unwrap();
-        assert_eq!(calls(&d), vec![list, "plugin marketplace remove erlkonig-local".into(), add]);
+        assert_eq!(calls(&d), vec![list.clone(), "plugin marketplace remove erlkonig-local".into(), add.clone()]);
+        // A root that only starts with ours is another root.
+        for listing in [
+            format!("MARKETPLACE  ROOT\nerlkonig-local  {root}-old"),
+            format!("Configured marketplaces:\n\n  \u{276f} erlkonig-local\n    Source: Directory ({root}-old)"),
+        ] {
+            let d = scratch("mk-prefix");
+            ensure_marketplace(&mut Report::default(), &fake_cli(&d, &listing), root).unwrap();
+            assert_eq!(calls(&d), vec![list.clone(), "plugin marketplace remove erlkonig-local".into(), add.clone()]);
+        }
+    }
+
+    #[test]
+    fn a_stalled_cli_is_stopped_and_gets_a_usable_path() {
+        let d = scratch("stall");
+        let cli = d.join("cli");
+        fs::write(&cli, "#!/bin/sh\necho \"PATH=$PATH\"\n[ \"$1\" = stall ] && exec /bin/sleep 30\nexit 0\n").unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+        let t0 = Instant::now();
+        let e = run_with_timeout(&cli, &["stall"], Duration::from_millis(500)).err().unwrap();
+        assert!(e.contains("did not finish within"), "{e}");
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        let ran = run_with_timeout(&cli, &["ok"], Duration::from_secs(10)).unwrap();
+        assert!(ran.status.success());
+        let path = String::from_utf8_lossy(&ran.stdout).into_owned();
+        assert!(path.contains("/opt/homebrew/bin") && path.contains(&d.display().to_string()), "{path}");
+    }
+
+    #[test]
+    fn stale_staging_leftovers_are_removed() {
+        let d = scratch("stale");
+        let layout = Layout::new(d.join("D"));
+        let root = layout.plugins();
+        // pid 1 is alive but never ours; a pid far above any real one is dead.
+        let dead = root.join(format!(".{PLUGIN_DIR}.new-999999999"));
+        let live = root.join(format!(".{PLUGIN_DIR}.old-1"));
+        fs::create_dir_all(&dead).unwrap();
+        fs::create_dir_all(&live).unwrap();
+        fs::create_dir_all(&layout.dir).unwrap();
+        fs::set_permissions(&layout.dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let zip_tmp = layout.dir.join(".erlkonig-claude-plugin.zip.tmp-999999999");
+        fs::write(&zip_tmp, "partial").unwrap();
+        stage_plugin(&layout, &template()).unwrap();
+        build_claude_zip(&layout, &template()).unwrap();
+        assert!(!dead.exists() && !zip_tmp.exists());
+        assert!(live.exists(), "a leftover whose pid is alive is left alone");
     }
 }

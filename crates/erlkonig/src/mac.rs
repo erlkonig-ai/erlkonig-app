@@ -17,7 +17,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::window::WindowId;
 
@@ -27,6 +27,9 @@ const REFRESH: Duration = Duration::from_secs(2);
 
 enum UserEvent {
     Menu(MenuEvent),
+    /// An install that ran on a worker thread finished: the alert title and
+    /// the message (Ok) or the error (Err).
+    Installed(&'static str, Result<String, String>),
 }
 
 struct Items {
@@ -49,10 +52,19 @@ struct App {
     tray: Option<TrayIcon>,
     flash: Option<(String, Instant)>,
     next_refresh: Instant,
+    proxy: EventLoopProxy<UserEvent>,
+    /// What runs on a worker thread now ("Installing in ChatGPT…"), if anything.
+    busy: Option<&'static str>,
 }
 
 fn agent() -> objc2::rc::Retained<SMAppService> {
     unsafe { SMAppService::agentServiceWithPlistName(&NSString::from_str(AGENT_PLIST)) }
+}
+
+/// The menu app itself as a login item, so that "Open at login" also brings
+/// the crown back after a logout or restart, not only the background node.
+fn main_app() -> objc2::rc::Retained<SMAppService> {
+    unsafe { SMAppService::mainAppService() }
 }
 
 fn agent_status() -> SMAppServiceStatus {
@@ -102,8 +114,8 @@ impl App {
             let _ = std::fs::write(&marker, b"");
             let choice = self.alert(
                 "Run Erlkönig in the background?",
-                "Erlkönig keeps your pile in sync and maintained while you work, also when this menu is closed. \
-You can change this later with Open at login.",
+                "Erlkönig keeps your pile in sync and maintained while you work, also when this menu is closed, \
+and opens this menu when you log in. You can change this later with Open at login.",
                 &["Run in the background", "Not now"],
             );
             if choice == 0 {
@@ -112,24 +124,72 @@ You can change this later with Open at login.",
         }
     }
 
+    fn ask_for_approval(&self) {
+        let choice = self.alert(
+            "Allow Erlkönig in Login Items",
+            "macOS needs your approval before Erlkönig can run in the background. Turn on Erlkönig under System Settings > General > Login Items & Extensions.",
+            &["Open System Settings", "Later"],
+        );
+        if choice == 0 {
+            unsafe { SMAppService::openSystemSettingsLoginItems() };
+        }
+    }
+
+    /// Registers (or unregisters) the node's LaunchAgent and the menu app as a
+    /// login item. Waiting for approval is not an error: it gets the one
+    /// approval alert, not a "macOS refused" alert first.
     fn set_login(&mut self, on: bool) {
+        if on && agent_status() == SMAppServiceStatus::RequiresApproval {
+            self.ask_for_approval();
+            return;
+        }
         let service = agent();
         let result = unsafe {
             if on { service.registerAndReturnError() } else { service.unregisterAndReturnError() }
         };
+        // The menu's own login item follows the node's; its failure is told
+        // but does not undo the node's.
+        let app = main_app();
+        let app_result = unsafe { if on { app.registerAndReturnError() } else { app.unregisterAndReturnError() } };
+        if on && agent_status() == SMAppServiceStatus::RequiresApproval {
+            // register returns kSMErrorLaunchDeniedByUser in this state.
+            self.ask_for_approval();
+            return;
+        }
         if let Err(err) = result {
             let text = err.localizedDescription().to_string();
             self.alert("Open at login", &format!("macOS refused: {text}"), &["OK"]);
-        }
-        if on && agent_status() == SMAppServiceStatus::RequiresApproval {
-            let choice = self.alert(
-                "Allow Erlkönig in Login Items",
-                "macOS needs your approval before Erlkönig can run in the background. Turn on Erlkönig under System Settings > General > Login Items & Extensions.",
-                &["Open System Settings", "Later"],
+        } else if let Err(err) = app_result
+            && on
+        {
+            let text = err.localizedDescription().to_string();
+            self.alert(
+                "Open at login",
+                &format!("The background node is on, but macOS would not open this menu at login: {text}"),
+                &["OK"],
             );
-            if choice == 0 {
-                unsafe { SMAppService::openSystemSettingsLoginItems() };
+        }
+    }
+
+    /// The Open at login item: off when on, on when off, and a choice when
+    /// macOS is still waiting for approval (the item shows ticked then,
+    /// because the node is registered).
+    fn toggle_login(&mut self) {
+        match agent_status() {
+            SMAppServiceStatus::Enabled => self.set_login(false),
+            SMAppServiceStatus::RequiresApproval => {
+                let choice = self.alert(
+                    "Open at login",
+                    "Erlkönig is waiting for your approval in System Settings > General > Login Items & Extensions.",
+                    &["Open System Settings", "Turn off", "Cancel"],
+                );
+                match choice {
+                    0 => unsafe { SMAppService::openSystemSettingsLoginItems() },
+                    1 => self.set_login(false),
+                    _ => {}
+                }
             }
+            _ => self.set_login(true),
         }
     }
 
@@ -139,6 +199,8 @@ You can change this later with Open at login.",
             "Move Erlkönig to Applications to finish setup".to_string()
         } else if let Some(p) = &self.setup_problem {
             p.clone()
+        } else if let Some(busy) = self.busy {
+            busy.to_string()
         } else if let Some((msg, _)) = self.flash.as_ref().filter(|(_, until)| Instant::now() < *until) {
             msg.clone()
         } else {
@@ -151,10 +213,13 @@ You can change this later with Open at login.",
             }
         };
         self.items.status.set_text(text);
-        self.items.login.set_checked(agent_status() == SMAppServiceStatus::Enabled);
+        self.items.login.set_checked(matches!(
+            agent_status(),
+            SMAppServiceStatus::Enabled | SMAppServiceStatus::RequiresApproval
+        ));
         let usable = !self.translocated;
-        self.items.chatgpt.set_enabled(usable);
-        self.items.claude.set_enabled(usable);
+        self.items.chatgpt.set_enabled(usable && self.busy.is_none());
+        self.items.claude.set_enabled(usable && self.busy.is_none());
         self.items.login.set_enabled(usable);
         self.next_refresh = Instant::now() + REFRESH;
     }
@@ -193,6 +258,32 @@ You can change this later with Open at login.",
         self.exe_dir.join("../Resources/plugin")
     }
 
+    /// Runs `job` on a worker thread, so a CLI that stalls (network, update,
+    /// login) never freezes the menu bar; each CLI command also has its own
+    /// timeout. The result comes back as `UserEvent::Installed`.
+    fn in_background(
+        &mut self,
+        busy: &'static str,
+        title: &'static str,
+        job: impl FnOnce() -> Result<install::Report, String> + Send + 'static,
+    ) {
+        self.busy = Some(busy);
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let result = job().map(|r| r.message);
+            let _ = proxy.send_event(UserEvent::Installed(title, result));
+        });
+    }
+
+    fn installed(&mut self, title: &'static str, result: Result<String, String>) {
+        self.busy = None;
+        self.refresh();
+        match result {
+            Ok(message) => self.alert(title, &message, &["OK"]),
+            Err(e) => self.alert(&format!("{title} failed"), &e, &["OK"]),
+        };
+    }
+
     fn install_chatgpt(&mut self) {
         let Some(codex) = install::find_codex() else {
             self.alert(
@@ -202,14 +293,10 @@ You can change this later with Open at login.",
             );
             return;
         };
-        match install::install_chatgpt(&self.layout, &self.plugin_src(), &codex) {
-            Ok(report) => {
-                self.alert("Install in ChatGPT", &report.message, &["OK"]);
-            }
-            Err(e) => {
-                self.alert("Install in ChatGPT failed", &e, &["OK"]);
-            }
-        }
+        let (layout, src) = (self.layout.clone(), self.plugin_src());
+        self.in_background("Installing in ChatGPT…", "Install in ChatGPT", move || {
+            install::install_chatgpt(&layout, &src, &codex)
+        });
     }
 
     fn install_claude(&mut self) {
@@ -230,10 +317,10 @@ You can change this later with Open at login.",
                     &["Done", "Also install in Claude Code"],
                 );
                 if choice == 1 {
-                    match install::install_claude_code(&self.layout, &self.plugin_src(), &claude) {
-                        Ok(r) => self.alert("Claude Code", &r.message, &["OK"]),
-                        Err(e) => self.alert("Claude Code install failed", &e, &["OK"]),
-                    };
+                    let (layout, src) = (self.layout.clone(), self.plugin_src());
+                    self.in_background("Installing in Claude Code…", "Claude Code", move || {
+                        install::install_claude_code(&layout, &src, &claude)
+                    });
                 }
             }
             None => {
@@ -248,13 +335,12 @@ You can change this later with Open at login.",
             event_loop.exit();
         } else if id == self.items.copy_id.id() {
             self.copy_id();
-        } else if id == self.items.chatgpt.id() {
+        } else if id == self.items.chatgpt.id() && self.busy.is_none() {
             self.install_chatgpt();
-        } else if id == self.items.claude.id() {
+        } else if id == self.items.claude.id() && self.busy.is_none() {
             self.install_claude();
         } else if id == self.items.login.id() {
-            let on = agent_status() != SMAppServiceStatus::Enabled;
-            self.set_login(on);
+            self.toggle_login();
         }
         self.refresh();
     }
@@ -307,6 +393,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Menu(e) => self.on_menu(e, event_loop),
+            UserEvent::Installed(title, result) => self.installed(title, result),
         }
     }
 
@@ -323,15 +410,18 @@ pub fn main() {
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .expect("executable directory");
-    let layout = Layout::new(paths::data_dir().expect("data directory"));
+    // Always the default folder: .mcp.json and the LaunchAgent use it, so an
+    // ERLKONIG_DATA_DIR in the environment must not point the menu elsewhere.
+    let layout = Layout::new(paths::default_data_dir().expect("data directory"));
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .with_activation_policy(ActivationPolicy::Accessory)
         .build()
         .expect("event loop");
     let proxy = event_loop.create_proxy();
+    let menu_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |e| {
-        let _ = proxy.send_event(UserEvent::Menu(e));
+        let _ = menu_proxy.send_event(UserEvent::Menu(e));
     }));
 
     let items = Items {
@@ -368,6 +458,8 @@ pub fn main() {
         tray: None,
         flash: None,
         next_refresh: Instant::now() + REFRESH,
+        proxy,
+        busy: None,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("erlkonig: {e}");
