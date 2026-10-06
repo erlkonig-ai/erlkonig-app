@@ -191,21 +191,26 @@ impl App {
             });
         }
         self.transfer_bytes = bytes;
-        let reduced =
-            unsafe { NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion() };
-        let frame = crown::frame_with_preview(now, self.activity, self.preview_started, reduced);
-        if changed || self.animating {
-            if let Some(tray) = &self.tray {
-                set_crown(tray, &frame, self.mtm);
+        // Native image/menu changes can wake the loop before WaitUntil expires.
+        // Keep processing status and real activity, but do not let those wakeups
+        // drive more images or move the existing frame deadline into the future.
+        if Instant::now() >= self.next_refresh {
+            let reduced = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+            let frame =
+                crown::frame_with_preview(now, self.activity, self.preview_started, reduced);
+            if self.animating || frame.animating {
+                if let Some(tray) = &self.tray {
+                    set_crown(tray, &frame, self.mtm);
+                }
             }
+            self.animating = frame.animating;
+            self.next_refresh = Instant::now()
+                + if self.animating {
+                    Duration::from_millis(33)
+                } else {
+                    Duration::from_millis(250)
+                };
         }
-        self.animating = frame.animating;
-        self.next_refresh = Instant::now()
-            + if self.animating {
-                Duration::from_millis(33)
-            } else {
-                Duration::from_millis(250)
-            };
     }
 
     fn quit(&mut self) {
@@ -587,7 +592,7 @@ impl App {
         if id == self.items.quit.id() {
             self.quit();
         } else if id == self.items.preview.id() {
-            if unsafe { NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion() } {
+            if NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion() {
                 self.alert(
                     "Sync animation preview",
                     "Reduce Motion is enabled, so the crown stays still. This preview does not start sync or transfer any data.",
@@ -596,6 +601,7 @@ impl App {
             }
             self.preview_started = Some(self.origin.elapsed());
             self.animating = true; // Paint the first frame and schedule its attack.
+            self.next_refresh = Instant::now();
         } else if id == self.items.add_pile.id() {
             self.add_pile();
         } else if let Some((entry, action)) = self.pile_items.iter().find_map(|p| {
