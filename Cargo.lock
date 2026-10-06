@@ -1900,6 +1900,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 name = "erlkonig"
 version = "0.1.0"
 dependencies = [
+ "block2 0.6.2",
  "erlkonig-core",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",

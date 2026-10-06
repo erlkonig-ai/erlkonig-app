@@ -8,8 +8,8 @@ use erlkonig_core::{
 };
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSPasteboard, NSPasteboardTypeString,
-    NSWorkspace,
+    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSCellImagePosition, NSImageScaling,
+    NSPasteboard, NSPasteboardTypeString, NSWorkspace,
 };
 use objc2_foundation::NSString;
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
@@ -20,7 +20,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -55,6 +55,14 @@ struct App {
 
 fn login() -> objc2::rc::Retained<SMAppService> {
     unsafe { SMAppService::mainAppService() }
+}
+
+fn set_crown(tray: &TrayIcon, frame: &crown::Frame, mtm: MainThreadMarker) {
+    if let Some(button) = tray.ns_status_item().and_then(|item| item.button(mtm)) {
+        button.setImageScaling(NSImageScaling::ScaleNone);
+        button.setImagePosition(NSCellImagePosition::ImageOnly);
+        button.setImage(Some(&frame.template_image()));
+    }
 }
 
 impl App {
@@ -143,9 +151,8 @@ impl App {
             unsafe { NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion() };
         let frame = crown::frame(now, self.activity, reduced);
         if changed || self.animating {
-            let (rgba, w, h) = frame.rgba();
-            if let (Some(tray), Ok(icon)) = (&self.tray, Icon::from_rgba(rgba, w, h)) {
-                let _ = tray.set_icon(Some(icon));
+            if let Some(tray) = &self.tray {
+                set_crown(tray, &frame, self.mtm);
             }
         }
         self.animating = frame.animating;
@@ -316,16 +323,19 @@ impl App {
 impl ApplicationHandler<MenuEvent> for App {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         if cause == StartCause::Init {
-            let (rgba, w, h) = crown::frame(Duration::ZERO, None, true).rgba();
-            let icon = Icon::from_rgba(rgba, w, h).expect("crown pixels");
             match TrayIconBuilder::new()
                 .with_menu(Box::new(self.menu.take().unwrap()))
-                .with_icon_templated(icon)
                 .with_autosave_name("ai.erlkonig.app.status")
-                .with_tooltip("Erlkönig")
                 .build()
             {
-                Ok(tray) => self.tray = Some(tray),
+                Ok(tray) => {
+                    set_crown(&tray, &crown::frame(Duration::ZERO, None, true), self.mtm);
+                    // tray-icon also fits its click-target view when setting
+                    // the tooltip. Do this after installing our native image,
+                    // so its hit area includes the full, wider crown.
+                    let _ = tray.set_tooltip(Some("Erlkönig"));
+                    self.tray = Some(tray);
+                }
                 Err(error) => self.problem = Some(format!("Cannot create menu: {error}")),
             }
             if std::env::current_exe().is_ok_and(|p| paths::is_translocated(&p)) {

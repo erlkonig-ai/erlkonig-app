@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[[example]]
+name = "crown-preview"
+path = "../../scripts/crown-preview.rs"
+
 [dependencies]
 erlkonig-core.workspace = true
 signal-hook.workspace = true
@@ -15,6 +19,7 @@ signal-hook.workspace = true
 tray-icon.workspace = true
 winit.workspace = true
 objc2.workspace = true
+block2.workspace = true
 objc2-foundation.workspace = true
 objc2-app-kit.workspace = true
 objc2-service-management.workspace = true

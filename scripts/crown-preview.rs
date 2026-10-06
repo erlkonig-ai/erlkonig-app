@@ -1,94 +1,111 @@
-//! Standalone, dependency-free contact sheet from the production crown module.
-//! Compile with rustc (not Cargo), then pass the destination SVG path.
+//! Deterministic offscreen AppKit proof, using the production vector renderer.
+//! cargo run --release -p erlkonig --example crown-preview -- OUTPUT_DIRECTORY
+//! Does not create an application, window, status item, timer or network service.
 
 #[allow(dead_code)]
 #[path = "../crates/erlkonig/src/crown.rs"]
 mod crown;
 
-use std::fmt::Write as _;
-use std::time::Duration;
+use objc2::{AnyThread, rc::Retained};
+use objc2_app_kit::{
+    NSBitmapImageFileType, NSBitmapImageRep, NSCalibratedRGBColorSpace,
+    NSCustomImageRep, NSGraphicsContext, NSImage,
+};
+use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize};
+use std::{fmt::Write as _, path::Path, time::Duration};
+
+fn render(image: &NSImage, scale: usize) -> Retained<NSBitmapImageRep> {
+    let width = crown::WIDTH as usize * scale;
+    let height = crown::HEIGHT as usize * scale;
+    // Null planes ask AppKit to own the storage. Explicit RGBA8 row geometry
+    // makes the subsequent bounded pixel inspection unambiguous.
+    let bitmap = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(), std::ptr::null_mut(), width as isize,
+            height as isize, 8, 4, true, false, NSCalibratedRGBColorSpace,
+            (width * 4) as isize, 32,
+        )
+    }.expect("RGBA bitmap");
+    unsafe {
+        std::slice::from_raw_parts_mut(bitmap.bitmapData(), width * height * 4).fill(0);
+    }
+    let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&bitmap)
+        .expect("offscreen context");
+    NSGraphicsContext::saveGraphicsState_class();
+    NSGraphicsContext::setCurrentContext(Some(&context));
+    image.drawInRect(NSRect::new(NSPoint::ZERO, NSSize::new(width as f64, height as f64)));
+    NSGraphicsContext::restoreGraphicsState_class();
+    bitmap
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let destination = std::env::args()
-        .nth(1)
-        .ok_or("usage: crown-preview OUTPUT.svg")?;
-    let mut svg = String::from(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1420\" height=\"610\" viewBox=\"0 0 1420 610\"><title>Erlkönig crown — real transfer activity and exact rest</title><rect width=\"1420\" height=\"610\" fill=\"#fafafa\"/><style>text{font-family:system-ui,sans-serif;font-size:14px} .label{font-size:12px}</style><text x=\"24\" y=\"32\" font-size=\"22\">Erlkönig · transfer wavelet</text><text x=\"24\" y=\"58\">Canonical silhouette · 0.85 px maximum motion · 160 ms attack · 600 ms to exact rest · 18 pt native size</text>",
-    );
+    let destination = std::env::args().nth(1).ok_or("usage: crown-preview OUTPUT_DIRECTORY")?;
+    let destination = Path::new(&destination);
+    std::fs::create_dir_all(destination)?;
     let cases = [
-        ("Idle", 0, None, false),
-        ("Attack · 80 ms", 80, Some(80), false),
-        ("Transferring · 400 ms", 400, Some(400), false),
-        ("Transferring · 1000 ms", 1000, Some(1000), false),
-        ("Quiet · 300 ms", 1300, Some(1000), false),
-        ("Quiet · 600 ms (rest)", 1600, Some(1000), false),
-        ("Reduced motion + bytes", 1000, Some(1000), true),
+        ("idle", 0, None, false),
+        ("attack", 80, Some(80), false),
+        ("transfer", 1000, Some(1000), false),
+        ("settled", 1600, Some(1000), false),
+        ("reduced", 1000, Some(1000), true),
     ];
-    for row in 0..2 {
-        let top = 82 + row * 250;
-        let (background, foreground) = if row == 0 {
-            ("#fafafa", "#171717")
-        } else {
-            ("#222326", "#fafafa")
-        };
-        writeln!(
-            svg,
-            "<rect x=\"0\" y=\"{top}\" width=\"1420\" height=\"250\" fill=\"{background}\"/>"
-        )?;
-        for (column, (label, now, last, reduced)) in cases.iter().enumerate() {
-            let x = 24 + column * 200;
-            let activity = last.map(|last| crown::TransferActivity {
-                began_at: Duration::ZERO,
-                last_transfer_at: Duration::from_millis(last),
-            });
-            let frame = crown::frame(Duration::from_millis(*now), activity, *reduced);
-            let points = frame
-                .points
-                .iter()
-                .map(|p| format!("{:.4},{:.4}", p.x, p.y))
-                .collect::<Vec<_>>()
-                .join(" ");
-            writeln!(
-                svg,
-                "<g fill=\"{foreground}\"><text x=\"{x}\" y=\"{}\">{label}</text><polygon points=\"{points}\" transform=\"translate({}, {}) scale(3)\"/><text class=\"label\" x=\"{x}\" y=\"{}\">vector × 3</text>",
-                top + 22,
-                x + 28,
-                top + 30,
-                top + 146
-            )?;
-            let (pixels, width, _) = frame.rgba();
-            writeln!(
-                svg,
-                "<g transform=\"translate({}, {}) scale(2)\">",
-                x + 28,
-                top + 149
-            )?;
-            for (index, p) in pixels
-                .chunks_exact(4)
-                .enumerate()
-                .filter(|(_, p)| p[3] != 0)
-            {
-                writeln!(
-                    svg,
-                    "<rect x=\"{}\" y=\"{}\" width=\"1\" height=\"1\" opacity=\"{:.4}\"/>",
-                    index % width as usize,
-                    index / width as usize,
-                    f64::from(p[3]) / 255.0
-                )?;
+    let mut svg = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1100\" height=\"380\"><rect width=\"1100\" height=\"380\" fill=\"white\"/><style>text{font:14px system-ui,sans-serif}</style><text x=\"20\" y=\"25\">Production AppKit vector · 24 pt silhouette in 26 × 18 pt image · 0.5194 pt motion bound</text>");
+    let mut idle_pixels = Vec::new();
+    for (column, (label, now, last, reduced)) in cases.iter().enumerate() {
+        let activity = last.map(|last| crown::TransferActivity {
+            began_at: Duration::ZERO,
+            last_transfer_at: Duration::from_millis(last),
+        });
+        let image = crown::frame(Duration::from_millis(*now), activity, *reduced).template_image();
+        assert!(image.isTemplate());
+        assert_eq!(image.size(), NSSize::new(crown::WIDTH, crown::HEIGHT));
+        let reps = image.representations();
+        assert_eq!(reps.len(), 1);
+        assert!(reps.objectAtIndex(0).downcast_ref::<NSCustomImageRep>().is_some());
+        let x = 20 + column * 215;
+        writeln!(svg, "<text x=\"{x}\" y=\"55\">{label} · template=true</text>")?;
+        for scale in [1, 2] {
+            let bitmap = render(&image, scale);
+            let width = bitmap.pixelsWide() as usize;
+            let height = bitmap.pixelsHigh() as usize;
+            assert_eq!((width, height), (26 * scale, 18 * scale));
+            assert_eq!(bitmap.bytesPerRow() as usize, width * 4);
+            let pixels = unsafe {
+                std::slice::from_raw_parts(bitmap.bitmapData(), width * height * 4)
+            };
+            assert!(pixels.chunks_exact(4).all(|p| p[..3] == [0, 0, 0]));
+            let solid = pixels.chunks_exact(4).filter(|p| p[3] == 255).count();
+            let partial = pixels.chunks_exact(4).filter(|p| p[3] > 0 && p[3] < 255).count();
+            assert!(solid > 0 && partial > 0);
+            for row in 0..height {
+                assert_eq!(pixels[(row * width) * 4 + 3], 0);
+                assert_eq!(pixels[(row * width + width - 1) * 4 + 3], 0);
             }
-            writeln!(
-                svg,
-                "</g><text class=\"label\" x=\"{x}\" y=\"{}\">template × 2</text><polygon points=\"{points}\" transform=\"translate({}, {}) scale(.5)\"/><text class=\"label\" x=\"{}\" y=\"{}\">18 pt</text></g>",
-                top + 234,
-                x + 144,
-                top + 181,
-                x + 136,
-                top + 222
-            )?;
+            assert!(pixels[..width * 4].iter().all(|p| *p == 0));
+            assert!(pixels[(height - 1) * width * 4..].iter().all(|p| *p == 0));
+            if scale == 2 {
+                if *label == "idle" { idle_pixels = pixels.to_vec(); }
+                if *label == "settled" || *label == "reduced" { assert_eq!(pixels, idle_pixels); }
+                if *label == "transfer" { assert_ne!(pixels, idle_pixels); }
+            }
+            // Empty property dictionary carries no untyped option values.
+            let png = unsafe {
+                bitmap.representationUsingType_properties(
+                    NSBitmapImageFileType::PNG, &NSDictionary::new(),
+                )
+            }.expect("PNG representation");
+            std::fs::write(destination.join(format!("{label}-{scale}x.png")), png.to_vec())?;
+            println!("{label} {scale}x: {width}×{height}, {solid} opaque pixels, {partial} antialiased pixels, custom vector rep, template=true");
+            let top = if scale == 1 { 70 } else { 220 };
+            let zoom = if scale == 1 { 7 } else { 3 };
+            writeln!(svg, "<g transform=\"translate({x} {top}) scale({zoom})\" fill=\"black\">")?;
+            for (i, pixel) in pixels.chunks_exact(4).enumerate().filter(|(_, p)| p[3] != 0) {
+                writeln!(svg, "<rect x=\"{}\" y=\"{}\" width=\"1\" height=\"1\" opacity=\"{:.4}\"/>", i % width, i / width, f64::from(pixel[3]) / 255.0)?;
+            }
+            writeln!(svg, "</g><text x=\"{x}\" y=\"{}\">Native {scale}× alpha mask, zoom {zoom}×</text>", top + height * zoom + 20)?;
         }
     }
     svg.push_str("</svg>\n");
-    std::fs::write(&destination, svg)?;
-    println!("{destination}");
+    std::fs::write(destination.join("contact-sheet.svg"), svg)?;
     Ok(())
 }

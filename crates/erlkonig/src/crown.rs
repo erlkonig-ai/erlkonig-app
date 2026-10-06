@@ -1,7 +1,7 @@
 //! Erlkönig's wavelet crown, still at rest and gently moving during byte transfer.
 //!
 //! The outline is the canonical website's Gabor/Morlet crown, uniformly fitted
-//! to a 36 px template image. Only the inner wave moves; walls, tips and base
+//! to native menu-bar points. Only the inner wave moves; walls, tips and base
 //! stay put. There is no clock, timer, worker or network dependency here.
 //!
 //! The caller owns a monotonic origin and updates `last_transfer_at` ONLY when
@@ -13,15 +13,18 @@
 use std::f64::consts::{PI, TAU};
 use std::time::Duration;
 
-pub const SIZE: u32 = 36;
+pub const WIDTH: f64 = 26.0;
+pub const HEIGHT: f64 = 18.0;
 /// After this much time without bytes the exact resting crown is restored.
 pub const SETTLE_AFTER: Duration = Duration::from_millis(600);
 const ATTACK: f64 = 0.160;
 const HOLD: f64 = 0.120;
 const RELEASE: f64 = 0.480;
 const WAVE_STEPS: usize = 140;
-const SCALE: f64 = 0.080;
-const MAX_DISPLACEMENT: f64 = 0.85; // physical pixels, less than half a point at 2x
+const SCALE: f64 = 0.060; // 400 canonical units → 24 points, with 1 pt side padding
+// Preserve the old on-screen amplitude: 0.85 source pixels in a 36 px image
+// displayed by tray-icon at 22 pt. Enlargement is not stronger animation.
+const MAX_DISPLACEMENT: f64 = 0.85 * 22.0 / 36.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferActivity {
@@ -37,7 +40,8 @@ pub struct Point {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
-    /// Closed polygon in the 36 × 36 template-image coordinate system.
+    /// Closed polygon in the 26 × 18 point template-image coordinate system.
+    /// Coordinates are top-down, as on the canonical website.
     pub points: Vec<Point>,
     /// True during attack/hold/settle; false means no further frames are needed
     /// until byte activity or the reduced-motion preference changes.
@@ -83,10 +87,11 @@ fn wave_slope(t: f64) -> f64 {
 }
 
 fn template_point(x: f64, y: f64) -> Point {
-    // Center the canonical 400 × 165.75 outline, preserving its proportions.
+    // Preserve the canonical 400 × 165.75 outline. The flat base is on a whole
+    // point (also a whole Retina pixel), not between two antialiased rows.
     Point {
-        x: 18.0 + (x - 250.0) * SCALE,
-        y: 18.0 + (y - 199.125) * SCALE,
+        x: WIDTH / 2.0 + (x - 250.0) * SCALE,
+        y: 14.0 + (y - 282.0) * SCALE,
     }
 }
 
@@ -135,37 +140,39 @@ pub fn frame(now: Duration, activity: Option<TransferActivity>, reduced_motion: 
     Frame { points, animating }
 }
 
+#[cfg(target_os = "macos")]
 impl Frame {
-    /// Black RGBA8 with coverage in alpha only, suitable for a macOS template.
-    /// Four-by-four scanline supersampling needs no image/font/rendering stack.
-    pub fn rgba(&self) -> (Vec<u8>, u32, u32) {
-        const SS: usize = 4;
-        let size = SIZE as usize;
-        let mut coverage = vec![0u8; size * size];
-        let mut crossings = Vec::with_capacity(self.points.len());
-        for sy in 0..size * SS {
-            let y = (sy as f64 + 0.5) / SS as f64;
-            crossings.clear();
-            for edge in self.points.windows(2) {
-                let [a, b] = [edge[0], edge[1]];
-                if (a.y > y) != (b.y > y) {
-                    crossings.push(a.x + (y - a.y) * (b.x - a.x) / (b.y - a.y));
-                }
+    /// AppKit redraws this vector at the destination backing scale. There is
+    /// no intermediate PNG, fixed-resolution bitmap, resampling or fake stroke.
+    pub fn template_image(&self) -> objc2::rc::Retained<objc2_app_kit::NSImage> {
+        use block2::RcBlock;
+        use objc2::runtime::Bool;
+        use objc2_app_kit::{NSBezierPath, NSColor, NSImage};
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+        // The block owns only immutable Rust points; AppKit may invoke it on
+        // any drawing thread, so all AppKit drawing objects are local to it.
+        let points = self.points.clone();
+        let draw = RcBlock::new(move |_rect: NSRect| {
+            let path = NSBezierPath::bezierPath();
+            path.moveToPoint(NSPoint::new(points[0].x, points[0].y));
+            for point in &points[1..] {
+                path.lineToPoint(NSPoint::new(point.x, point.y));
             }
-            crossings.sort_by(f64::total_cmp);
-            for pair in crossings.chunks_exact(2) {
-                let sample_index =
-                    |x: f64| (x * SS as f64 - 0.5).ceil().clamp(0.0, (size * SS) as f64) as usize;
-                for sx in sample_index(pair[0])..sample_index(pair[1]) {
-                    coverage[(sy / SS) * size + sx / SS] += 1;
-                }
-            }
-        }
-        let mut rgba = vec![0; size * size * 4];
-        for (pixel, samples) in rgba.chunks_exact_mut(4).zip(coverage) {
-            pixel[3] = ((u16::from(samples) * 255 + 8) / 16) as u8;
-        }
-        (rgba, SIZE, SIZE)
+            path.closePath();
+            NSColor::blackColor().setFill(); // fully opaque mask, never grey
+            path.fill();
+            Bool::YES
+        });
+        let image = NSImage::imageWithSize_flipped_drawingHandler(
+            NSSize::new(WIDTH, HEIGHT),
+            true,
+            &draw,
+        );
+        // Set this on EVERY frame, including transfer animation. AppKit owns
+        // the tint for dark/light menu bars, selection and accessibility.
+        image.setTemplate(true);
+        image
     }
 }
 
@@ -241,8 +248,8 @@ mod tests {
             assert_eq!(f.points.first(), f.points.last());
             for (i, p) in f.points.iter().enumerate() {
                 assert!(p.x.is_finite() && p.y.is_finite());
-                assert!((2.0..=34.0).contains(&p.x));
-                assert!((10.0..=25.0).contains(&p.y));
+                assert!((1.0..=25.0).contains(&p.x));
+                assert!((3.0..=15.0).contains(&p.y));
                 assert_eq!(p.x, idle.points[i].x);
                 assert!((p.y - idle.points[i].y).abs() <= MAX_DISPLACEMENT);
                 if i <= 2 || i >= WAVE_STEPS + 2 {
@@ -276,21 +283,15 @@ mod tests {
     }
 
     #[test]
-    fn template_pixels_are_monochrome_and_do_not_touch_edges() {
-        for active in [None, burst(0, 1000)] {
-            let (pixels, w, h) = frame(ms(1000), active, false).rgba();
-            assert_eq!((w, h), (36, 36));
-            assert_eq!(pixels.len(), 36 * 36 * 4);
-            assert!(pixels.chunks_exact(4).all(|p| p[..3] == [0, 0, 0]));
-            assert!(pixels.chunks_exact(4).any(|p| p[3] == 255));
-            assert!(pixels.chunks_exact(4).any(|p| p[3] > 0 && p[3] < 255));
-            for y in 0..36 {
-                for x in 0..36 {
-                    if x == 0 || x == 35 || y == 0 || y == 35 {
-                        assert_eq!(pixels[(y * 36 + x) * 4 + 3], 0);
-                    }
-                }
-            }
-        }
+    fn native_geometry_is_larger_proportional_and_base_aligned() {
+        let idle = frame(ms(0), None, false);
+        let min_x = idle.points.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+        let max_x = idle.points.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
+        let min_y = idle.points.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+        let max_y = idle.points.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
+        assert_eq!((min_x, max_x), (1.0, 25.0));
+        assert!((max_y - min_y - 165.75 * SCALE).abs() < 1e-10);
+        assert_eq!(max_y, 14.0);
+        assert!((MAX_DISPLACEMENT - 0.5194444444444445).abs() < 1e-10);
     }
 }
