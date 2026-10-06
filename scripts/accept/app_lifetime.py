@@ -1,6 +1,6 @@
 """Launch a verified Mac candidate, exercise its native graceful quit, relaunch.
 
-Usage: app_lifetime.py /path/to/Erlkonig.app
+Usage: app_lifetime.py /path/to/Erlkonig.app [--existing-data]
 Requires explicit delivery authority: creates only the app's own default data.
 Never edits client configuration or login items. Leaves the final app open.
 """
@@ -25,7 +25,10 @@ def processes():
             for line in output.splitlines() if len(line.strip().split(None, 1)) == 2]
 
 assert not any(Path(command).name in ("erlkonig", "erlkonig-node") for _, command in processes()), "another Erlkonig is already running"
-assert not data.exists(), "first-run smoke requires an absent app data directory; never replace existing user data"
+if "--existing-data" in sys.argv[2:]:
+    assert not (data / "node.toml").exists(), "successor smoke requires the unchanged, unconfigured app-only fixture"
+else:
+    assert not data.exists(), "first-run smoke requires an absent app data directory; never replace existing user data"
 subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], check=True)
 active = None
 success = False
@@ -91,7 +94,29 @@ try:
     assert (now.st_ino, now.st_size, now.st_mtime_ns) == (key_stat.st_ino, key_stat.st_size, key_stat.st_mtime_ns), "key file changed on restart"
     with request(token) as response:
         assert json.load(response)["result"]["serverInfo"]["name"] == "faculties"
-    print("relaunch:", second, "same private key file and MCP credential; final app left running", flush=True)
+    print("relaunch:", second, "same private key file and MCP credential", flush=True)
+    # Hold an admitted body open, then request AppKit termination through the
+    # exact NSRunningApplication PID. No System Events/UI automation is used.
+    pending = socket.create_connection(("127.0.0.1", 41773), timeout=1)
+    pending.sendall(("POST / HTTP/1.1\r\nHost: 127.0.0.1:41773\r\nAuthorization: Bearer "
+        + token + "\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{").encode())
+    time.sleep(0.1)
+    before = time.monotonic()
+    command = 'ObjC.import("AppKit"); $.NSRunningApplication.runningApplicationWithProcessIdentifier(' + str(second) + ').terminate'
+    accepted = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e", command], capture_output=True, text=True, timeout=10)
+    assert accepted.returncode == 0 and "true" in accepted.stdout, "AppKit termination request was not accepted"
+    while any(pid == second for pid, _ in processes()) and time.monotonic() - before < 17:
+        time.sleep(0.05)
+    elapsed = time.monotonic() - before
+    assert not any(pid == second for pid, _ in processes()), "AppKit termination did not exit"
+    active = None
+    pending.close()
+    assert 3.0 < elapsed < 10.0, "AppKit must drain the five-second body deadline before exiting"
+    print("AppKit termination with stalled body:", round(elapsed, 3), "seconds; native drain observed", flush=True)
+    final = start()
+    with request(token) as response:
+        assert json.load(response)["result"]["serverInfo"]["name"] == "faculties"
+    print("final relaunch:", final, "authenticated native app left running", flush=True)
     success = True
 finally:
     if not success and active and any(pid == active and command == executable for pid, command in processes()):
