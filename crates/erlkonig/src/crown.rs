@@ -24,9 +24,9 @@ const HOLD: f64 = 0.120;
 const RELEASE: f64 = 0.480;
 const WAVE_STEPS: usize = 140;
 const SCALE: f64 = 0.060; // 400 canonical units → 24 points, with 1 pt side padding
-// Preserve the old on-screen amplitude: 0.85 source pixels in a 36 px image
-// displayed by tray-icon at 22 pt. Enlargement is not stronger animation.
-const MAX_DISPLACEMENT: f64 = 0.85 * 22.0 / 36.0;
+// Legible at native menu-bar size, still confined to the inner wave. This
+// single bound applies equally to real transfer activity and explicit preview.
+const MAX_DISPLACEMENT: f64 = 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferActivity {
@@ -272,7 +272,7 @@ mod tests {
             for (i, p) in f.points.iter().enumerate() {
                 assert!(p.x.is_finite() && p.y.is_finite());
                 assert!((1.0..=25.0).contains(&p.x));
-                assert!((3.0..=15.0).contains(&p.y));
+                assert!((2.0..=15.0).contains(&p.y));
                 assert_eq!(p.x, idle.points[i].x);
                 assert!((p.y - idle.points[i].y).abs() <= MAX_DISPLACEMENT);
                 if i <= 2 || i >= WAVE_STEPS + 2 {
@@ -315,7 +315,7 @@ mod tests {
         assert_eq!((min_x, max_x), (1.0, 25.0));
         assert!((max_y - min_y - 165.75 * SCALE).abs() < 1e-10);
         assert_eq!(max_y, 14.0);
-        assert!((MAX_DISPLACEMENT - 0.5194444444444445).abs() < 1e-10);
+        assert_eq!(MAX_DISPLACEMENT, 2.0);
     }
 
     #[test]
