@@ -244,12 +244,14 @@ mod tests {
         assert_ne!(active.points, idle.points);
         let almost = frame(ms(1759), burst(1000, 1160), false);
         assert!(almost.animating);
+        // One millisecond before the smoothstep ends, less than 1.4e-5 of
+        // the motion remains. Keep the tail check independent of amplitude.
         assert!(
             almost
                 .points
                 .iter()
                 .zip(&idle.points)
-                .all(|(a, b)| (a.y - b.y).abs() < 0.00002)
+                .all(|(a, b)| (a.y - b.y).abs() < MAX_DISPLACEMENT * 0.000014)
         );
         assert_eq!(idle, frame(ms(1760), burst(1000, 1160), false));
         assert_eq!(idle, frame(ms(2000), burst(1000, 1160), false));
