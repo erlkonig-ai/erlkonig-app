@@ -15,6 +15,7 @@ libc.workspace = true
 anyhow.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+hifitime.workspace = true
 tokio.workspace = true
 toml_edit.workspace = true
 faculties.workspace = true

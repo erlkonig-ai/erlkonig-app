@@ -1902,6 +1902,7 @@ version = "0.1.0"
 dependencies = [
  "block2 0.6.2",
  "erlkonig-core",
+ "hex",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
@@ -1920,6 +1921,7 @@ dependencies = [
  "faculties",
  "getrandom 0.4.3",
  "hex",
+ "hifitime",
  "iroh-base",
  "libc",
  "reqwest 0.12.28",

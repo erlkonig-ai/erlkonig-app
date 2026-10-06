@@ -2,16 +2,18 @@
 
 use crate::crown::{self, TransferActivity};
 use erlkonig_core::{
-    install,
+    config, install,
+    node_store::ManagedPile,
     paths::{self, Layout},
     runtime::Runtime,
 };
-use objc2::MainThreadMarker;
+use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSApplication, NSCellImagePosition, NSImageScaling,
-    NSPasteboard, NSPasteboardTypeString, NSWorkspace,
+    NSModalResponseOK, NSOpenPanel, NSPasteboard, NSPasteboardTypeString, NSTextField, NSView,
+    NSWorkspace,
 };
-use objc2_foundation::NSString;
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
 use std::path::PathBuf;
 use std::sync::{
@@ -19,7 +21,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
@@ -33,7 +35,19 @@ struct Items {
     chatgpt: MenuItem,
     claude: MenuItem,
     login: CheckMenuItem,
+    piles: Submenu,
+    add_pile: MenuItem,
     quit: MenuItem,
+}
+
+struct PileItems {
+    id: String,
+    submenu: Submenu,
+    sync: CheckMenuItem,
+    maintenance: CheckMenuItem,
+    edit: MenuItem,
+    details: MenuItem,
+    remove: MenuItem,
 }
 
 struct App {
@@ -51,6 +65,8 @@ struct App {
     next_refresh: Instant,
     quitting: Option<Instant>,
     terminate: Arc<AtomicBool>,
+    pile_items: Vec<PileItems>,
+    config_generation: u64,
 }
 
 fn login() -> objc2::rc::Retained<SMAppService> {
@@ -121,6 +137,32 @@ impl App {
                 .unwrap_or_else(|| "Not running".into())
         });
         self.items.status.set_text(text);
+        if let Some(status) = &status {
+            if status.config_generation != self.config_generation {
+                self.config_generation = status.config_generation;
+                self.rebuild_piles(status);
+            }
+            for items in &self.pile_items {
+                if let Some(pile) = status.managed.iter().find(|pile| pile.id == items.id) {
+                    items.sync.set_checked(pile.sync_enabled);
+                    items.maintenance.set_checked(pile.maintenance_enabled);
+                    let state = if pile.problem.is_some() {
+                        "problem"
+                    } else if pile.sync_running && pile.maintenance_running {
+                        "sync + maintenance"
+                    } else if pile.sync_running {
+                        "sync"
+                    } else if pile.maintenance_running {
+                        "local maintenance"
+                    } else if pile.sync_enabled || pile.maintenance_enabled {
+                        "starting"
+                    } else {
+                        "off"
+                    };
+                    items.submenu.set_text(format!("{} · {state}", pile.label));
+                }
+            }
+        }
         let usable = status
             .as_ref()
             .is_some_and(|s| s.running && s.mcp_url.is_some());
@@ -175,6 +217,7 @@ impl App {
             item.set_enabled(false);
         }
         self.items.login.set_enabled(false);
+        self.items.piles.set_enabled(false);
         if let Some(runtime) = &self.runtime {
             runtime.begin_shutdown();
         }
@@ -279,10 +322,282 @@ impl App {
         }
     }
 
+    fn rebuild_piles(&mut self, status: &erlkonig_core::status::Status) {
+        while self.items.piles.remove_at(0).is_some() {}
+        self.pile_items.clear();
+        let _ = self.items.piles.append(&self.items.add_pile);
+        let _ = self.items.piles.append(&PredefinedMenuItem::separator());
+        for pile in &status.managed {
+            let submenu = Submenu::new(
+                format!(
+                    "{}{}",
+                    pile.label,
+                    if pile.problem.is_some() { " ⚠" } else { "" }
+                ),
+                true,
+            );
+            let items = PileItems {
+                id: pile.id.clone(),
+                submenu: submenu.clone(),
+                sync: CheckMenuItem::new("Sync", true, pile.sync_enabled, None),
+                maintenance: CheckMenuItem::new(
+                    "Local maintenance",
+                    true,
+                    pile.maintenance_enabled,
+                    None,
+                ),
+                edit: MenuItem::new("Edit configuration…", true, None),
+                details: MenuItem::new("Status and paths…", true, None),
+                remove: MenuItem::new("Remove from Erlkönig…", true, None),
+            };
+            let _ = submenu.append_items(&[
+                &items.sync,
+                &items.maintenance,
+                &items.edit,
+                &items.details,
+                &PredefinedMenuItem::separator(),
+                &items.remove,
+            ]);
+            let _ = self.items.piles.append(&submenu);
+            self.pile_items.push(items);
+        }
+        if status.managed.is_empty() {
+            let _ = self.items.piles.append(&MenuItem::new(
+                "No managed piles — services are off",
+                false,
+                None,
+            ));
+        }
+    }
+
+    fn choose_file(&self, title: &str) -> Option<PathBuf> {
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(self.mtm).activateIgnoringOtherApps(true);
+        let panel = NSOpenPanel::openPanel(self.mtm);
+        panel.setTitle(Some(&NSString::from_str(title)));
+        panel.setCanChooseFiles(true);
+        panel.setCanChooseDirectories(false);
+        panel.setAllowsMultipleSelection(false);
+        panel.setCanCreateDirectories(false);
+        if panel.runModal() != NSModalResponseOK {
+            return None;
+        }
+        panel
+            .URL()?
+            .path()
+            .map(|path| PathBuf::from(path.to_string()))
+    }
+
+    fn edit_fields(&self, pile: &mut ManagedPile) -> Result<bool, String> {
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(self.mtm).activateIgnoringOtherApps(true);
+        let alert = NSAlert::new(self.mtm);
+        alert.setMessageText(&NSString::from_str("Managed pile configuration"));
+        alert.setInformativeText(&NSString::from_str("Enter exact IDs and collection handles, separated by spaces or commas. Adding a pile leaves Sync and Local maintenance off. MCP continues to use the node pile only."));
+        alert.addButtonWithTitle(&NSString::from_str("Save"));
+        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+        let view = NSView::initWithFrame(
+            NSView::alloc(self.mtm),
+            NSRect::new(NSPoint::ZERO, NSSize::new(600.0, 244.0)),
+        );
+        let values = [
+            pile.label.clone(),
+            pile.peers
+                .iter()
+                .map(hex::encode)
+                .collect::<Vec<_>>()
+                .join(" "),
+            pile.sync_collections
+                .iter()
+                .map(|h| format!("blake3:{}", hex::encode(h.raw)))
+                .collect::<Vec<_>>()
+                .join(" "),
+            pile.maintain_targets
+                .iter()
+                .map(|h| format!("blake3:{}", hex::encode(h.raw)))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ];
+        let mut fields = Vec::new();
+        for (i, (name, value)) in [
+            "Name",
+            "Peer IDs (64 hex)",
+            "Sync collections",
+            "Maintenance targets",
+        ]
+        .iter()
+        .zip(values)
+        .enumerate()
+        {
+            let y = 222.0 - i as f64 * 60.0;
+            let label = NSTextField::labelWithString(&NSString::from_str(name), self.mtm);
+            label.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(600.0, 20.0)));
+            view.addSubview(&label);
+            let field = NSTextField::textFieldWithString(&NSString::from_str(&value), self.mtm);
+            field.setFrame(NSRect::new(
+                NSPoint::new(0.0, y - 26.0),
+                NSSize::new(600.0, 24.0),
+            ));
+            view.addSubview(&field);
+            fields.push(field);
+        }
+        alert.setAccessoryView(Some(&view));
+        if alert.runModal() != NSAlertFirstButtonReturn {
+            return Ok(false);
+        }
+        let split = |s: String| {
+            s.split(|c: char| c.is_whitespace() || c == ',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        pile.label = fields[0].stringValue().to_string();
+        if pile.label.trim().is_empty() {
+            return Err("A name is required.".into());
+        }
+        pile.peers = split(fields[1].stringValue().to_string())
+            .iter()
+            .map(|peer| {
+                if !config::is_node_id(peer) {
+                    return Err("Peer IDs must have 64 hexadecimal characters.".to_owned());
+                }
+                hex::decode(peer)
+                    .map_err(|e| e.to_string())?
+                    .try_into()
+                    .map_err(|_| "Invalid peer ID".to_owned())
+            })
+            .collect::<Result<_, _>>()?;
+        pile.sync_collections = split(fields[2].stringValue().to_string())
+            .iter()
+            .map(|h| config::parse_handle(h).map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        pile.maintain_targets = split(fields[3].stringValue().to_string())
+            .iter()
+            .map(|h| config::parse_handle(h).map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        Ok(true)
+    }
+
+    fn add_pile(&self) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let result = (|| {
+            let expected = runtime.config().map_err(|e| e.to_string())?;
+            let Some(path) = self.choose_file("Choose the existing pile to manage") else {
+                return Ok(());
+            };
+            let Some(key) = self.choose_file("Choose its existing signing-key file") else {
+                return Ok(());
+            };
+            let label = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let mut pile = ManagedPile::new(label, path, key);
+            if self.edit_fields(&mut pile)? {
+                runtime
+                    .put_managed(&expected, &pile)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = result {
+            self.alert("Configuration not saved", &error, &["OK"]);
+        }
+    }
+
+    fn pile_action(&self, selected: &str, action: &str) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        if action == "details" {
+            if let Some(pile) = runtime.status().managed.iter().find(|p| p.id == selected) {
+                let text = format!(
+                    "{}\nPile: {}\nKey file: {}\nSigning identity: {}\nSync: {}\nLocal maintenance: {}\nTransferred: {} bytes\nMaintenance publications: {}\n{}",
+                    pile.label,
+                    pile.pile,
+                    pile.key,
+                    pile.node_id.as_deref().unwrap_or("not loaded while off"),
+                    if pile.sync_running {
+                        "running"
+                    } else if pile.sync_enabled {
+                        "requested — not running"
+                    } else {
+                        "off"
+                    },
+                    if pile.maintenance_running {
+                        "running"
+                    } else if pile.maintenance_enabled {
+                        "requested — not running"
+                    } else {
+                        "off"
+                    },
+                    pile.transfer_bytes,
+                    pile.maintenance_publications,
+                    pile.problem.as_deref().unwrap_or("No reported problem")
+                );
+                self.alert("Managed pile status", &text, &["OK"]);
+            }
+            return;
+        }
+        let result = (|| {
+            let expected = runtime.config().map_err(|e| e.to_string())?;
+            let id = expected
+                .managed_ids()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|id| id.to_string() == selected)
+                .ok_or("This entry is no longer configured.")?;
+            if action == "remove" {
+                if self.alert("Remove managed pile?", "This stops its services and removes the entry from this app. The pile and signing-key files are never deleted.", &["Remove", "Cancel"]) == 0 {
+                    runtime.remove_managed(&expected, id).map_err(|e| e.to_string())?;
+                }
+                return Ok(());
+            }
+            let mut pile = expected
+                .managed(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("This entry was removed.")?;
+            match action {
+                "sync" => pile.sync_enabled = !pile.sync_enabled,
+                "maintenance" => pile.maintenance_enabled = !pile.maintenance_enabled,
+                "edit" => {
+                    if !self.edit_fields(&mut pile)? {
+                        return Ok(());
+                    }
+                }
+                _ => return Ok(()),
+            }
+            runtime
+                .put_managed(&expected, &pile)
+                .map_err(|e| e.to_string())
+        })();
+        if let Err(error) = result {
+            self.alert("Configuration not saved", &error, &["OK"]);
+        }
+    }
+
     fn on_menu(&mut self, event: MenuEvent, event_loop: &ActiveEventLoop) {
         let id = event.id();
         if id == self.items.quit.id() {
             self.quit();
+        } else if id == self.items.add_pile.id() {
+            self.add_pile();
+        } else if let Some((entry, action)) = self.pile_items.iter().find_map(|p| {
+            [
+                (p.sync.id(), "sync"),
+                (p.maintenance.id(), "maintenance"),
+                (p.edit.id(), "edit"),
+                (p.details.id(), "details"),
+                (p.remove.id(), "remove"),
+            ]
+            .into_iter()
+            .find(|(item, _)| id == *item)
+            .map(|(_, action)| (p.id.clone(), action))
+        }) {
+            self.pile_action(&entry, action);
         } else if id == self.items.copy_id.id() {
             if let Some(id) = self.runtime.as_ref().and_then(|r| r.status().node_id) {
                 let pb = NSPasteboard::generalPasteboard();
@@ -306,10 +621,11 @@ impl App {
                     .map(|r| {
                         let s = r.status();
                         format!(
-                            "{}\n{}\n{}",
+                            "{}\n{}\n{}\n{}",
                             s.summary(),
                             s.mcp_url.unwrap_or_default(),
-                            s.warnings.join("\n")
+                            s.warnings.join("\n"),
+                            s.metrics_problem.unwrap_or_default()
                         )
                     })
                     .unwrap_or_default()
@@ -382,11 +698,14 @@ pub fn main() {
         chatgpt: MenuItem::new("Connect ChatGPT…", true, None),
         claude: MenuItem::new("Connect Claude…", true, None),
         login: CheckMenuItem::new("Open at login", true, false, None),
+        piles: Submenu::new("Managed Piles", true),
+        add_pile: MenuItem::new("Add existing pile…", true, None),
         quit: MenuItem::new("Quit Erlkönig", true, None),
     };
     let menu = Menu::new();
     menu.append_items(&[
         &items.status,
+        &items.piles,
         &PredefinedMenuItem::separator(),
         &items.copy_id,
         &items.chatgpt,
@@ -411,6 +730,8 @@ pub fn main() {
         next_refresh: Instant::now(),
         quitting: None,
         terminate,
+        pile_items: Vec::new(),
+        config_generation: u64::MAX,
     };
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("Erlkönig: {error}");

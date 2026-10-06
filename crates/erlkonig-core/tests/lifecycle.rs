@@ -1,4 +1,10 @@
-use erlkonig_core::{credentials, paths::Layout, runtime::Runtime};
+use erlkonig_core::{
+    config::Bootstrap,
+    credentials, init,
+    node_store::{ManagedPile, NodeStore},
+    paths::Layout,
+    runtime::Runtime,
+};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -12,7 +18,11 @@ fn fixture() -> (tempfile::TempDir, Layout) {
     let dir = tempfile::tempdir().unwrap();
     let layout = Layout::new(dir.path().join("data"));
     fs::create_dir(&layout.dir).unwrap();
-    fs::write(layout.config(), "mcp_port = 0\n").unwrap();
+    let signer = init::prepare(&Bootstrap::new(&layout.dir)).unwrap();
+    let mut node = NodeStore::open(&layout.default_pile(), signer).unwrap();
+    let view = node.config().unwrap();
+    node.put_mcp_port(&view, 0).unwrap();
+    node.close().unwrap();
     (dir, layout)
 }
 
@@ -174,10 +184,241 @@ fn quit_stops_accepting_and_bounds_a_stalled_http_body() {
 #[test]
 fn missing_named_key_is_reported_without_fallback() {
     let (_dir, layout) = fixture();
-    fs::write(layout.config(), "mcp_port = 0\nkey = 'missing.key'\n").unwrap();
-    let error = Runtime::start(&layout).err().unwrap().to_string();
-    assert!(error.contains("signing identity"), "{error}");
+    let mut app = Runtime::start(&layout).unwrap();
+    let mut managed = ManagedPile::new(
+        "missing key",
+        layout.dir.join("external.pile"),
+        layout.dir.join("missing.key"),
+    );
+    fs::write(&managed.pile, []).unwrap();
+    managed.sync_enabled = true;
+    app.put_managed(&app.config().unwrap(), &managed).unwrap();
+    wait_for(&app, |s| {
+        s.managed.iter().any(|p| {
+            p.problem
+                .as_ref()
+                .is_some_and(|e| e.contains("signing identity"))
+        })
+    });
     assert!(!layout.dir.join("missing.key").exists());
+    app.finish().unwrap();
+}
+
+fn wait_for(app: &Runtime, predicate: impl Fn(&erlkonig_core::status::Status) -> bool) {
+    let began = Instant::now();
+    loop {
+        let status = app.status();
+        if predicate(&status) {
+            return;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(15),
+            "timed out: {status:?}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn managed_fixture(dir: &std::path::Path, name: &str) -> ManagedPile {
+    use triblespace::core::{collection::CollectionStoreExt, metadata, signing_key_file};
+    use triblespace::prelude::*;
+    let pile = dir.join(format!("{name}.pile"));
+    let key = dir.join(format!("{name}.key"));
+    fs::write(&pile, []).unwrap();
+    signing_key_file::init(&key).unwrap();
+    let signer = signing_key_file::load_existing(&key).unwrap();
+    let mut store = faculties::storage::open_pile_strict_as(&pile, signer.verifying_key()).unwrap();
+    let collection = store
+        .collection(
+            name,
+            faculties::collection_names::private_policy(signer.verifying_key()),
+        )
+        .unwrap();
+    store
+        .commit(
+            collection,
+            &signer,
+            entity! { metadata::name: name.to_owned() },
+        )
+        .unwrap();
+    let mut config = ManagedPile::new(name, pile, key);
+    config.sync_collections.push(collection.handle());
+    config.maintain_targets.push(collection.handle());
+    store.close().unwrap();
+    config
+}
+
+#[test]
+fn two_piles_reconfigure_stop_persist_and_metrics_do_not_restart_workers() {
+    let (dir, layout) = fixture();
+    let mut first = managed_fixture(dir.path(), "first");
+    let mut second = managed_fixture(dir.path(), "second");
+    first.sync_enabled = true;
+    first.maintenance_enabled = true;
+    second.maintenance_enabled = true;
+    let mut app = Runtime::start(&layout).unwrap();
+    app.put_managed(&app.config().unwrap(), &first).unwrap();
+    app.put_managed(&app.config().unwrap(), &second).unwrap();
+    wait_for(&app, |s| {
+        s.managed.len() == 2
+            && s.managed.iter().all(|p| p.maintenance_running)
+            && s.managed.iter().any(|p| p.sync_running)
+    });
+    let before = app.status();
+    let sockets: Vec<String> = before
+        .managed
+        .iter()
+        .flat_map(|p| p.bound_sockets.clone())
+        .collect();
+    assert!(
+        !sockets.is_empty(),
+        "sync session owns real native UDP sockets"
+    );
+    thread::sleep(Duration::from_millis(800));
+    assert_eq!(
+        before.config_generation,
+        app.status().config_generation,
+        "metrics writes must not invalidate config"
+    );
+    assert!(app.status().managed.iter().all(|p| p.sessions_started == 1));
+    first.sync_enabled = false;
+    app.put_managed(&app.config().unwrap(), &first).unwrap();
+    wait_for(&app, |s| {
+        s.managed.iter().all(|p| !p.sync_running)
+            && s.managed.iter().all(|p| p.maintenance_running)
+            && s.managed
+                .iter()
+                .find(|p| p.label == "first")
+                .is_some_and(|p| p.sessions_started == 2)
+    });
+    for socket in sockets {
+        drop(
+            std::net::UdpSocket::bind(socket)
+                .expect("Sync Off releases native UDP sockets while local maintenance continues"),
+        );
+    }
+    second.maintenance_enabled = false;
+    app.put_managed(&app.config().unwrap(), &second).unwrap();
+    wait_for(&app, |s| {
+        s.managed
+            .iter()
+            .find(|p| p.label == "second")
+            .is_some_and(|p| !p.maintenance_running && !p.maintenance_enabled)
+    });
+    app.finish().unwrap();
+    let signer = triblespace::core::signing_key_file::load_existing(&layout.default_key()).unwrap();
+    let mut node = NodeStore::open(&layout.default_pile(), signer).unwrap();
+    let reports = node
+        .metrics(
+            erlkonig_core::node_metrics::now_tai_ns().unwrap(),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    assert!(
+        !reports.is_empty(),
+        "actual native sessions/maintenance emit metrics in node pile"
+    );
+    node.close().unwrap();
+    let mut app = Runtime::start(&layout).unwrap();
+    wait_for(&app, |s| {
+        s.managed.len() == 2
+            && s.managed
+                .iter()
+                .any(|p| p.label == "first" && p.maintenance_running)
+    });
+    assert!(app.status().managed.iter().all(|p| !p.sync_running));
+    assert!(
+        app.status()
+            .managed
+            .iter()
+            .any(|p| p.label == "second" && !p.maintenance_running && !p.maintenance_enabled)
+    );
+    app.finish().unwrap();
+}
+
+#[test]
+fn duplicate_alias_and_signer_activation_is_rejected_without_taking_over() {
+    let (dir, layout) = fixture();
+    let mut first = managed_fixture(dir.path(), "one");
+    first.sync_enabled = true;
+    let mut alias = first.clone();
+    alias.id = triblespace::core::id::genid().id;
+    alias.label = "alias".into();
+    alias.pile = dir.path().join("hardlink.pile");
+    fs::hard_link(&first.pile, &alias.pile).unwrap();
+    let mut app = Runtime::start(&layout).unwrap();
+    app.put_managed(&app.config().unwrap(), &first).unwrap();
+    app.put_managed(&app.config().unwrap(), &alias).unwrap();
+    wait_for(&app, |s| {
+        s.managed.len() == 2
+            && s.managed.iter().all(|p| {
+                p.problem
+                    .as_ref()
+                    .is_some_and(|e| e.contains("same pile file"))
+            })
+    });
+    assert!(app.status().managed.iter().all(|p| !p.sync_running));
+    let other = managed_fixture(dir.path(), "other");
+    alias.pile = other.pile;
+    alias.sync_collections = other.sync_collections;
+    app.put_managed(&app.config().unwrap(), &alias).unwrap();
+    wait_for(&app, |s| {
+        s.managed.iter().all(|p| {
+            p.problem
+                .as_ref()
+                .is_some_and(|e| e.contains("signing identity"))
+        })
+    });
+    assert!(app.status().managed.iter().all(|p| !p.sync_running));
+    app.finish().unwrap();
+}
+
+#[test]
+fn unreadable_config_stops_existing_managed_sessions() {
+    use std::io::Write;
+    let (dir, layout) = fixture();
+    let mut entry = managed_fixture(dir.path(), "local");
+    entry.maintenance_enabled = true;
+    let mut app = Runtime::start(&layout).unwrap();
+    app.put_managed(&app.config().unwrap(), &entry).unwrap();
+    wait_for(&app, |s| s.managed.iter().any(|p| p.maintenance_running));
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(layout.default_pile())
+        .unwrap();
+    file.write_all(&[0xff; 256]).unwrap();
+    file.sync_all().unwrap();
+    wait_for(&app, |s| {
+        s.config_problem.is_some() && s.managed.iter().all(|p| !p.maintenance_running)
+    });
+    let _ = app.finish(); // Corrupt control-store shutdown can report its read fault.
+}
+
+// This is a test-harness process, never a shipped daemon/headless app mode.
+#[test]
+fn gui_fixture() {
+    let Some(root) = std::env::var_os("ERLKONIG_GUI_FIXTURE") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    assert!(!root.exists(), "refuse to reuse a GUI fixture");
+    let home = root.join("home");
+    let layout = Layout::new(erlkonig_core::paths::default_data_dir_for(&home));
+    fs::create_dir_all(&layout.dir).unwrap();
+    let signer = init::prepare(&Bootstrap::new(&layout.dir)).unwrap();
+    let mut node = NodeStore::open(&layout.default_pile(), signer).unwrap();
+    let view = node.config().unwrap();
+    node.put_mcp_port(&view, 0).unwrap();
+    let first = managed_fixture(&root, "Scratch One");
+    let second = managed_fixture(&root, "Scratch Two");
+    let view = node.config().unwrap();
+    node.put_managed(&view, &first).unwrap();
+    node.close().unwrap();
+    fs::write(root.join("fixture.json"), serde_json::to_vec_pretty(&json!({
+        "home": home,
+        "first": { "pile": first.pile, "key": first.key, "collection": format!("blake3:{}", hex::encode(first.sync_collections[0].raw)) },
+        "second": { "pile": second.pile, "key": second.key, "collection": format!("blake3:{}", hex::encode(second.sync_collections[0].raw)) }
+    })).unwrap()).unwrap();
 }
 
 // This is a test-harness process, never a shipped daemon/headless app mode.
@@ -187,6 +428,13 @@ fn force_quit_fixture() {
         return;
     };
     let layout = Layout::new(dir);
+    if !layout.default_pile().exists() {
+        let signer = init::prepare(&Bootstrap::new(&layout.dir)).unwrap();
+        let mut node = NodeStore::open(&layout.default_pile(), signer).unwrap();
+        let expected = node.config().unwrap();
+        node.put_mcp_port(&expected, 0).unwrap();
+        node.close().unwrap();
+    }
     let _app = Runtime::start(&layout).unwrap();
     fs::write(
         layout.dir.join("fixture-ready"),

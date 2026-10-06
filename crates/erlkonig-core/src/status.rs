@@ -7,6 +7,24 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PileStatus {
+    pub id: String,
+    pub label: String,
+    pub pile: String,
+    pub key: String,
+    pub node_id: Option<String>,
+    pub bound_sockets: Vec<String>,
+    pub sync_enabled: bool,
+    pub maintenance_enabled: bool,
+    pub sync_running: bool,
+    pub maintenance_running: bool,
+    pub problem: Option<String>,
+    pub transfer_bytes: u64,
+    pub maintenance_publications: u64,
+    pub sessions_started: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Status {
     pub running: bool,
     pub node_id: Option<String>,
@@ -18,6 +36,10 @@ pub struct Status {
     /// Actual payload bytes transferred. Connection/idle events never advance it.
     pub transfer_bytes: u64,
     pub maintenance_publications: u64,
+    pub managed: Vec<PileStatus>,
+    pub config_generation: u64,
+    pub config_problem: Option<String>,
+    pub metrics_problem: Option<String>,
 }
 
 impl Status {
@@ -25,15 +47,27 @@ impl Status {
         if let Some(problem) = &self.problem {
             return format!("Problem: {problem}");
         }
+        if let Some(problem) = &self.config_problem {
+            return format!("Configuration: {problem}");
+        }
         if !self.running {
             return "Erlkönig is stopped".into();
         }
-        let sync = if self.sync_collections == 0 {
+        if self.metrics_problem.is_some() {
+            return "Running · metrics could not be saved".into();
+        }
+        let active = self.managed.iter().filter(|p| p.sync_running).count();
+        let sync = if active == 0 {
             "sync off".into()
         } else {
-            format!("{} sync collections", self.sync_collections)
+            format!("{active} syncing piles")
         };
-        format!("Running · {sync} · authenticated MCP")
+        let problems = self.managed.iter().filter(|p| p.problem.is_some()).count();
+        if problems > 0 {
+            format!("Running · {sync} · {problems} pile problems")
+        } else {
+            format!("Running · {sync} · authenticated MCP")
+        }
     }
 }
 

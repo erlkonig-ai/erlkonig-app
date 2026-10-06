@@ -39,9 +39,6 @@ impl Layout {
     pub fn lock(&self) -> PathBuf {
         self.dir.join("node.lock")
     }
-    pub fn config(&self) -> PathBuf {
-        self.dir.join("node.toml")
-    }
     pub fn default_pile(&self) -> PathBuf {
         self.dir.join("self.pile")
     }
@@ -51,13 +48,7 @@ impl Layout {
 }
 
 /// Files whose presence marks a folder as an Erlkonig data or log folder.
-const OUR_FILES: &[&str] = &[
-    "node.toml",
-    "node.lock",
-    "self.pile",
-    "self.key",
-    "mcp.token",
-];
+const OUR_FILES: &[&str] = &["node.lock", "self.pile", "self.key", "mcp.token"];
 
 /// True when `dir` is empty or holds one of Erlkonig's own files.
 fn looks_like_ours(dir: &Path) -> io::Result<bool> {
@@ -153,8 +144,8 @@ mod tests {
             fs::metadata(&d).unwrap().permissions().mode() & 0o777,
             0o755
         );
-        // The same folder once it holds a node.toml is ours, and is tightened.
-        fs::write(d.join("node.toml"), "").unwrap();
+        // The same folder once it holds a node pile is ours, and is tightened.
+        fs::write(d.join("self.pile"), "").unwrap();
         ensure_private_dir(&d).unwrap();
         assert_eq!(
             fs::metadata(&d).unwrap().permissions().mode() & 0o777,
@@ -176,7 +167,6 @@ mod tests {
     fn layout_names() {
         let l = Layout::new("/d");
         assert_eq!(l.lock(), Path::new("/d/node.lock"));
-        assert_eq!(l.config(), Path::new("/d/node.toml"));
         assert_eq!(l.default_pile(), Path::new("/d/self.pile"));
         assert_eq!(l.default_key(), Path::new("/d/self.key"));
     }

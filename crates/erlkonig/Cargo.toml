@@ -14,6 +14,7 @@ path = "../../scripts/crown-preview.rs"
 [dependencies]
 erlkonig-core.workspace = true
 signal-hook.workspace = true
+hex.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon.workspace = true

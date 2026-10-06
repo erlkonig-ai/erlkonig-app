@@ -1,6 +1,6 @@
 //! Native first-start setup. No CLI invocation or ambient pile/key selection.
 
-use crate::config::Resolved;
+use crate::config::Bootstrap;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
@@ -10,7 +10,7 @@ use triblespace::core::signing_key_file;
 pub fn ensure_pile(pile: &Path, create: bool) -> Result<(), String> {
     if create && fs::symlink_metadata(pile).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(
-            "the default pile is a symlink; explicitly name another pile in node.toml".into(),
+            "the node pile is a symlink; the fixed application root must be a regular file".into(),
         );
     }
     match fs::metadata(pile) {
@@ -29,9 +29,9 @@ pub fn ensure_pile(pile: &Path, create: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub fn prepare(config: &Resolved) -> Result<ed25519_dalek::SigningKey, String> {
-    ensure_pile(&config.pile, !config.pile_named)?;
-    if !config.key_named && fs::symlink_metadata(&config.key).is_err() {
+pub fn prepare(config: &Bootstrap) -> Result<ed25519_dalek::SigningKey, String> {
+    ensure_pile(&config.pile, true)?;
+    if fs::symlink_metadata(&config.key).is_err() {
         signing_key_file::init(&config.key)
             .map_err(|e| format!("cannot initialize signing identity: {e}"))?;
     }
@@ -45,14 +45,12 @@ mod tests {
     #[test]
     fn defaults_are_private_stable_and_named_paths_are_never_created() {
         let d = tempfile::tempdir().unwrap();
-        let r = crate::config::NodeConfig::default().resolve(d.path());
+        let r = Bootstrap::new(d.path());
         let first = prepare(&r).unwrap();
         assert_eq!(first.to_bytes(), prepare(&r).unwrap().to_bytes());
-        let mut named = r.clone();
-        named.pile = d.path().join("missing.pile");
-        named.pile_named = true;
-        assert!(prepare(&named).is_err());
-        assert!(!named.pile.exists());
+        let named = d.path().join("missing.pile");
+        assert!(ensure_pile(&named, false).is_err());
+        assert!(!named.exists());
     }
     #[test]
     fn default_pile_never_follows_a_link() {

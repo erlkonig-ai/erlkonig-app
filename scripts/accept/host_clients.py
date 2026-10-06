@@ -25,7 +25,6 @@ def private(path, text):
     with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as file:
         file.write(text)
 
-private(data / "node.toml", "mcp_port = 0\n")
 env = {k: v for k, v in os.environ.items()
        if not k.startswith("TRIBLESPACE_") and k not in ("PILE", "PERSONA", "ANTHROPIC_API_KEY", "OPENAI_API_KEY")}
 env.update(HOME=str(home), CODEX_HOME=str(codex_home), CLAUDE_CONFIG_DIR=str(claude_home),
