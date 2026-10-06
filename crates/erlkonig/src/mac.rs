@@ -95,7 +95,9 @@ impl App {
             if self.runtime.as_ref().is_none_or(Runtime::is_finished) {
                 if let Some(mut runtime) = self.runtime.take() {
                     if let Err(error) = runtime.finish() {
-                        self.alert("Erlkönig shutdown", &format!("{error:#}"), &["Close"]);
+                        // Quit is final even when cleanup reports an error.
+                        // Never put a modal dialog between joined workers and exit.
+                        eprintln!("Erlkönig shutdown: {error:#}");
                     }
                 }
                 event_loop.exit();
@@ -168,6 +170,26 @@ impl App {
         self.items.login.set_enabled(false);
         if let Some(runtime) = &self.runtime {
             runtime.begin_shutdown();
+        }
+    }
+
+    /// AppKit can terminate without returning from run_app. Winit delivers
+    /// LoopExiting synchronously from applicationWillTerminate, so drain here
+    /// before returning to AppKit, with the same final process-exit deadline.
+    fn finish_termination(&mut self) {
+        if let Some(mut runtime) = self.runtime.take() {
+            runtime.begin_shutdown();
+            let since = self.quitting.unwrap_or_else(Instant::now);
+            while !runtime.is_finished() {
+                if since.elapsed() >= Duration::from_secs(15) {
+                    eprintln!("Erlkönig: shutdown grace elapsed during application termination");
+                    std::process::exit(1);
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if let Err(error) = runtime.finish() {
+                eprintln!("Erlkönig shutdown: {error:#}");
+            }
         }
     }
 
@@ -325,6 +347,9 @@ impl ApplicationHandler<MenuEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_refresh));
     }
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        self.finish_termination();
+    }
 }
 
 pub fn main() {
@@ -380,19 +405,6 @@ pub fn main() {
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("Erlkönig: {error}");
     }
-    // Covers OS-initiated loop termination as well as the explicit menu action.
-    if let Some(mut runtime) = app.runtime.take() {
-        runtime.begin_shutdown();
-        let since = app.quitting.unwrap_or_else(Instant::now);
-        while !runtime.is_finished() {
-            if since.elapsed() >= Duration::from_secs(15) {
-                eprintln!("Erlkönig: shutdown grace elapsed after event-loop termination");
-                std::process::exit(1);
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        if let Err(error) = runtime.finish() {
-            eprintln!("Erlkönig shutdown: {error:#}");
-        }
-    }
+    // Idempotent fallback for event-loop construction/execution errors.
+    app.finish_termination();
 }
