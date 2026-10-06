@@ -1,5 +1,5 @@
 """Ask `codex app-server` (the engine inside ChatGPT) for the faculties
-server's tool list, and call one tool in a thread.
+server's tool list, and call one native tool in a scratch thread.
 Usage: appserver_tools.py <codex> <HOME> <CODEX_HOME>"""
 import json, os, queue, subprocess, sys, threading, time
 codex, home, codex_home = sys.argv[1:4]
@@ -21,7 +21,7 @@ def call(i, method, params, timeout=90):
 r = call(1, "initialize", {"clientInfo": {"name": "erlkonig-test", "version": "0"}})
 print("initialize:", "ok" if "result" in r else r)
 send({"method": "initialized"})
-r = call(2, "mcpServerStatus/list", {"serverName": "faculties"})
+r = call(2, "mcpServerStatus/list", {"serverName": "erlkonig"})
 if "error" in r:
     print("mcpServerStatus/list ERROR", r["error"])
 else:
@@ -30,13 +30,15 @@ else:
         print(f"mcpServerStatus/list: server={s['name']} plugin={s.get('pluginId')} serverInfo={json.dumps(s.get('serverInfo'))} "
               f"tools={len(tools)} toolsError={s.get('toolsError')}")
         print("  sample tools:", sorted(tools)[:6])
+    assert any(s["name"] == "erlkonig" and s.get("tools") for s in r["result"]["data"]), "native HTTP server absent"
 r = call(3, "thread/start", {"ephemeral": True, "cwd": home})
 if "error" in r:
     print("thread/start ERROR", json.dumps(r["error"])[:300])
 else:
     tid = r["result"]["thread"]["id"]
-    c = call(4, "mcpServer/tool/call", {"server": "faculties", "threadId": tid, "tool": "compass_list", "arguments": {}})
+    c = call(4, "mcpServer/tool/call", {"server": "erlkonig", "threadId": tid, "tool": "compass_list", "arguments": {}})
     print("compass_list in a thread:", json.dumps(c.get("result", c.get("error")))[:200])
+    assert "result" in c and not c["result"].get("isError"), "native tool call failed"
 p.stdin.close()
 p.wait(timeout=30)
 print("app-server exit:", p.returncode)

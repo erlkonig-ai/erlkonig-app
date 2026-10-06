@@ -30,6 +30,9 @@ pub struct NodeConfig {
     pub sync_collections: Vec<String>,
     #[serde(default)]
     pub maintain_targets: Vec<String>,
+    /// Stable loopback HTTP port; zero asks the OS for a port in fixtures.
+    #[serde(default)]
+    pub mcp_port: Option<u16>,
 }
 
 /// The config with paths made absolute and defaults filled in.
@@ -44,6 +47,7 @@ pub struct Resolved {
     pub peers: Vec<String>,
     pub sync_collections: Vec<String>,
     pub maintain_targets: Vec<String>,
+    pub mcp_port: u16,
 }
 
 fn is_hex64(s: &str) -> bool {
@@ -113,21 +117,36 @@ impl NodeConfig {
     }
 
     pub fn resolve(&self, data_dir: &Path) -> Resolved {
-        let abs = |p: &PathBuf| if p.is_absolute() { p.clone() } else { data_dir.join(p) };
+        let abs = |p: &PathBuf| {
+            if p.is_absolute() {
+                p.clone()
+            } else {
+                data_dir.join(p)
+            }
+        };
         Resolved {
-            pile: self.pile.as_ref().map(abs).unwrap_or_else(|| data_dir.join("self.pile")),
-            key: self.key.as_ref().map(abs).unwrap_or_else(|| data_dir.join("self.key")),
+            pile: self
+                .pile
+                .as_ref()
+                .map(abs)
+                .unwrap_or_else(|| data_dir.join("self.pile")),
+            key: self
+                .key
+                .as_ref()
+                .map(abs)
+                .unwrap_or_else(|| data_dir.join("self.key")),
             pile_named: self.pile.is_some(),
             key_named: self.key.is_some(),
             peers: dedup(&self.peers),
             sync_collections: dedup(&self.sync_collections),
             maintain_targets: dedup(&self.maintain_targets),
+            mcp_port: self.mcp_port.unwrap_or(41773),
         }
     }
 }
 
 /// Folders below `$HOME` that macOS guards with privacy prompts (TCC). A
-/// LaunchAgent is subject to them too, so a pile or key there may be refused
+/// Native app work is subject to them too, so a pile or key there may be refused
 /// or prompt for access, and with an ad hoc signature prompt again after every
 /// rebuild.
 pub const PROTECTED_FOLDERS: &[&str] = &["Desktop", "Documents", "Downloads"];
@@ -142,7 +161,7 @@ impl Resolved {
             for folder in PROTECTED_FOLDERS {
                 if path.starts_with(home.join(folder)) {
                     out.push(format!(
-                        "the {what} {} is inside {folder}, which macOS protects: the background node may be \
+                        "the {what} {} is inside {folder}, which macOS protects: the app may be \
 refused access or macOS may ask for permission (again after every rebuild while the app is signed ad hoc)",
                         path.display()
                     ));
@@ -166,7 +185,9 @@ mod tests {
         assert_eq!(r.pile, Path::new("/d/self.pile"));
         assert_eq!(r.key, Path::new("/d/self.key"));
         assert!(!r.pile_named && !r.key_named);
-        assert!(r.peers.is_empty() && r.sync_collections.is_empty() && r.maintain_targets.is_empty());
+        assert!(
+            r.peers.is_empty() && r.sync_collections.is_empty() && r.maintain_targets.is_empty()
+        );
     }
 
     #[test]
@@ -201,16 +222,21 @@ mod tests {
     #[test]
     fn protected_folders_are_warned_about() {
         let home = Path::new("/Users/jp");
-        let named = NodeConfig::parse("pile = \"/Users/jp/Desktop/chatbot/liora/self.pile\"\nkey = \"/Users/jp/k\"")
-            .unwrap()
-            .resolve(Path::new("/Users/jp/Library/Application Support/Erlkonig"));
+        let named = NodeConfig::parse(
+            "pile = \"/Users/jp/Desktop/chatbot/liora/self.pile\"\nkey = \"/Users/jp/k\"",
+        )
+        .unwrap()
+        .resolve(Path::new("/Users/jp/Library/Application Support/Erlkonig"));
         let w = named.protected_folder_warnings(home);
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("pile") && w[0].contains("Desktop"), "{w:?}");
-        let default = NodeConfig::default().resolve(Path::new("/Users/jp/Library/Application Support/Erlkonig"));
+        let default = NodeConfig::default()
+            .resolve(Path::new("/Users/jp/Library/Application Support/Erlkonig"));
         assert!(default.protected_folder_warnings(home).is_empty());
         // A sibling whose name merely starts with "Desktop" is not inside it.
-        let sibling = NodeConfig::parse("pile = \"/Users/jp/Desktop2/p\"").unwrap().resolve(Path::new("/d"));
+        let sibling = NodeConfig::parse("pile = \"/Users/jp/Desktop2/p\"")
+            .unwrap()
+            .resolve(Path::new("/d"));
         assert!(sibling.protected_folder_warnings(home).is_empty());
     }
 
