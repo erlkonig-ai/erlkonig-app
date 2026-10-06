@@ -11,9 +11,12 @@ stdio launcher, LaunchAgent or KeepAlive restarter is bundled.
 serves configured collections; maintenance uses that Peer. Faculty reads use
 an existing lazy, non-serving ephemeral Leech when an exact payload is missing.
 These native owners and their safe pile handles all end with the app.
-Existing user-invoked Faculty commands (including Git and Habit shell
-predicates) can still launch external processes. They are not resident app
-sidecars, but arbitrary descendants are outside the native shutdown guarantee.
+Code's local Git operations use linked, vendored libgit2; no Git executable,
+external diff/filter/credential helper, or SSH/HTTPS transport is used. Its
+rename-similarity and clock-skewed history ordering can differ from Git CLI.
+User-invoked Habit shell predicates remain an explicit subprocess exception.
+They are not resident app sidecars, but arbitrary descendants are outside the
+native shutdown guarantee.
 
 The app uses `~/Library/Application Support/Erlkonig`, with its own empty pile,
 signing key and private MCP credential. Explicit `pile`/`key` paths in
