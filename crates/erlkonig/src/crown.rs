@@ -17,6 +17,8 @@ pub const WIDTH: f64 = 26.0;
 pub const HEIGHT: f64 = 18.0;
 /// After this much time without bytes the exact resting crown is restored.
 pub const SETTLE_AFTER: Duration = Duration::from_millis(600);
+/// Explicit visual preview: six seconds of motion, then the normal settle.
+const PREVIEW_FOR: Duration = Duration::from_secs(6);
 const ATTACK: f64 = 0.160;
 const HOLD: f64 = 0.120;
 const RELEASE: f64 = 0.480;
@@ -138,6 +140,27 @@ pub fn frame(now: Duration, activity: Option<TransferActivity>, reduced_motion: 
     points.push(template_point(425.0, 282.0));
     points.push(points[0]);
     Frame { points, animating }
+}
+
+/// Select a finite visual-only preview without changing observed byte activity.
+///
+/// The caller replaces only `preview_started` when the person requests another
+/// preview. Once it settles, genuine activity is rendered exactly as usual.
+pub fn frame_with_preview(
+    now: Duration,
+    activity: Option<TransferActivity>,
+    preview_started: Option<Duration>,
+    reduced_motion: bool,
+) -> Frame {
+    let preview = preview_started.filter(|start| {
+        now.checked_sub(*start)
+            .is_some_and(|elapsed| elapsed < PREVIEW_FOR + SETTLE_AFTER)
+    });
+    let visual_activity = preview.map(|start| TransferActivity {
+        began_at: start,
+        last_transfer_at: now.min(start.saturating_add(PREVIEW_FOR)),
+    });
+    frame(now, visual_activity.or(activity), reduced_motion)
 }
 
 #[cfg(target_os = "macos")]
@@ -293,5 +316,69 @@ mod tests {
         assert!((max_y - min_y - 165.75 * SCALE).abs() < 1e-10);
         assert_eq!(max_y, 14.0);
         assert!((MAX_DISPLACEMENT - 0.5194444444444445).abs() < 1e-10);
+    }
+
+    #[test]
+    fn preview_is_finite_and_settles_to_exact_idle() {
+        let idle = frame(ms(0), None, false);
+        for elapsed in [0, 80, 5999, 6000, 6599] {
+            assert!(frame_with_preview(ms(1000 + elapsed), None, Some(ms(1000)), false).animating);
+        }
+        assert_ne!(
+            idle.points,
+            frame_with_preview(ms(2000), None, Some(ms(1000)), false).points
+        );
+        for now in [ms(7600), ms(9000), Duration::MAX] {
+            assert_eq!(idle, frame_with_preview(now, None, Some(ms(1000)), false));
+        }
+    }
+
+    #[test]
+    fn preview_retrigger_restarts_one_finite_envelope() {
+        let mut started = Some(ms(1000));
+        assert!(frame_with_preview(ms(6500), None, started, false).animating);
+        started = Some(ms(6500));
+        let restarted = frame_with_preview(ms(6500), None, started, false);
+        assert!(restarted.animating);
+        assert_eq!(restarted.points, frame(ms(0), None, false).points);
+        assert!(frame_with_preview(ms(7600), None, started, false).animating);
+        assert!(!frame_with_preview(ms(13_100), None, started, false).animating);
+    }
+
+    #[test]
+    fn preview_respects_reduced_motion_at_every_phase() {
+        let idle = frame(ms(0), None, false);
+        for now in [1000, 1080, 3000, 7000, 7599, 7600] {
+            assert_eq!(
+                idle,
+                frame_with_preview(ms(now), burst(0, now), Some(ms(1000)), true)
+            );
+        }
+    }
+
+    #[test]
+    fn preview_never_leaks_into_real_activity() {
+        for now in [ms(7600), ms(10_000)] {
+            for real in [
+                None,
+                burst(0, 3000),
+                burst(7000, 7500),
+                burst(7000, now.as_millis() as u64),
+            ] {
+                assert_eq!(
+                    frame(now, real, false),
+                    frame_with_preview(now, real, Some(ms(1000)), false)
+                );
+                assert_eq!(
+                    frame(now, real, false),
+                    frame_with_preview(now, real, None, false)
+                );
+            }
+        }
+        // An invalid future preview also cannot suppress genuine activity.
+        assert_eq!(
+            frame(ms(500), burst(0, 500), false),
+            frame_with_preview(ms(500), burst(0, 500), Some(ms(1000)), false)
+        );
     }
 }

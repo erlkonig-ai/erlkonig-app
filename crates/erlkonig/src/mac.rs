@@ -31,6 +31,7 @@ use winit::window::WindowId;
 
 struct Items {
     status: MenuItem,
+    preview: MenuItem,
     copy_id: MenuItem,
     chatgpt: MenuItem,
     claude: MenuItem,
@@ -60,6 +61,7 @@ struct App {
     tray: Option<TrayIcon>,
     origin: Instant,
     activity: Option<TransferActivity>,
+    preview_started: Option<Duration>,
     transfer_bytes: u64,
     animating: bool,
     next_refresh: Instant,
@@ -191,7 +193,7 @@ impl App {
         self.transfer_bytes = bytes;
         let reduced =
             unsafe { NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion() };
-        let frame = crown::frame(now, self.activity, reduced);
+        let frame = crown::frame_with_preview(now, self.activity, self.preview_started, reduced);
         if changed || self.animating {
             if let Some(tray) = &self.tray {
                 set_crown(tray, &frame, self.mtm);
@@ -212,6 +214,7 @@ impl App {
             &self.items.chatgpt,
             &self.items.claude,
             &self.items.copy_id,
+            &self.items.preview,
             &self.items.quit,
         ] {
             item.set_enabled(false);
@@ -583,6 +586,16 @@ impl App {
         let id = event.id();
         if id == self.items.quit.id() {
             self.quit();
+        } else if id == self.items.preview.id() {
+            if unsafe { NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion() } {
+                self.alert(
+                    "Sync animation preview",
+                    "Reduce Motion is enabled, so the crown stays still. This preview does not start sync or transfer any data.",
+                    &["OK"],
+                );
+            }
+            self.preview_started = Some(self.origin.elapsed());
+            self.animating = true; // Paint the first frame and schedule its attack.
         } else if id == self.items.add_pile.id() {
             self.add_pile();
         } else if let Some((entry, action)) = self.pile_items.iter().find_map(|p| {
@@ -694,6 +707,7 @@ pub fn main() {
     }
     let items = Items {
         status: MenuItem::new("Starting…", true, None),
+        preview: MenuItem::new("Preview sync animation", true, None),
         copy_id: MenuItem::new("Copy my ID", true, None),
         chatgpt: MenuItem::new("Connect ChatGPT…", true, None),
         claude: MenuItem::new("Connect Claude…", true, None),
@@ -705,6 +719,7 @@ pub fn main() {
     let menu = Menu::new();
     menu.append_items(&[
         &items.status,
+        &items.preview,
         &items.piles,
         &PredefinedMenuItem::separator(),
         &items.copy_id,
@@ -725,6 +740,7 @@ pub fn main() {
         tray: None,
         origin: Instant::now(),
         activity: None,
+        preview_started: None,
         transfer_bytes: 0,
         animating: false,
         next_refresh: Instant::now(),
