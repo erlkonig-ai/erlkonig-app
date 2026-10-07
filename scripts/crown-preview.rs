@@ -116,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Native proof for the selected travelling ripple; sampled at full attack.
 fn ripple_phases(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(destination)?;
-    for (phase, millis) in [(0, 2400), (90, 600), (180, 1200), (270, 1800)] {
+    for (phase, millis) in [(0, 3600), (90, 900), (180, 1800), (270, 2700)] {
         let now = Duration::from_millis(millis);
         let frame = crown::frame(now, Some(crown::TransferActivity {
             began_at: Duration::ZERO, last_transfer_at: now,

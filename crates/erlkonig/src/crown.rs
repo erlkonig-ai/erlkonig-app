@@ -24,7 +24,7 @@ const HOLD: f64 = 0.120;
 const RELEASE: f64 = 0.480;
 const WAVE_STEPS: usize = 140;
 const SCALE: f64 = 0.060; // 400 canonical units → 24 points, with 1 pt side padding
-const WAVE_PERIOD: Duration = Duration::from_millis(2400);
+const WAVE_PERIOD: Duration = Duration::from_millis(3600);
 // Soften the active inner wave around its midpoint; never scale the idle mark.
 const RIPPLE_AMPLITUDE: f64 = 0.75;
 
@@ -323,8 +323,8 @@ mod tests {
     fn deterministic_inputs_and_long_uptime_keep_the_same_carrier() {
         let early = frame(ms(2234), burst(0, 2234), false);
         assert_eq!(early, frame(ms(2234), burst(0, 2234), false));
-        // Twelve whole seconds are exactly five 2.4 s periods.
-        let late = Duration::new(u64::MAX - u64::MAX % 12 + 2, 234_000_000);
+        // Eighteen whole seconds are exactly five 3.6 s periods.
+        let late = Duration::new(u64::MAX - u64::MAX % 18 + 2, 234_000_000);
         let f = frame(
             late,
             Some(TransferActivity {
@@ -385,16 +385,19 @@ mod tests {
     fn active_ripple_uses_a_softer_centred_band_without_deepening() {
         let idle = frame(ms(0), None, false);
         let (ceiling, floor) = wave_bounds(&idle.points);
-        let crest = frame(ms(2400), burst(0, 2400), false);
-        let valley = frame(ms(1200), burst(0, 1200), false);
+        let crest = frame(ms(3600), burst(0, 3600), false);
+        let quarter = frame(ms(900), burst(0, 900), false);
+        let valley = frame(ms(1800), burst(0, 1800), false);
         let centre = 2 + WAVE_STEPS / 2;
         let middle = (ceiling + floor) * 0.5;
         let amplitude = (floor - ceiling) * 0.5 * RIPPLE_AMPLITUDE;
         assert!((crest.points[centre].y - (middle - amplitude)).abs() < 1e-12);
+        assert!((quarter.points[centre].y - middle).abs() < 1e-12);
         assert!((valley.points[centre].y - (middle + amplitude)).abs() < 1e-12);
         assert!(crest.points[centre].y > ceiling && valley.points[centre].y < floor);
+        assert_eq!(quarter, frame(ms(4500), burst(0, 4500), false));
         // Phase is relative to each burst, not an arbitrary app uptime origin.
-        assert_eq!(valley, frame(ms(11_200), burst(10_000, 11_200), false));
+        assert_eq!(valley, frame(ms(11_800), burst(10_000, 11_800), false));
     }
 
     #[test]
