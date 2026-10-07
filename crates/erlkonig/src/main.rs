@@ -6,6 +6,9 @@
 #[cfg(target_os = "macos")]
 mod mac;
 
+#[cfg(target_os = "macos")]
+mod crown_display;
+
 mod crown;
 
 #[cfg(target_os = "macos")]

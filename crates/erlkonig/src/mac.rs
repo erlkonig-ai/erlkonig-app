@@ -1,6 +1,7 @@
 //! Main-thread menu and the one application-owned native lifetime.
 
 use crate::crown::{self, TransferActivity};
+use crate::crown_display::DisplayCrown;
 use erlkonig_core::{
     config, install,
     node_store::ManagedPile,
@@ -9,7 +10,7 @@ use erlkonig_core::{
 };
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSCellImagePosition, NSImageScaling,
+    NSAlert, NSAlertFirstButtonReturn, NSApplication,
     NSModalResponseOK, NSOpenPanel, NSPasteboard, NSPasteboardTypeString, NSTextField, NSView,
     NSWorkspace,
 };
@@ -31,7 +32,7 @@ use winit::window::WindowId;
 
 struct Items {
     status: MenuItem,
-    preview: MenuItem,
+    preview: CheckMenuItem,
     copy_id: MenuItem,
     chatgpt: MenuItem,
     claude: MenuItem,
@@ -61,9 +62,8 @@ struct App {
     tray: Option<TrayIcon>,
     origin: Instant,
     activity: Option<TransferActivity>,
-    preview_started: Option<Duration>,
+    crown: Option<DisplayCrown>,
     transfer_bytes: u64,
-    animating: bool,
     next_refresh: Instant,
     quitting: Option<Instant>,
     terminate: Arc<AtomicBool>,
@@ -73,14 +73,6 @@ struct App {
 
 fn login() -> objc2::rc::Retained<SMAppService> {
     unsafe { SMAppService::mainAppService() }
-}
-
-fn set_crown(tray: &TrayIcon, frame: &crown::Frame, mtm: MainThreadMarker) {
-    if let Some(button) = tray.ns_status_item().and_then(|item| item.button(mtm)) {
-        button.setImageScaling(NSImageScaling::ScaleNone);
-        button.setImagePosition(NSCellImagePosition::ImageOnly);
-        button.setImage(Some(&frame.template_image()));
-    }
 }
 
 impl App {
@@ -129,6 +121,11 @@ impl App {
                 event_loop.exit();
             }
             self.next_refresh = Instant::now() + Duration::from_millis(50);
+            return;
+        }
+        // Status/config polling is independent of the native display clock.
+        // Image-caused events neither redraw nor slide this deadline forward.
+        if Instant::now() < self.next_refresh {
             return;
         }
         let status = self.runtime.as_ref().map(Runtime::status);
@@ -191,40 +188,25 @@ impl App {
             });
         }
         self.transfer_bytes = bytes;
-        // Native image/menu changes can wake the loop before WaitUntil expires.
-        // Keep processing status and real activity, but do not let those wakeups
-        // drive more images or move the existing frame deadline into the future.
-        if Instant::now() >= self.next_refresh {
-            let reduced = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
-            let frame =
-                crown::frame_with_preview(now, self.activity, self.preview_started, reduced);
-            if self.animating || frame.animating {
-                if let Some(tray) = &self.tray {
-                    set_crown(tray, &frame, self.mtm);
-                }
-            }
-            self.animating = frame.animating;
-            self.next_refresh = Instant::now()
-                + if self.animating {
-                    Duration::from_millis(33)
-                } else {
-                    Duration::from_millis(250)
-                };
+        if let Some(crown) = &self.crown {
+            crown.update_activity(self.activity);
         }
+        self.next_refresh = Instant::now() + Duration::from_millis(250);
     }
 
     fn quit(&mut self) {
         self.quitting.get_or_insert_with(Instant::now);
+        self.crown.take(); // Invalidate display callbacks before service teardown.
         for item in [
             &self.items.chatgpt,
             &self.items.claude,
             &self.items.copy_id,
-            &self.items.preview,
             &self.items.quit,
         ] {
             item.set_enabled(false);
         }
         self.items.login.set_enabled(false);
+        self.items.preview.set_enabled(false);
         self.items.piles.set_enabled(false);
         if let Some(runtime) = &self.runtime {
             runtime.begin_shutdown();
@@ -235,6 +217,7 @@ impl App {
     /// LoopExiting synchronously from applicationWillTerminate, so drain here
     /// before returning to AppKit, with the same final process-exit deadline.
     fn finish_termination(&mut self) {
+        self.crown.take();
         if let Some(mut runtime) = self.runtime.take() {
             runtime.begin_shutdown();
             let since = self.quitting.unwrap_or_else(Instant::now);
@@ -592,16 +575,18 @@ impl App {
         if id == self.items.quit.id() {
             self.quit();
         } else if id == self.items.preview.id() {
-            if NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion() {
+            let enabled = self.items.preview.is_checked();
+            if let Some(crown) = &self.crown {
+                crown.set_preview(enabled);
+                self.items.preview.set_checked(crown.preview_enabled());
+            }
+            if enabled && NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion() {
                 self.alert(
                     "Sync animation preview",
-                    "Reduce Motion is enabled, so the crown stays still. This preview does not start sync or transfer any data.",
+                    "Preview is on, but Reduce Motion keeps the crown still. Uncheck Preview sync animation to stop the preview. No sync or data transfer is started.",
                     &["OK"],
                 );
             }
-            self.preview_started = Some(self.origin.elapsed());
-            self.animating = true; // Paint the first frame and schedule its attack.
-            self.next_refresh = Instant::now();
         } else if id == self.items.add_pile.id() {
             self.add_pile();
         } else if let Some((entry, action)) = self.pile_items.iter().find_map(|p| {
@@ -651,6 +636,7 @@ impl App {
             });
             self.alert("Erlkönig", &text, &["OK"]);
         }
+        self.next_refresh = Instant::now();
         self.refresh(event_loop);
     }
 }
@@ -664,7 +650,12 @@ impl ApplicationHandler<MenuEvent> for App {
                 .build()
             {
                 Ok(tray) => {
-                    set_crown(&tray, &crown::frame(Duration::ZERO, None, true), self.mtm);
+                    if let Some(button) = tray.ns_status_item().and_then(|item| item.button(self.mtm)) {
+                        self.crown = Some(DisplayCrown::new(button, self.origin, self.mtm));
+                    } else {
+                        self.problem = Some("Cannot create crown display".into());
+                        self.items.preview.set_enabled(false);
+                    }
                     // tray-icon also fits its click-target view when setting
                     // the tooltip. Do this after installing our native image,
                     // so its hit area includes the full, wider crown.
@@ -713,7 +704,7 @@ pub fn main() {
     }
     let items = Items {
         status: MenuItem::new("Starting…", true, None),
-        preview: MenuItem::new("Preview sync animation", true, None),
+        preview: CheckMenuItem::new("Preview sync animation", true, false, None),
         copy_id: MenuItem::new("Copy my ID", true, None),
         chatgpt: MenuItem::new("Connect ChatGPT…", true, None),
         claude: MenuItem::new("Connect Claude…", true, None),
@@ -746,9 +737,8 @@ pub fn main() {
         tray: None,
         origin: Instant::now(),
         activity: None,
-        preview_started: None,
+        crown: None,
         transfer_bytes: 0,
-        animating: false,
         next_refresh: Instant::now(),
         quitting: None,
         terminate,

@@ -17,8 +17,6 @@ pub const WIDTH: f64 = 26.0;
 pub const HEIGHT: f64 = 18.0;
 /// After this much time without bytes the exact resting crown is restored.
 pub const SETTLE_AFTER: Duration = Duration::from_millis(600);
-/// Explicit visual preview: six seconds of motion, then the normal settle.
-const PREVIEW_FOR: Duration = Duration::from_secs(6);
 const ATTACK: f64 = 0.160;
 const HOLD: f64 = 0.120;
 const RELEASE: f64 = 0.480;
@@ -33,6 +31,37 @@ const CENTRE_RADIUS: f64 = 0.2;
 pub struct TransferActivity {
     pub began_at: Duration,
     pub last_transfer_at: Duration,
+}
+
+/// Session-local visual intent, separate from observed byte activity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Preview {
+    began_at: Option<Duration>,
+    stopped_at: Option<Duration>,
+}
+
+impl Preview {
+    pub fn is_enabled(&self) -> bool {
+        self.began_at.is_some() && self.stopped_at.is_none()
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool, now: Duration) {
+        if enabled {
+            self.began_at = Some(now);
+            self.stopped_at = None;
+        } else if self.is_enabled() {
+            self.stopped_at = Some(now);
+        }
+    }
+
+    fn activity(&self, now: Duration) -> Option<TransferActivity> {
+        let began_at = self.began_at?;
+        let last_transfer_at = self.stopped_at.unwrap_or(now);
+        (began_at <= last_transfer_at
+            && last_transfer_at <= now
+            && now - last_transfer_at < SETTLE_AFTER)
+            .then_some(TransferActivity { began_at, last_transfer_at })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -167,10 +196,12 @@ pub fn frame(now: Duration, activity: Option<TransferActivity>, reduced_motion: 
         0.0
     };
     for (i, point) in points[2..WAVE_STEPS + 3].iter_mut().enumerate() {
-        if i == 0 || i == WAVE_STEPS {
-            continue;
-        }
         let u = i as f64 / WAVE_STEPS as f64;
+        // Pin each join AND its first segment. Only the outer 10% ramps;
+        // the Gaussian alone softens the remaining wavelet lobes.
+        let distance = u.min(1.0 - u);
+        let pinned = 1.0 / WAVE_STEPS as f64;
+        let taper = smooth((distance - pinned) / (0.10 - pinned));
         let radius = ((point.x - WIDTH / 2.0) / (225.0 * SCALE * 0.25)).abs();
         let rest = radial_carrier(radius, 0.0);
         let carrier = rest + amount * (radial_carrier(radius, phase) - rest);
@@ -178,30 +209,28 @@ pub fn frame(now: Duration, activity: Option<TransferActivity>, reduced_motion: 
             - RIPPLE_AMPLITUDE * half * (-0.32 * radius * radius).exp() * carrier;
         // One endpoint/tangent taper, one canonical reference. Neither the
         // softened rest nor motion is scaled twice; no clipping or blur.
-        point.y += (PI * u).sin().powi(2) * (target - point.y);
+        point.y += taper * (target - point.y);
     }
     Frame { points, animating }
 }
 
-/// Select a finite visual-only preview without changing observed byte activity.
+/// Select visual-only preview intent without changing observed byte activity.
 ///
-/// The caller replaces only `preview_started` when the person requests another
-/// preview. Once it settles, genuine activity is rendered exactly as usual.
+/// ON sustains the preview. OFF settles normally, but genuine activity takes
+/// precedence immediately: switching off a demo never suppresses real motion.
 pub fn frame_with_preview(
     now: Duration,
     activity: Option<TransferActivity>,
-    preview_started: Option<Duration>,
+    preview: Preview,
     reduced_motion: bool,
 ) -> Frame {
-    let preview = preview_started.filter(|start| {
-        now.checked_sub(*start)
-            .is_some_and(|elapsed| elapsed < PREVIEW_FOR + SETTLE_AFTER)
-    });
-    let visual_activity = preview.map(|start| TransferActivity {
-        began_at: start,
-        last_transfer_at: now.min(start.saturating_add(PREVIEW_FOR)),
-    });
-    frame(now, visual_activity.or(activity), reduced_motion)
+    let real_is_active = envelope(now, activity, false).1;
+    let visual_activity = if !preview.is_enabled() && real_is_active {
+        activity
+    } else {
+        preview.activity(now).or(activity)
+    };
+    frame(now, visual_activity, reduced_motion)
 }
 
 #[cfg(target_os = "macos")]
@@ -434,66 +463,107 @@ mod tests {
     }
 
     #[test]
-    fn preview_is_finite_and_settles_to_exact_idle() {
+    fn preview_stays_on_until_off_then_settles_exactly() {
         let idle = frame(ms(0), None, false);
-        for elapsed in [0, 80, 5999, 6000, 6599] {
-            assert!(frame_with_preview(ms(1000 + elapsed), None, Some(ms(1000)), false).animating);
+        let mut preview = Preview::default();
+        assert!(!preview.is_enabled());
+        preview.set_enabled(true, ms(1000));
+        for elapsed in [0, 80, 6000, 60_000, 86_400_000] {
+            assert!(frame_with_preview(ms(1000 + elapsed), None, preview, false).animating);
         }
+        assert!(preview.is_enabled());
         assert_ne!(
             idle.points,
-            frame_with_preview(ms(2000), None, Some(ms(1000)), false).points
+            frame_with_preview(ms(2000), None, preview, false).points
         );
+        preview.set_enabled(false, ms(7000));
+        assert!(!preview.is_enabled());
+        assert!(frame_with_preview(ms(7599), None, preview, false).animating);
         for now in [ms(7600), ms(9000), Duration::MAX] {
-            assert_eq!(idle, frame_with_preview(now, None, Some(ms(1000)), false));
+            assert_eq!(idle, frame_with_preview(now, None, preview, false));
         }
+        preview.set_enabled(false, ms(9000)); // Repeated OFF never extends settling.
+        assert_eq!(idle, frame_with_preview(ms(9000), None, preview, false));
     }
 
     #[test]
-    fn preview_retrigger_restarts_one_finite_envelope() {
-        let mut started = Some(ms(1000));
-        assert!(frame_with_preview(ms(6500), None, started, false).animating);
-        started = Some(ms(6500));
-        let restarted = frame_with_preview(ms(6500), None, started, false);
+    fn preview_retrigger_restarts_one_envelope() {
+        let mut preview = Preview::default();
+        preview.set_enabled(true, ms(1000));
+        preview.set_enabled(false, ms(6000));
+        assert!(frame_with_preview(ms(6500), None, preview, false).animating);
+        preview.set_enabled(true, ms(6500));
+        let restarted = frame_with_preview(ms(6500), None, preview, false);
         assert!(restarted.animating);
         assert_eq!(restarted.points, frame(ms(0), None, false).points);
-        assert!(frame_with_preview(ms(7600), None, started, false).animating);
-        assert!(!frame_with_preview(ms(13_100), None, started, false).animating);
+        assert!(frame_with_preview(ms(13_100), None, preview, false).animating);
     }
 
     #[test]
     fn preview_respects_reduced_motion_at_every_phase() {
         let idle = frame(ms(0), None, false);
+        let mut preview = Preview::default();
+        preview.set_enabled(true, ms(1000));
         for now in [1000, 1080, 3000, 7000, 7599, 7600] {
             assert_eq!(
                 idle,
-                frame_with_preview(ms(now), burst(0, now), Some(ms(1000)), true)
+                frame_with_preview(ms(now), burst(0, now), preview, true)
             );
+            assert!(preview.is_enabled()); // Checkmark is intent, not animation.
         }
+        preview.set_enabled(false, ms(7600));
+        assert_eq!(idle, frame_with_preview(ms(7601), None, preview, true));
     }
 
     #[test]
     fn preview_never_leaks_into_real_activity() {
-        for now in [ms(7600), ms(10_000)] {
+        let mut preview = Preview::default();
+        preview.set_enabled(true, ms(1000));
+        preview.set_enabled(false, ms(7000));
+        // OFF hands over immediately, even during the demo's settling tail.
+        for now in [ms(7000), ms(7100), ms(7600), ms(10_000)] {
             for real in [
-                None,
-                burst(0, 3000),
-                burst(7000, 7500),
                 burst(7000, now.as_millis() as u64),
             ] {
                 assert_eq!(
                     frame(now, real, false),
-                    frame_with_preview(now, real, Some(ms(1000)), false)
+                    frame_with_preview(now, real, preview, false)
                 );
                 assert_eq!(
                     frame(now, real, false),
-                    frame_with_preview(now, real, None, false)
+                    frame_with_preview(now, real, Preview::default(), false)
                 );
             }
         }
         // An invalid future preview also cannot suppress genuine activity.
+        preview.set_enabled(true, ms(1000));
         assert_eq!(
             frame(ms(500), burst(0, 500), false),
-            frame_with_preview(ms(500), burst(0, 500), Some(ms(1000)), false)
+            frame_with_preview(ms(500), burst(0, 500), preview, false)
         );
+    }
+
+    #[test]
+    fn endpoint_taper_pins_first_segments_and_releases_outer_lobes() {
+        let base = canonical_points();
+        for tick in 0..720 {
+            let now = ms(tick * 5);
+            let f = frame(now, burst(0, tick * 5), false);
+            for i in [0, 1, 2, 3, 141, 142, 143, 144, 145] {
+                assert_eq!(f.points[i], base[i]);
+            }
+        }
+        // The former global taper reduced this second radial crest to ~0.10 pt.
+        let index = (2..143).min_by(|&a, &b|
+            (base[a].x - 20.394255).abs().total_cmp(&(base[b].x - 20.394255).abs())
+        ).unwrap();
+        let mut low = f64::INFINITY;
+        let mut high = f64::NEG_INFINITY;
+        for tick in 120..240 {
+            let f = frame(ms(tick * 30), burst(0, tick * 30), false);
+            low = low.min(f.points[index].y);
+            high = high.max(f.points[index].y);
+        }
+        assert!(high - low > 1.2);
     }
 }
