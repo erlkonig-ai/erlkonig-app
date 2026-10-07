@@ -25,6 +25,8 @@ const RELEASE: f64 = 0.480;
 const WAVE_STEPS: usize = 140;
 const SCALE: f64 = 0.060; // 400 canonical units → 24 points, with 1 pt side padding
 const WAVE_PERIOD: Duration = Duration::from_millis(2400);
+// Soften the active inner wave around its midpoint; never scale the idle mark.
+const RIPPLE_AMPLITUDE: f64 = 0.75;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferActivity {
@@ -157,8 +159,9 @@ pub fn frame(now: Duration, activity: Option<TransferActivity>, reduced_motion: 
             }
             let u = i as f64 / WAVE_STEPS as f64;
             let radius = ((point.x - WIDTH / 2.0) / (225.0 * SCALE * 0.25)).abs();
-            let target =
-                middle - half * (-0.32 * radius * radius).exp() * radial_carrier(radius, phase);
+            let target = middle
+                - RIPPLE_AMPLITUDE * half * (-0.32 * radius * radius).exp()
+                    * radial_carrier(radius, phase);
             // Both values lie inside the original crest/floor band. A convex
             // blend cannot deepen valleys or raise the ceiling: no clipping or
             // additive stretch. This taper also pins both endpoint tangents.
@@ -379,14 +382,17 @@ mod tests {
     }
 
     #[test]
-    fn active_ripple_exchanges_central_crest_and_floor_without_deepening() {
+    fn active_ripple_uses_a_softer_centred_band_without_deepening() {
         let idle = frame(ms(0), None, false);
         let (ceiling, floor) = wave_bounds(&idle.points);
         let crest = frame(ms(2400), burst(0, 2400), false);
         let valley = frame(ms(1200), burst(0, 1200), false);
         let centre = 2 + WAVE_STEPS / 2;
-        assert!((crest.points[centre].y - ceiling).abs() < 1e-12);
-        assert!((valley.points[centre].y - floor).abs() < 1e-12);
+        let middle = (ceiling + floor) * 0.5;
+        let amplitude = (floor - ceiling) * 0.5 * RIPPLE_AMPLITUDE;
+        assert!((crest.points[centre].y - (middle - amplitude)).abs() < 1e-12);
+        assert!((valley.points[centre].y - (middle + amplitude)).abs() < 1e-12);
+        assert!(crest.points[centre].y > ceiling && valley.points[centre].y < floor);
         // Phase is relative to each burst, not an arbitrary app uptime origin.
         assert_eq!(valley, frame(ms(11_200), burst(10_000, 11_200), false));
     }
