@@ -18,8 +18,10 @@ pub const HEIGHT: f64 = 18.0;
 /// After this much time without bytes the exact resting crown is restored.
 pub const SETTLE_AFTER: Duration = Duration::from_millis(600);
 const ATTACK: f64 = 0.160;
-const HOLD: f64 = 0.120;
-const RELEASE: f64 = 0.480;
+// Runtime publishes measured byte deltas at ~250 ms cadence. Hold an observed
+// pulse across a normal sample interval; unchanged counters never renew it.
+const HOLD: f64 = 0.300;
+const RELEASE: f64 = 0.300;
 const WAVE_STEPS: usize = 140;
 const SCALE: f64 = 0.060; // 400 canonical units → 24 points, with 1 pt side padding
 const WAVE_PERIOD: Duration = Duration::from_millis(3600);
@@ -216,21 +218,30 @@ pub fn frame(now: Duration, activity: Option<TransferActivity>, reduced_motion: 
 
 /// Select visual-only preview intent without changing observed byte activity.
 ///
-/// ON sustains the preview. OFF settles normally, but genuine activity takes
-/// precedence immediately: switching off a demo never suppresses real motion.
+/// ON sustains the preview. OFF crossfades its settling tail into the genuine
+/// frame, reaching that exact frame after 600 ms without a phase/attack snap.
 pub fn frame_with_preview(
     now: Duration,
     activity: Option<TransferActivity>,
     preview: Preview,
     reduced_motion: bool,
 ) -> Frame {
-    let real_is_active = envelope(now, activity, false).1;
-    let visual_activity = if !preview.is_enabled() && real_is_active {
-        activity
-    } else {
-        preview.activity(now).or(activity)
+    let real = frame(now, activity, reduced_motion);
+    if reduced_motion {
+        return real;
+    }
+    let Some(visual_activity) = preview.activity(now) else {
+        return real;
     };
-    frame(now, visual_activity, reduced_motion)
+    let mut visual = frame(now, Some(visual_activity), false);
+    if let Some(stopped_at) = preview.stopped_at {
+        let mix = smooth((now - stopped_at).as_secs_f64() / SETTLE_AFTER.as_secs_f64());
+        for (point, target) in visual.points.iter_mut().zip(&real.points) {
+            point.y += mix * (target.y - point.y);
+        }
+        visual.animating |= real.animating;
+    }
+    visual
 }
 
 #[cfg(target_os = "macos")]
@@ -520,8 +531,8 @@ mod tests {
         let mut preview = Preview::default();
         preview.set_enabled(true, ms(1000));
         preview.set_enabled(false, ms(7000));
-        // OFF hands over immediately, even during the demo's settling tail.
-        for now in [ms(7000), ms(7100), ms(7600), ms(10_000)] {
+        // The genuine frame is exact after the visual-only settling tail.
+        for now in [ms(7600), ms(10_000)] {
             for real in [
                 burst(7000, now.as_millis() as u64),
             ] {
@@ -541,6 +552,35 @@ mod tests {
             frame(ms(500), burst(0, 500), false),
             frame_with_preview(ms(500), burst(0, 500), preview, false)
         );
+    }
+
+    #[test]
+    fn preview_off_crossfades_without_snapping_to_a_new_real_burst() {
+        let mut preview = Preview::default();
+        preview.set_enabled(true, ms(1000));
+        let real = burst(7100, 7100);
+        let before = frame_with_preview(ms(7100), real, preview, false);
+        preview.set_enabled(false, ms(7100));
+        assert_eq!(before, frame_with_preview(ms(7100), real, preview, false));
+        let after = frame_with_preview(ms(7101), burst(7100, 7101), preview, false);
+        assert!(before.points.iter().zip(&after.points).all(|(a,b)| (a.y-b.y).abs() < 0.02));
+        for now in 7100..7700 {
+            assert!(frame_with_preview(ms(now), burst(7100, now), preview, false).animating);
+        }
+        assert_eq!(
+            frame(ms(7700), burst(7100, 7700), false),
+            frame_with_preview(ms(7700), burst(7100, 7700), preview, false),
+        );
+    }
+
+    #[test]
+    fn measured_250ms_pulses_hold_without_extending_unchanged_activity() {
+        for now in 250..2000 {
+            let measured_at = now / 250 * 250;
+            assert_eq!(envelope(ms(now), burst(0, measured_at), false), (1.0, true));
+        }
+        assert!(envelope(ms(2599), burst(0, 2000), false).1);
+        assert_eq!(frame(ms(2600), burst(0, 2000), false), frame(ms(0), None, false));
     }
 
     #[test]
@@ -564,6 +604,13 @@ mod tests {
             low = low.min(f.points[index].y);
             high = high.max(f.points[index].y);
         }
-        assert!(high - low > 1.2);
+        let u = (index - 2) as f64 / WAVE_STEPS as f64;
+        let radius = ((base[index].x - WIDTH / 2.0) / (225.0 * SCALE * 0.25)).abs();
+        let taper = smooth((u.min(1.0 - u) - 1.0 / 140.0) / (0.10 - 1.0 / 140.0));
+        let (ceiling, floor) = wave_bounds(&base);
+        let expected = (floor - ceiling) * RIPPLE_AMPLITUDE
+            * (-0.32 * radius * radius).exp() * taper;
+        assert!((high - low - expected).abs() < 0.003); // 120 sampled phases
+        assert!(high - low > 1.0); // At least two native Retina pixels of travel.
     }
 }
