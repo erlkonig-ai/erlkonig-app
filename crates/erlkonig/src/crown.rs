@@ -10,7 +10,9 @@
 //! `SETTLE_AFTER` without bytes. Keep the last burst until it settles: passing
 //! `None` intentionally returns immediately to the exact resting outline.
 
-use std::f64::consts::{PI, TAU};
+use std::f64::consts::TAU;
+#[cfg(test)]
+use std::f64::consts::PI;
 use std::time::Duration;
 
 pub const WIDTH: f64 = 26.0;
