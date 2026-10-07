@@ -35,7 +35,7 @@ block2 = "0.6.2"
 objc2-foundation = "0.3"
 objc2-app-kit = "0.3"
 objc2-service-management = "0.3"
-objc2-quartz-core = "0.3"
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CADisplayLink", "objc2-core-foundation"] }
 
 [profile.release]
 strip = "symbols"
