@@ -1,8 +1,8 @@
 //! Erlkönig's wavelet crown, still at rest and gently moving during byte transfer.
 //!
-//! The outline is the canonical website's Gabor/Morlet crown, uniformly fitted
-//! to native menu-bar points. Only the inner wave moves; walls, tips and base
-//! stay put. There is no clock, timer, worker or network dependency here.
+//! The canonical website's Gabor/Morlet crown fixes the outer geometry and
+//! reference band. Rest and motion share a softer, smooth-centred inner wave;
+//! walls, tips and base stay put. No clock, timer, worker or network lives here.
 //!
 //! The caller owns a monotonic origin and updates `last_transfer_at` ONLY when
 //! received/sent byte counters increase, not when a peer connects or a poll
@@ -25,8 +25,9 @@ const RELEASE: f64 = 0.480;
 const WAVE_STEPS: usize = 140;
 const SCALE: f64 = 0.060; // 400 canonical units → 24 points, with 1 pt side padding
 const WAVE_PERIOD: Duration = Duration::from_millis(3600);
-// Soften the active inner wave around its midpoint; never scale the idle mark.
+// One gain against the ORIGINAL canonical band, for both rest and motion.
 const RIPPLE_AMPLITUDE: f64 = 0.75;
+const CENTRE_RADIUS: f64 = 0.2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferActivity {
@@ -105,19 +106,18 @@ fn wave_bounds(points: &[Point]) -> (f64, f64) {
     )
 }
 
-// Equal-phase crests move outward on both sides, cos(k * radius - phase).
-// Suppress the quadrature smoothly only within 0.405 pt of the centre, removing
-// the abs(x) cusp while retaining mirror symmetry and a carrier bounded by 1.
-fn radial_carrier(radius: f64, phase: f64) -> f64 {
-    (TAU * radius).cos() * phase.cos() + (TAU * radius).sin() * phase.sin() * smooth(radius / 0.12)
+// Broader phase spacing at the centre avoids a hairline trough between paired
+// crests. Its derivative is zero at centre, so no quadrature correction is
+// needed. Distance remains monotone and approaches ordinary spacing outward.
+fn radial_phase(radius: f64) -> f64 {
+    (radius * radius + CENTRE_RADIUS * CENTRE_RADIUS).sqrt() - CENTRE_RADIUS
 }
 
-/// Pure monotonic time + observed activity → vector frame.
-///
-/// Reduced motion is exactly static, including while bytes are transferring.
-/// Idle, invalid and fully settled inputs all produce bit-identical points.
-pub fn frame(now: Duration, activity: Option<TransferActivity>, reduced_motion: bool) -> Frame {
-    let (amount, animating) = envelope(now, activity, reduced_motion);
+fn radial_carrier(radius: f64, phase: f64) -> f64 {
+    (TAU * radial_phase(radius) - phase).cos()
+}
+
+fn canonical_points() -> Vec<Point> {
     let mut catch = 0.75;
     let mut steepest = f64::INFINITY;
     for step in 0..210 {
@@ -141,33 +141,44 @@ pub fn frame(now: Duration, activity: Option<TransferActivity>, reduced_motion: 
     points.push(template_point(450.0, apex_y));
     points.push(template_point(425.0, 282.0));
     points.push(points[0]);
-    if amount > 0.0 {
-        let (ceiling, floor) = wave_bounds(&points);
-        let middle = (ceiling + floor) * 0.5;
-        let half = (floor - ceiling) * 0.5;
+    points
+}
+
+/// Pure monotonic time + observed activity → vector frame.
+///
+/// Rest is the same softened wave at phase zero. Reduced motion, idle, invalid
+/// and fully settled inputs all produce bit-identical resting points.
+pub fn frame(now: Duration, activity: Option<TransferActivity>, reduced_motion: bool) -> Frame {
+    let (amount, animating) = envelope(now, activity, reduced_motion);
+    let mut points = canonical_points();
+    let (ceiling, floor) = wave_bounds(&points);
+    let middle = (ceiling + floor) * 0.5;
+    let half = (floor - ceiling) * 0.5;
+    let phase = if amount > 0.0 {
         // Integer reduction retains phase precision after arbitrarily long
         // uptime. Each real burst or explicit preview starts the same ripple.
         let elapsed = now
             - activity
                 .expect("positive envelope has valid activity")
                 .began_at;
-        let phase = TAU * (elapsed.as_nanos() % WAVE_PERIOD.as_nanos()) as f64
-            / WAVE_PERIOD.as_nanos() as f64;
-        for (i, point) in points[2..WAVE_STEPS + 3].iter_mut().enumerate() {
-            if i == 0 || i == WAVE_STEPS {
-                continue;
-            }
-            let u = i as f64 / WAVE_STEPS as f64;
-            let radius = ((point.x - WIDTH / 2.0) / (225.0 * SCALE * 0.25)).abs();
-            let target = middle
-                - RIPPLE_AMPLITUDE * half * (-0.32 * radius * radius).exp()
-                    * radial_carrier(radius, phase);
-            // Both values lie inside the original crest/floor band. A convex
-            // blend cannot deepen valleys or raise the ceiling: no clipping or
-            // additive stretch. This taper also pins both endpoint tangents.
-            let blend = amount * (PI * u).sin().powi(2);
-            point.y += blend * (target - point.y);
+        TAU * (elapsed.as_nanos() % WAVE_PERIOD.as_nanos()) as f64
+            / WAVE_PERIOD.as_nanos() as f64
+    } else {
+        0.0
+    };
+    for (i, point) in points[2..WAVE_STEPS + 3].iter_mut().enumerate() {
+        if i == 0 || i == WAVE_STEPS {
+            continue;
         }
+        let u = i as f64 / WAVE_STEPS as f64;
+        let radius = ((point.x - WIDTH / 2.0) / (225.0 * SCALE * 0.25)).abs();
+        let rest = radial_carrier(radius, 0.0);
+        let carrier = rest + amount * (radial_carrier(radius, phase) - rest);
+        let target = middle
+            - RIPPLE_AMPLITUDE * half * (-0.32 * radius * radius).exp() * carrier;
+        // One endpoint/tangent taper, one canonical reference. Neither the
+        // softened rest nor motion is scaled twice; no clipping or blur.
+        point.y += (PI * u).sin().powi(2) * (target - point.y);
     }
     Frame { points, animating }
 }
@@ -274,7 +285,7 @@ mod tests {
         assert_ne!(active.points, idle.points);
         let almost = frame(ms(1759), burst(1000, 1160), false);
         assert!(almost.animating);
-        let (ceiling, floor) = wave_bounds(&idle.points);
+        let (ceiling, floor) = wave_bounds(&canonical_points());
         // One millisecond before the smoothstep ends, less than 1.4e-5 of
         // the motion remains. Keep the tail check independent of amplitude.
         assert!(
@@ -282,7 +293,7 @@ mod tests {
                 .points
                 .iter()
                 .zip(&idle.points)
-                .all(|(a, b)| (a.y - b.y).abs() < (floor - ceiling) * 0.000014)
+                .all(|(a, b)| (a.y - b.y).abs() < (floor - ceiling) * RIPPLE_AMPLITUDE * 0.000014)
         );
         assert_eq!(idle, frame(ms(1760), burst(1000, 1160), false));
         assert_eq!(idle, frame(ms(2000), burst(1000, 1160), false));
@@ -291,7 +302,8 @@ mod tests {
     #[test]
     fn coordinates_are_finite_bounded_and_outer_silhouette_does_not_move() {
         let idle = frame(ms(0), None, false);
-        let (ceiling, floor) = wave_bounds(&idle.points);
+        let canonical = canonical_points();
+        let (ceiling, floor) = wave_bounds(&canonical);
         for tick in 0..1200 {
             let now = ms(tick * 10);
             let f = frame(
@@ -313,7 +325,7 @@ mod tests {
                     assert!((p.y - f.points[WAVE_STEPS + 4 - i].y).abs() < 1e-12);
                 }
                 if i <= 2 || i >= WAVE_STEPS + 2 {
-                    assert_eq!(*p, idle.points[i]);
+                    assert_eq!(*p, canonical[i]);
                 }
             }
         }
@@ -344,18 +356,19 @@ mod tests {
     }
 
     #[test]
-    fn native_geometry_is_larger_proportional_and_base_aligned() {
+    fn native_geometry_has_softened_rest_and_pinned_outer_outline() {
         let idle = frame(ms(0), None, false);
         let min_x = idle.points.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
         let max_x = idle.points.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
         let min_y = idle.points.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
         let max_y = idle.points.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
         assert_eq!((min_x, max_x), (1.0, 25.0));
-        assert!((max_y - min_y - 165.75 * SCALE).abs() < 1e-10);
         assert_eq!(max_y, 14.0);
-        let (ceiling, floor) = wave_bounds(&idle.points);
+        let (ceiling, floor) = wave_bounds(&canonical_points());
         assert!((ceiling - 4.055).abs() < 1e-12);
         assert!((floor - 12.107434011801187).abs() < 1e-12);
+        assert!((min_y - ((ceiling + floor) * 0.5 - RIPPLE_AMPLITUDE * (floor - ceiling) * 0.5)).abs() < 1e-12);
+        assert!(min_y > ceiling);
     }
 
     #[test]
@@ -369,8 +382,10 @@ mod tests {
             }
         }
         for radius in [0.2, 0.4, 0.7, 1.0] {
+            let advance = radial_phase(radius + 0.1) - radial_phase(radius);
+            assert!(advance > 0.0 && advance < 0.1);
             assert!(
-                (radial_carrier(radius, 0.3) - radial_carrier(radius + 0.1, 0.3 + TAU * 0.1)).abs()
+                (radial_carrier(radius, 0.3) - radial_carrier(radius + 0.1, 0.3 + TAU * advance)).abs()
                     < 1e-12
             );
         }
@@ -384,7 +399,7 @@ mod tests {
     #[test]
     fn active_ripple_uses_a_softer_centred_band_without_deepening() {
         let idle = frame(ms(0), None, false);
-        let (ceiling, floor) = wave_bounds(&idle.points);
+        let (ceiling, floor) = wave_bounds(&canonical_points());
         let crest = frame(ms(3600), burst(0, 3600), false);
         let quarter = frame(ms(900), burst(0, 900), false);
         let valley = frame(ms(1800), burst(0, 1800), false);
@@ -395,9 +410,27 @@ mod tests {
         assert!((quarter.points[centre].y - middle).abs() < 1e-12);
         assert!((valley.points[centre].y - (middle + amplitude)).abs() < 1e-12);
         assert!(crest.points[centre].y > ceiling && valley.points[centre].y < floor);
+        assert_eq!(crest.points, idle.points); // rest is the SAME phase-zero wave
         assert_eq!(quarter, frame(ms(4500), burst(0, 4500), false));
         // Phase is relative to each burst, not an arbitrary app uptime origin.
         assert_eq!(valley, frame(ms(11_800), burst(10_000, 11_800), false));
+    }
+
+    #[test]
+    fn central_inversion_has_a_broader_opening_between_crests() {
+        let f = frame(ms(1800), burst(0, 1800), false);
+        let centre = 2 + WAVE_STEPS / 2;
+        let mut peak = centre + 1;
+        while f.points[peak + 1].y < f.points[peak].y { peak += 1; }
+        assert!(2.0 * (f.points[peak].x - WIDTH / 2.0) > 4.0);
+        let level = (f.points[centre].y + f.points[peak].y) * 0.5;
+        let mut right = centre + 1;
+        while f.points[right].y > level { right += 1; }
+        let (a, b) = (f.points[right - 1], f.points[right]);
+        let crossing = a.x + (level - a.y) * (b.x - a.x) / (b.y - a.y);
+        // v9's half-depth opening was only 1.543 pt; this is not just a
+        // shallower copy of that hairline valley or a raster blur.
+        assert!(2.0 * (crossing - WIDTH / 2.0) > 2.0);
     }
 
     #[test]
