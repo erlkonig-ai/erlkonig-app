@@ -40,8 +40,8 @@ fn render(image: &NSImage, scale: usize) -> Retained<NSBitmapImageRep> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let destination = std::env::args().nth(1).ok_or("usage: crown-preview OUTPUT_DIRECTORY")?;
-    if destination == "--compare" {
-        return compare(Path::new(&std::env::args().nth(2).ok_or("usage: crown-preview --compare OUTPUT_DIRECTORY")?));
+    if destination == "--ripple-phases" {
+        return ripple_phases(Path::new(&std::env::args().nth(2).ok_or("usage: crown-preview --ripple-phases OUTPUT_DIRECTORY")?));
     }
     let destination = Path::new(&destination);
     std::fs::create_dir_all(destination)?;
@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("settled", 1600, Some(1000), false),
         ("reduced", 1000, Some(1000), true),
     ];
-    let mut svg = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1100\" height=\"380\"><rect width=\"1100\" height=\"380\" fill=\"white\"/><style>text{font:14px system-ui,sans-serif}</style><text x=\"20\" y=\"25\">Production AppKit vector · 24 pt silhouette in 26 × 18 pt image · 2 pt motion bound</text>");
+    let mut svg = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1100\" height=\"380\"><rect width=\"1100\" height=\"380\" fill=\"white\"/><style>text{font:14px system-ui,sans-serif}</style><text x=\"20\" y=\"25\">Production AppKit vector · 24 pt silhouette in 26 × 18 pt image · fixed original crest/floor envelope</text>");
     let mut idle_pixels = Vec::new();
     for (column, (label, now, last, reduced)) in cases.iter().enumerate() {
         let activity = last.map(|last| crown::TransferActivity {
@@ -113,74 +113,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Compare previous and current native 2x alpha masks. Reconstruct the previous
-/// strength from the production frame's inner-wave deltas; all fixed silhouette
-/// points stay fixed. This does not change the renderer or the running app.
-fn compare(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Native proof for the selected travelling ripple; sampled at full attack.
+fn ripple_phases(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(destination)?;
-    let idle = crown::frame(Duration::ZERO, None, false);
-    let idle_bitmap = render(&idle.template_image(), 2);
-    let idle_pixels = unsafe { std::slice::from_raw_parts(idle_bitmap.bitmapData(), 52 * 36 * 4) };
-    let phases = [160, 1000, 2500, 4000];
-    let zoom = 4;
-    let width = 900;
-    let height = 390;
-    let sheet = unsafe {
-        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
-            NSBitmapImageRep::alloc(), std::ptr::null_mut(), width, height,
-            8, 4, true, false, NSCalibratedRGBColorSpace, width * 4, 32,
-        )
-    }.expect("contact sheet");
-    let sheet_pixels = unsafe { std::slice::from_raw_parts_mut(sheet.bitmapData(), width as usize * height as usize * 4) };
-    sheet_pixels.fill(255);
-    for (column, millis) in phases.into_iter().enumerate() {
+    for (phase, millis) in [(0, 2400), (90, 600), (180, 1200), (270, 1800)] {
         let now = Duration::from_millis(millis);
-        let current = crown::frame(now, Some(crown::TransferActivity { began_at: Duration::ZERO, last_transfer_at: now }), false);
-        let mut previous = current.clone();
-        for (point, rest) in previous.points.iter_mut().zip(&idle.points) {
-            point.y = rest.y + (point.y - rest.y) * ((0.85 * 22.0 / 36.0) / 2.0);
-        }
-        for (row, (label, frame)) in [("previous-0.519pt", previous), ("current-2pt", current)].into_iter().enumerate() {
-            let max_displacement = frame.points.iter().zip(&idle.points).map(|(p, r)| (p.y - r.y).abs()).fold(0f64, f64::max);
-            assert!(max_displacement <= 2.000001);
-            let image = frame.template_image();
-            assert!(image.isTemplate());
-            let bitmap = render(&image, 2);
-            let pixels = unsafe { std::slice::from_raw_parts(bitmap.bitmapData(), 52 * 36 * 4) };
-            assert!((0..52).all(|x| pixels[x * 4 + 3] == 0 && pixels[((35 * 52 + x) * 4) + 3] == 0));
-            assert!((0..36).all(|y| pixels[(y * 52) * 4 + 3] == 0 && pixels[(y * 52 + 51) * 4 + 3] == 0));
-            let mut changed = 0;
-            let mut significant = 0;
-            let mut alpha_delta = 0u64;
-            for (p, base) in pixels.chunks_exact(4).zip(idle_pixels.chunks_exact(4)) {
-                let delta = p[3].abs_diff(base[3]);
-                changed += usize::from(delta > 0);
-                significant += usize::from(delta >= 32);
-                alpha_delta += u64::from(delta);
-            }
-            println!("{label} {millis}ms: native2x=52x36 max_displacement_pt={max_displacement:.4} changed_pixels={changed} delta_at_least_32={significant} alpha_area_delta_px={:.3}", alpha_delta as f64 / 255.0);
+        let frame = crown::frame(now, Some(crown::TransferActivity {
+            began_at: Duration::ZERO, last_transfer_at: now,
+        }), false);
+        let image = frame.template_image();
+        assert!(image.isTemplate());
+        for scale in [1, 2] {
+            let bitmap = render(&image, scale);
+            let (width, height) = (26 * scale, 18 * scale);
+            let pixels = unsafe { std::slice::from_raw_parts(bitmap.bitmapData(), width * height * 4) };
+            assert!(pixels.chunks_exact(4).all(|p| p[..3] == [0, 0, 0]));
+            assert!((0..width).all(|x| pixels[x * 4 + 3] == 0 && pixels[((height - 1) * width + x) * 4 + 3] == 0));
+            assert!((0..height).all(|y| pixels[y * width * 4 + 3] == 0 && pixels[(y * width + width - 1) * 4 + 3] == 0));
             let png = unsafe { bitmap.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }.unwrap();
-            std::fs::write(destination.join(format!("{label}-{millis}ms-2x.png")), png.to_vec())?;
-            // Large rows: 4x nearest-neighbour enlargement of the actual 2x mask.
-            // Small rows underneath: the unchanged native 2x pixels at 1:1.
-            for (scale, top) in [(zoom, row * 190 + 5), (1, row * 190 + 150)] {
-                let left = column * 220 + 10;
-                for y in 0..36 {
-                    for x in 0..52 {
-                        let grey = 255 - pixels[(y * 52 + x) * 4 + 3];
-                        for dy in 0..scale {
-                            for dx in 0..scale {
-                                let index = ((top + y * scale + dy) * width as usize + left + x * scale + dx) * 4;
-                                sheet_pixels[index..index + 3].fill(grey);
-                            }
-                        }
-                    }
-                }
-            }
+            std::fs::write(destination.join(format!("outward-ripple-phase{phase}-{scale}x.png")), png.to_vec())?;
+            println!("ripple phase{phase} {scale}x: native vector, template=true, opaque black mask, border alpha=0");
         }
     }
-    let png = unsafe { sheet.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }.unwrap();
-    std::fs::write(destination.join("comparison.png"), png.to_vec())?;
-    println!("comparison.png: TOP=previous 0.5194pt bound, BOTTOM=current 2pt bound; columns=160/1000/2500/4000ms; each row includes enlarged4x and native2x1:1 masks. Native border-alpha/no-clipping checks passed. No screen capture.");
     Ok(())
 }

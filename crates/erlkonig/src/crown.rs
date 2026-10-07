@@ -24,9 +24,7 @@ const HOLD: f64 = 0.120;
 const RELEASE: f64 = 0.480;
 const WAVE_STEPS: usize = 140;
 const SCALE: f64 = 0.060; // 400 canonical units → 24 points, with 1 pt side padding
-// Legible at native menu-bar size, still confined to the inner wave. This
-// single bound applies equally to real transfer activity and explicit preview.
-const MAX_DISPLACEMENT: f64 = 2.0;
+const WAVE_PERIOD: Duration = Duration::from_millis(2400);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferActivity {
@@ -97,6 +95,21 @@ fn template_point(x: f64, y: f64) -> Point {
     }
 }
 
+fn wave_bounds(points: &[Point]) -> (f64, f64) {
+    let wave = &points[2..WAVE_STEPS + 3];
+    (
+        wave.iter().map(|p| p.y).fold(f64::INFINITY, f64::min),
+        wave.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max),
+    )
+}
+
+// Equal-phase crests move outward on both sides, cos(k * radius - phase).
+// Suppress the quadrature smoothly only within 0.405 pt of the centre, removing
+// the abs(x) cusp while retaining mirror symmetry and a carrier bounded by 1.
+fn radial_carrier(radius: f64, phase: f64) -> f64 {
+    (TAU * radius).cos() * phase.cos() + (TAU * radius).sin() * phase.sin() * smooth(radius / 0.12)
+}
+
 /// Pure monotonic time + observed activity → vector frame.
 ///
 /// Reduced motion is exactly static, including while bytes are transferring.
@@ -118,27 +131,41 @@ pub fn frame(now: Duration, activity: Option<TransferActivity>, reduced_motion: 
     let mut points = Vec::with_capacity(WAVE_STEPS + 6);
     points.push(template_point(75.0, 282.0));
     points.push(template_point(50.0, apex_y));
-    // The two carrier periods divide six seconds. Reducing before converting to
-    // f64 retains subsecond precision even after arbitrarily long app uptime.
-    let time = (now.as_secs() % 6) as f64 + f64::from(now.subsec_nanos()) / 1e9;
     for i in 0..=WAVE_STEPS {
         let u = i as f64 / WAVE_STEPS as f64;
         let t = -catch + 2.0 * catch * u;
-        let mut point = template_point(250.0 + 225.0 * t, wave_y(t));
-        if amount > 0.0 && i != 0 && i != WAVE_STEPS {
-            // A smooth compact envelope fixes both bridge endpoints AND their
-            // tangents. Two gentle coherent carriers, no random jitter, no
-            // flattening of the recognizable resting wavelet.
-            let spatial = (PI * u).sin().powi(2);
-            let carrier = 0.7 * (TAU * (2.0 * u - time / 1.2)).sin()
-                + 0.3 * (TAU * (3.0 * u + time / 2.0)).sin();
-            point.y += MAX_DISPLACEMENT * amount * spatial * carrier;
-        }
-        points.push(point);
+        points.push(template_point(250.0 + 225.0 * t, wave_y(t)));
     }
     points.push(template_point(450.0, apex_y));
     points.push(template_point(425.0, 282.0));
     points.push(points[0]);
+    if amount > 0.0 {
+        let (ceiling, floor) = wave_bounds(&points);
+        let middle = (ceiling + floor) * 0.5;
+        let half = (floor - ceiling) * 0.5;
+        // Integer reduction retains phase precision after arbitrarily long
+        // uptime. Each real burst or explicit preview starts the same ripple.
+        let elapsed = now
+            - activity
+                .expect("positive envelope has valid activity")
+                .began_at;
+        let phase = TAU * (elapsed.as_nanos() % WAVE_PERIOD.as_nanos()) as f64
+            / WAVE_PERIOD.as_nanos() as f64;
+        for (i, point) in points[2..WAVE_STEPS + 3].iter_mut().enumerate() {
+            if i == 0 || i == WAVE_STEPS {
+                continue;
+            }
+            let u = i as f64 / WAVE_STEPS as f64;
+            let radius = ((point.x - WIDTH / 2.0) / (225.0 * SCALE * 0.25)).abs();
+            let target =
+                middle - half * (-0.32 * radius * radius).exp() * radial_carrier(radius, phase);
+            // Both values lie inside the original crest/floor band. A convex
+            // blend cannot deepen valleys or raise the ceiling: no clipping or
+            // additive stretch. This taper also pins both endpoint tangents.
+            let blend = amount * (PI * u).sin().powi(2);
+            point.y += blend * (target - point.y);
+        }
+    }
     Frame { points, animating }
 }
 
@@ -244,6 +271,7 @@ mod tests {
         assert_ne!(active.points, idle.points);
         let almost = frame(ms(1759), burst(1000, 1160), false);
         assert!(almost.animating);
+        let (ceiling, floor) = wave_bounds(&idle.points);
         // One millisecond before the smoothstep ends, less than 1.4e-5 of
         // the motion remains. Keep the tail check independent of amplitude.
         assert!(
@@ -251,7 +279,7 @@ mod tests {
                 .points
                 .iter()
                 .zip(&idle.points)
-                .all(|(a, b)| (a.y - b.y).abs() < MAX_DISPLACEMENT * 0.000014)
+                .all(|(a, b)| (a.y - b.y).abs() < (floor - ceiling) * 0.000014)
         );
         assert_eq!(idle, frame(ms(1760), burst(1000, 1160), false));
         assert_eq!(idle, frame(ms(2000), burst(1000, 1160), false));
@@ -260,6 +288,7 @@ mod tests {
     #[test]
     fn coordinates_are_finite_bounded_and_outer_silhouette_does_not_move() {
         let idle = frame(ms(0), None, false);
+        let (ceiling, floor) = wave_bounds(&idle.points);
         for tick in 0..1200 {
             let now = ms(tick * 10);
             let f = frame(
@@ -276,7 +305,10 @@ mod tests {
                 assert!((1.0..=25.0).contains(&p.x));
                 assert!((2.0..=15.0).contains(&p.y));
                 assert_eq!(p.x, idle.points[i].x);
-                assert!((p.y - idle.points[i].y).abs() <= MAX_DISPLACEMENT);
+                if (2..WAVE_STEPS + 3).contains(&i) {
+                    assert!(p.y >= ceiling - 1e-12 && p.y <= floor + 1e-12);
+                    assert!((p.y - f.points[WAVE_STEPS + 4 - i].y).abs() < 1e-12);
+                }
                 if i <= 2 || i >= WAVE_STEPS + 2 {
                     assert_eq!(*p, idle.points[i]);
                 }
@@ -288,7 +320,8 @@ mod tests {
     fn deterministic_inputs_and_long_uptime_keep_the_same_carrier() {
         let early = frame(ms(2234), burst(0, 2234), false);
         assert_eq!(early, frame(ms(2234), burst(0, 2234), false));
-        let late = Duration::new(u64::MAX - u64::MAX % 6 + 2, 234_000_000);
+        // Twelve whole seconds are exactly five 2.4 s periods.
+        let late = Duration::new(u64::MAX - u64::MAX % 12 + 2, 234_000_000);
         let f = frame(
             late,
             Some(TransferActivity {
@@ -317,7 +350,45 @@ mod tests {
         assert_eq!((min_x, max_x), (1.0, 25.0));
         assert!((max_y - min_y - 165.75 * SCALE).abs() < 1e-10);
         assert_eq!(max_y, 14.0);
-        assert_eq!(MAX_DISPLACEMENT, 2.0);
+        let (ceiling, floor) = wave_bounds(&idle.points);
+        assert!((ceiling - 4.055).abs() < 1e-12);
+        assert!((floor - 12.107434011801187).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ripple_phase_inverts_and_travels_outward_without_a_cusp() {
+        for radius in [0.0, 0.01, 0.06, 0.12, 0.3, 0.8, 2.0] {
+            for i in 0..600 {
+                let phase = TAU * i as f64 / 600.0;
+                let carrier = radial_carrier(radius, phase);
+                assert!(carrier.abs() <= 1.0 + 1e-12);
+                assert!((carrier + radial_carrier(radius, phase + PI)).abs() < 1e-12);
+            }
+        }
+        for radius in [0.2, 0.4, 0.7, 1.0] {
+            assert!(
+                (radial_carrier(radius, 0.3) - radial_carrier(radius + 0.1, 0.3 + TAU * 0.1)).abs()
+                    < 1e-12
+            );
+        }
+        for phase in [0.0, PI * 0.5, PI, PI * 1.5] {
+            assert!(
+                ((radial_carrier(1e-7, phase) - radial_carrier(0.0, phase)) / 1e-7).abs() < 0.00001
+            );
+        }
+    }
+
+    #[test]
+    fn active_ripple_exchanges_central_crest_and_floor_without_deepening() {
+        let idle = frame(ms(0), None, false);
+        let (ceiling, floor) = wave_bounds(&idle.points);
+        let crest = frame(ms(2400), burst(0, 2400), false);
+        let valley = frame(ms(1200), burst(0, 1200), false);
+        let centre = 2 + WAVE_STEPS / 2;
+        assert!((crest.points[centre].y - ceiling).abs() < 1e-12);
+        assert!((valley.points[centre].y - floor).abs() < 1e-12);
+        // Phase is relative to each burst, not an arbitrary app uptime origin.
+        assert_eq!(valley, frame(ms(11_200), burst(10_000, 11_200), false));
     }
 
     #[test]
