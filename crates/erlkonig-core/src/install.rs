@@ -40,6 +40,38 @@ impl Host {
     }
 }
 
+/// Detection is separate from inventory: a present CLI may fail to report its
+/// plugin state, and a desktop app may have no supported management CLI.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClientAvailability {
+    pub openai_app: Option<String>,
+    pub claude_desktop: bool,
+    pub openai_cli: Option<PathBuf>,
+    pub claude_cli: Option<PathBuf>,
+}
+
+impl ClientAvailability {
+    pub fn openai_label(&self) -> Option<String> {
+        match (self.openai_app.as_deref(), self.openai_cli.is_some()) {
+            (Some("Codex"), _) | (None, true) => Some("Codex plugin".into()),
+            (Some(app), true) => Some(format!("{app} / Codex plugin")),
+            (Some(app), false) => Some(format!("{app} plugin")),
+            (None, false) => None,
+        }
+    }
+
+    pub fn cli(&self, host: Host) -> Option<&Path> {
+        match host {
+            Host::OpenAi => self.openai_cli.as_deref(),
+            Host::ClaudeCode => self.claude_cli.as_deref(),
+        }
+    }
+
+    pub fn any(&self) -> bool {
+        self.openai_label().is_some() || self.claude_cli.is_some() || self.claude_desktop
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inventory {
     /// Local user-scope installation only; never an account-install claim.
@@ -47,6 +79,31 @@ pub struct Inventory {
     pub enabled: bool,
     pub account_managed: bool,
     pub load_errors: bool,
+}
+
+/// A missing check value means retain the last observation, not "uninstalled".
+pub fn inventory_menu_state(
+    state: Option<&Result<Inventory, String>>,
+) -> (Option<bool>, bool, &'static str) {
+    match state {
+        Some(Ok(state)) => (
+            Some(state.installed),
+            true,
+            if state.installed && state.load_errors {
+                "load errors"
+            } else if state.installed && !state.enabled {
+                "disabled"
+            } else if state.installed {
+                "installed"
+            } else if state.account_managed {
+                "account-managed"
+            } else {
+                "not installed"
+            },
+        ),
+        Some(Err(_)) => (None, false, "status unavailable"),
+        None => (None, false, "checking…"),
+    }
 }
 
 /// Unknown/malformed inventory is an error, not an unchecked installation.
@@ -107,6 +164,12 @@ pub fn parse_inventory(host: Host, bytes: &[u8]) -> Result<Inventory, String> {
 }
 
 pub fn find_client(host: Host) -> Option<PathBuf> {
+    find_client_with_apps(host, &[PathBuf::from("/Applications/ChatGPT.app")])
+}
+
+/// Native callers supply paths returned by NSWorkspace; neither discovery nor
+/// this resolver launches a desktop app. Only the known CLI resource is used.
+pub fn find_client_with_apps(host: Host, openai_apps: &[PathBuf]) -> Option<PathBuf> {
     let mut candidates = std::env::var_os("PATH")
         .map(|path| {
             std::env::split_paths(&path)
@@ -121,8 +184,16 @@ pub fn find_client(host: Host) -> Option<PathBuf> {
         candidates.push(Path::new(prefix).join(host.program()));
     }
     if host == Host::OpenAi {
-        candidates.push("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex".into());
+        candidates.extend(openai_apps.iter().map(|app| bundled_openai_cli(app)));
     }
+    first_executable(candidates)
+}
+
+fn bundled_openai_cli(app: &Path) -> PathBuf {
+    app.join("Contents/Resources/codex-cli/bin/codex")
+}
+
+fn first_executable(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     candidates.into_iter().find(|path| {
         path.is_absolute()
             && fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -238,7 +309,16 @@ fn run(program: &Path, args: &[&str], cwd: &Path, cancel: &AtomicBool) -> Result
 pub fn inventory(host: Host, layout: &Layout, cancel: &AtomicBool) -> Result<Inventory, String> {
     let program =
         find_client(host).ok_or_else(|| format!("{} CLI was not found", host.program()))?;
-    read_inventory(host, &program, &layout.dir, cancel)
+    inventory_with_client(host, &program, layout, cancel)
+}
+
+pub fn inventory_with_client(
+    host: Host,
+    program: &Path,
+    layout: &Layout,
+    cancel: &AtomicBool,
+) -> Result<Inventory, String> {
+    read_inventory(host, program, &layout.dir, cancel)
 }
 
 /// Diagnostic only: a legacy server may be user-authored. Never remove or
@@ -484,6 +564,19 @@ pub fn set_installed(
 ) -> Result<Inventory, String> {
     let program =
         find_client(host).ok_or_else(|| format!("{} CLI was not found", host.program()))?;
+    set_installed_with_client(host, &program, wanted, layout, executable, url, cancel)
+}
+
+/// Use the exact CLI whose inventory the menu observed, not a fresh PATH choice.
+pub fn set_installed_with_client(
+    host: Host,
+    program: &Path,
+    wanted: bool,
+    layout: &Layout,
+    executable: &Path,
+    url: &str,
+    cancel: &AtomicBool,
+) -> Result<Inventory, String> {
     let before = read_inventory(host, &program, &layout.dir, cancel)?;
     if before.account_managed && !before.installed {
         return Err("This Claude plugin is account-managed. Manage or remove it in Customize → Plugins on your Claude account".into());
@@ -582,6 +675,92 @@ pub fn cowork_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn client_presence_keeps_apps_and_management_separate() {
+        // All absent, either app-only, either CLI-only, and mixed/both cases.
+        for bits in 0..16 {
+            let clients = ClientAvailability {
+                openai_app: (bits & 1 != 0).then(|| "ChatGPT".into()),
+                claude_desktop: bits & 2 != 0,
+                openai_cli: (bits & 4 != 0).then(|| PathBuf::from("/bin/codex")),
+                claude_cli: (bits & 8 != 0).then(|| PathBuf::from("/bin/claude")),
+            };
+            assert_eq!(clients.any(), bits != 0);
+            assert_eq!(clients.openai_label().is_some(), bits & 5 != 0);
+            assert_eq!(clients.cli(Host::OpenAi).is_some(), bits & 4 != 0);
+            assert_eq!(clients.cli(Host::ClaudeCode).is_some(), bits & 8 != 0);
+            assert_eq!(clients.claude_desktop, bits & 2 != 0);
+            if bits & 5 == 5 {
+                assert_eq!(
+                    clients.openai_label().as_deref(),
+                    Some("ChatGPT / Codex plugin")
+                );
+            } else if bits & 1 != 0 {
+                assert_eq!(clients.openai_label().as_deref(), Some("ChatGPT plugin"));
+            } else if bits & 4 != 0 {
+                assert_eq!(clients.openai_label().as_deref(), Some("Codex plugin"));
+            }
+        }
+        let clients = ClientAvailability {
+            openai_app: Some("Codex".into()),
+            openai_cli: Some("/bin/codex".into()),
+            ..Default::default()
+        };
+        assert_eq!(clients.openai_label().as_deref(), Some("Codex plugin"));
+    }
+
+    #[test]
+    fn inventory_failure_retains_check_and_disabled_stays_installed() {
+        let disabled = Ok(Inventory {
+            installed: true,
+            enabled: false,
+            account_managed: false,
+            load_errors: false,
+        });
+        assert_eq!(
+            inventory_menu_state(Some(&disabled)),
+            (Some(true), true, "disabled")
+        );
+        let unavailable = Err("CLI inventory failed".into());
+        assert_eq!(
+            inventory_menu_state(Some(&unavailable)),
+            (None, false, "status unavailable")
+        );
+        assert_eq!(inventory_menu_state(None), (None, false, "checking…"));
+        let absent = parse_inventory(Host::ClaudeCode, b"[]");
+        assert_eq!(
+            inventory_menu_state(Some(&absent)),
+            (Some(false), true, "not installed")
+        );
+        let synced = parse_inventory(
+            Host::ClaudeCode,
+            br#"[{"id":"erlkonig@synced","scope":"synced","enabled":true}]"#,
+        );
+        assert_eq!(
+            inventory_menu_state(Some(&synced)),
+            (Some(false), true, "account-managed")
+        );
+    }
+
+    #[test]
+    fn bundled_cli_uses_detected_location_and_requires_executable_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("Elsewhere/My ChatGPT.app");
+        let cli = bundled_openai_cli(&app);
+        assert_eq!(cli, app.join("Contents/Resources/codex-cli/bin/codex"));
+        assert_eq!(first_executable([cli.clone()]), None);
+        fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        fs::write(&cli, "fixture, never executed").unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(first_executable([cli.clone()]), None);
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(first_executable([cli.clone()]), Some(cli));
+        assert_eq!(
+            first_executable([app, PathBuf::from("relative/codex")]),
+            None
+        );
+    }
+
     #[test]
     fn inventory_is_not_enablement_or_account_state() {
         let state = parse_inventory(Host::OpenAi, br#"{"installed":[{"pluginId":"erlkonig@erlkonig-local","installed":true,"enabled":false}],"available":[]}"#).unwrap();

@@ -13,7 +13,7 @@ use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSApplication, NSModalResponseOK, NSOpenPanel, NSPasteboard,
     NSPasteboardTypeString, NSTextField, NSView, NSWorkspace,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSURL};
+use objc2_foundation::{NSBundle, NSPoint, NSRect, NSSize, NSString, NSURL};
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
 use std::path::PathBuf;
 use std::sync::{
@@ -33,7 +33,10 @@ struct Items {
     status: MenuItem,
     preview: CheckMenuItem,
     copy_id: MenuItem,
+    integrations: Submenu,
+    no_clients: MenuItem,
     chatgpt: CheckMenuItem,
+    openai_manual: MenuItem,
     claude: CheckMenuItem,
     cowork: MenuItem,
     refresh_plugins: MenuItem,
@@ -71,11 +74,15 @@ struct App {
     pile_items: Vec<PileItems>,
     config_generation: u64,
     plugin_states: [Option<Result<install::Inventory, String>>; 2],
+    clients: Option<install::ClientAvailability>,
     plugin_task: Option<PluginTask>,
 }
 
 enum PluginResult {
-    Inventory([Result<install::Inventory, String>; 2]),
+    Inventory {
+        clients: install::ClientAvailability,
+        states: [Option<Result<install::Inventory, String>>; 2],
+    },
     Changed(install::Host, Result<install::Inventory, String>),
     Archive(Result<PathBuf, String>),
 }
@@ -94,6 +101,30 @@ fn host_index(host: install::Host) -> usize {
 
 fn login() -> objc2::rc::Retained<SMAppService> {
     unsafe { SMAppService::mainAppService() }
+}
+
+/// Public LaunchServices lookup, not a running-process test. Reading bundle
+/// metadata does not launch/load its executable or imply account entitlement.
+fn installed_app(bundle_id: &str, fallback_name: &str) -> Option<(PathBuf, String)> {
+    let url = NSWorkspace::sharedWorkspace()
+        .URLForApplicationWithBundleIdentifier(&NSString::from_str(bundle_id))?;
+    let path = PathBuf::from(url.path()?.to_string());
+    if !path.is_absolute() || !path.is_dir() {
+        return None; // LaunchServices can retain an entry after an app is removed.
+    }
+    let bundle = NSBundle::bundleWithURL(&url)?;
+    let name = ["CFBundleDisplayName", "CFBundleName"]
+        .into_iter()
+        .find_map(|key| {
+            bundle
+                .objectForInfoDictionaryKey(&NSString::from_str(key))?
+                .downcast::<NSString>()
+                .ok()
+                .map(|name| name.to_string())
+                .filter(|name| !name.is_empty())
+        })
+        .unwrap_or_else(|| fallback_name.to_owned());
+    Some((path, name))
 }
 
 impl App {
@@ -229,6 +260,7 @@ impl App {
         self.items.chatgpt.set_enabled(false);
         self.items.claude.set_enabled(false);
         for item in [
+            &self.items.openai_manual,
             &self.items.cowork,
             &self.items.refresh_plugins,
             &self.items.copy_id,
@@ -239,6 +271,7 @@ impl App {
         self.items.login.set_enabled(false);
         self.items.preview.set_enabled(false);
         self.items.piles.set_enabled(false);
+        self.items.integrations.set_enabled(false);
         if let Some(runtime) = &self.runtime {
             runtime.begin_shutdown();
         }
@@ -307,13 +340,78 @@ impl App {
     }
 
     fn check_plugins(&mut self) {
+        if self.plugin_task.is_some() || self.quitting.is_some() {
+            return;
+        }
+        // The current OpenAI app is branded ChatGPT but retains this bundle ID.
+        // Use its public display name, not its path or ID, for the menu label.
+        let openai = installed_app("com.openai.codex", "OpenAI");
+        let openai_apps = openai
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let mut clients = install::ClientAvailability {
+            openai_app: openai.map(|(_, name)| name),
+            claude_desktop: installed_app("com.anthropic.claudefordesktop", "Claude").is_some(),
+            ..Default::default()
+        };
         let layout = self.layout.clone();
         self.start_plugin_task(move |cancel| {
-            PluginResult::Inventory([
-                install::inventory(install::Host::OpenAi, &layout, &cancel),
-                install::inventory(install::Host::ClaudeCode, &layout, &cancel),
-            ])
+            clients.openai_cli =
+                install::find_client_with_apps(install::Host::OpenAi, &openai_apps);
+            clients.claude_cli = install::find_client_with_apps(install::Host::ClaudeCode, &[]);
+            let states = [install::Host::OpenAi, install::Host::ClaudeCode].map(|host| {
+                clients
+                    .cli(host)
+                    .map(|program| install::inventory_with_client(host, program, &layout, &cancel))
+            });
+            PluginResult::Inventory { clients, states }
         });
+        if self.plugin_task.is_none() {
+            self.rebuild_integrations();
+        }
+    }
+
+    fn rebuild_integrations(&self) {
+        let menu = &self.items.integrations;
+        while menu.remove_at(0).is_some() {}
+        match &self.clients {
+            Some(clients) => {
+                if clients.openai_label().is_some() {
+                    if clients.openai_cli.is_some() {
+                        let _ = menu.append(&self.items.chatgpt);
+                    } else {
+                        let _ = menu.append(&self.items.openai_manual);
+                    }
+                }
+                if clients.claude_cli.is_some() {
+                    let _ = menu.append(&self.items.claude);
+                }
+                if clients.claude_desktop {
+                    let _ = menu.append(&self.items.cowork);
+                }
+                if !clients.any() {
+                    self.items
+                        .no_clients
+                        .set_text("No supported clients detected");
+                    let _ = menu.append(&self.items.no_clients);
+                }
+            }
+            None => {
+                self.items
+                    .no_clients
+                    .set_text(if self.plugin_task.is_some() {
+                        "Checking clients…"
+                    } else {
+                        "Client detection unavailable"
+                    });
+                let _ = menu.append(&self.items.no_clients);
+            }
+        }
+        let _ = menu.append_items(&[
+            &PredefinedMenuItem::separator(),
+            &self.items.refresh_plugins,
+        ]);
     }
 
     fn update_plugin_items(&self) {
@@ -322,29 +420,35 @@ impl App {
             (install::Host::ClaudeCode, &self.items.claude),
         ] {
             let state = self.plugin_states[host_index(host)].as_ref();
-            let suffix = match state {
-                Some(Ok(state)) => {
-                    item.set_checked(state.installed);
-                    if state.installed && state.load_errors {
-                        " · load errors"
-                    } else if state.installed && !state.enabled {
-                        " · disabled"
-                    } else if state.installed {
-                        " · installed"
-                    } else if state.account_managed {
-                        " · account-managed"
-                    } else {
-                        " · not installed"
-                    }
-                }
-                Some(Err(_)) => " · status unavailable",
-                None => " · checking…",
-            };
+            let (checked, actionable, suffix) = install::inventory_menu_state(state);
+            if let Some(checked) = checked {
+                item.set_checked(checked);
+            }
             // On an error retain the last-known check, disable the control and
             // explicitly mark uncertainty instead of claiming uninstallation.
-            item.set_text(format!("{}{suffix}", host.label()));
-            item.set_enabled(self.plugin_task.is_none() && state.is_some_and(Result::is_ok));
+            let label = (host == install::Host::OpenAi)
+                .then(|| {
+                    self.clients
+                        .as_ref()
+                        .and_then(|clients| clients.openai_label())
+                })
+                .flatten()
+                .unwrap_or_else(|| host.label().into());
+            item.set_text(format!("{label} · {suffix}"));
+            item.set_enabled(self.plugin_task.is_none() && actionable);
         }
+        if let Some(label) = self
+            .clients
+            .as_ref()
+            .and_then(|clients| clients.openai_label())
+        {
+            self.items
+                .openai_manual
+                .set_text(format!("{label} · CLI unavailable…"));
+        }
+        self.items
+            .openai_manual
+            .set_enabled(self.plugin_task.is_none());
         self.items
             .refresh_plugins
             .set_text(if self.plugin_task.is_some() {
@@ -370,8 +474,10 @@ impl App {
             return;
         };
         match task.thread.join() {
-            Ok(PluginResult::Inventory(states)) => {
-                self.plugin_states = states.map(Some);
+            Ok(PluginResult::Inventory { clients, states }) => {
+                self.clients = Some(clients);
+                self.plugin_states = states;
+                self.rebuild_integrations();
             }
             Ok(PluginResult::Changed(host, result)) => {
                 let text = match &result {
@@ -415,16 +521,28 @@ impl App {
                     Some(Err("Plugin worker failed".into())),
                     Some(Err("Plugin worker failed".into())),
                 ];
+                self.rebuild_integrations();
             }
         }
         self.update_plugin_items();
     }
 
     fn plugin_action(&mut self, host: install::Host) {
+        if self.plugin_task.is_some() || self.quitting.is_some() {
+            return;
+        }
         // AppKit toggles a check item immediately; restore observed state until
         // the client has actually confirmed the requested mutation.
         self.update_plugin_items();
         let Some(Ok(state)) = self.plugin_states[host_index(host)].clone() else {
+            return;
+        };
+        let Some(program) = self
+            .clients
+            .as_ref()
+            .and_then(|clients| clients.cli(host))
+            .map(PathBuf::from)
+        else {
             return;
         };
         if state.account_managed && !state.installed {
@@ -480,8 +598,9 @@ impl App {
         self.start_plugin_task(move |cancel| {
             PluginResult::Changed(
                 host,
-                install::set_installed(
+                install::set_installed_with_client(
                     host,
+                    &program,
                     wanted,
                     &layout,
                     &executable,
@@ -847,6 +966,12 @@ impl App {
             }
         } else if id == self.items.chatgpt.id() {
             self.plugin_action(install::Host::OpenAi);
+        } else if id == self.items.openai_manual.id() {
+            self.alert(
+                "OpenAI plugin management unavailable",
+                "The desktop app is installed, but a supported Codex management CLI was not detected. Use the app's plugin settings, or install the Codex CLI and choose Refresh plugin status. Erlkönig has not checked or changed the app's plugin installation.",
+                &["OK"],
+            );
         } else if id == self.items.claude.id() {
             self.plugin_action(install::Host::ClaudeCode);
         } else if id == self.items.cowork.id() {
@@ -946,7 +1071,10 @@ pub fn main() {
         status: MenuItem::new("Starting…", true, None),
         preview: CheckMenuItem::new("Preview sync animation", true, false, None),
         copy_id: MenuItem::new("Copy my ID", true, None),
+        integrations: Submenu::new("Integrations", true),
+        no_clients: MenuItem::new("Checking clients…", false, None),
         chatgpt: CheckMenuItem::new("OpenAI local plugin · checking…", false, false, None),
+        openai_manual: MenuItem::new("OpenAI plugin · CLI unavailable…", false, None),
         claude: CheckMenuItem::new("Claude Code plugin · checking…", false, false, None),
         cowork: MenuItem::new("Manage Cowork plugin…", false, None),
         refresh_plugins: MenuItem::new("Refresh plugin status…", false, None),
@@ -955,6 +1083,10 @@ pub fn main() {
         add_pile: MenuItem::new("Add existing pile…", true, None),
         quit: MenuItem::new("Quit Erlkönig", true, None),
     };
+    items
+        .integrations
+        .append_items(&[&items.no_clients, &items.refresh_plugins])
+        .expect("integrations menu");
     let menu = Menu::new();
     menu.append_items(&[
         &items.status,
@@ -962,10 +1094,7 @@ pub fn main() {
         &items.piles,
         &PredefinedMenuItem::separator(),
         &items.copy_id,
-        &items.chatgpt,
-        &items.claude,
-        &items.cowork,
-        &items.refresh_plugins,
+        &items.integrations,
         &PredefinedMenuItem::separator(),
         &items.login,
         &items.quit,
@@ -989,6 +1118,7 @@ pub fn main() {
         pile_items: Vec::new(),
         config_generation: u64::MAX,
         plugin_states: [None, None],
+        clients: None,
         plugin_task: None,
     };
     if let Err(error) = event_loop.run_app(&mut app) {

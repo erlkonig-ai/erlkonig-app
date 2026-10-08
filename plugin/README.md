@@ -12,3 +12,27 @@ credential, private key, pile, top-level `bin/` folder, or bundled executable.
 The client invokes the app binary's `mcp-stdio` mode; that transport only
 forwards to an already-running app. Quit closes the owning backend, and the
 transport must never relaunch it or acquire a pile itself.
+
+The Mac's **Integrations** menu detects installed desktop apps through public
+`NSWorkspace` bundle lookup (no app launch), and executable management CLIs
+through the local resolver. Detection runs at startup and on **Refresh plugin
+status**, not on the runtime status timer. The known OpenAI bundle ID is
+`com.openai.codex`; its public display name determines whether the row says
+ChatGPT or Codex. A CLI may also be resolved from the detected bundle's known
+`Contents/Resources/codex-cli/bin/codex` resource, independent of where the app
+was installed. Claude Desktop uses `com.anthropic.claudefordesktop`.
+
+Only detected integrations appear. The one OpenAI row describes the detected
+desktop app/Codex CLI; its check is the CLI's local plugin inventory, not a
+desktop connection claim. An OpenAI app without a management CLI gets a plain
+“CLI unavailable…” action, never a synthetic check. Claude Code has its own
+local-inventory check. Claude Desktop adds the separate **Manage Cowork
+plugin…** account action; detecting the app proves neither Cowork entitlement
+nor account installation. Installing locally in Claude Code does not install
+the account plugin. Account-synced-only inventory routes to account management.
+
+An installed but disabled plugin remains checked and says “disabled.” An
+inventory failure remains visible, disabled, and says “status unavailable,”
+retaining the last observed check. Not detecting any supported client leaves
+a small “No supported clients detected” entry and the refresh action. Detection
+never removes an integration or changes client settings.

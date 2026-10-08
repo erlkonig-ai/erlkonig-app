@@ -62,8 +62,13 @@ require a machine-local bearer token. The stdio transport reads the existing
 private token only when connecting; no credential is put in a plugin or client
 profile. Quit disconnects the transports, which never relaunch the app.
 
-**OpenAI local plugin** and **Claude Code plugin** are explicit local install
-controls. Their checkmarks mean installed, not enabled or connected. Disabled
+The **Integrations** submenu shows detected clients: one OpenAI row labelled
+for the installed ChatGPT/Codex clients, a **Claude Code plugin** row when its
+CLI is available, and a separate Cowork action when Claude Desktop is found.
+Desktop detection uses public macOS bundle lookup, not running processes or
+account state. An OpenAI app without a management CLI gets a plain “CLI
+unavailable…” action. See [detection policy](plugin/README.md) for details.
+The local controls' checkmarks mean installed, not enabled or connected. Disabled
 and load-error states are labelled separately; unavailable status preserves
 the last-known check and disables mutation until a successful refresh.
 Inventory runs on startup, after changes, or on **Refresh plugin status**—not
