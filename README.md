@@ -1,4 +1,4 @@
-# Erlkönig
+# Erlkonig
 
 One macOS menu-bar application, one executable, one resident backend. The
 main thread owns the menu; native Rust workers own replication, maintenance
@@ -11,8 +11,8 @@ to the running app, and never owns a pile or starts a backend.
 `erlkonig` owns the macOS menu and crown. `faculties`, `trible` and
 `triblespace-net` are linked libraries, not launched commands. Each syncing pile
 owns a durable Peer; enabled maintenance shares it. With sync off, maintenance
-uses a resident-only Pile, with no network acquisition. Faculty reads use
-an existing lazy, non-serving ephemeral Leech when an exact payload is missing.
+uses a resident-only Pile, with no network acquisition. Workspace Faculty reads
+are local-only: missing payloads fail rather than starting acquisition peers.
 These native owners and their safe pile handles all end with the app.
 Code's local Git operations use linked, vendored libgit2; no Git executable,
 external diff/filter/credential helper, or SSH/HTTPS transport is used. Its
@@ -34,6 +34,36 @@ handles, not ambiguous collection names. Each entry has independent **Sync**
 and **Local maintenance** controls, both initially off, plus its status and
 configuration editor. No other pile is discovered, created, attached or taken
 over automatically. Routes never inherit `TRIBLESPACE_PEERS`.
+
+Choose **Managed Piles → a pile → Create query workspace…** to name a query
+workspace and select exact local collection roots for its faculty roles.
+Discovery is read-only and user-triggered; same-name roots remain distinct,
+and an exact handle can probe a locally present descriptor-only root. READ
+and WRITE admission are shown separately. The selected pile/key paths, public
+signer and role-to-root bindings are saved in node configuration, not copied
+datasets. Omitted roles are unavailable: they never fall back to signer-private
+roots or the node pile. Creating a workspace does not enable Sync or maintenance.
+
+MCP clients call `list_workspaces` first. It returns healthy entries with labels,
+exact revision IDs, public signers and configured role/root handles, alongside
+unavailable entries with reasons. Listing does not open target piles or keys.
+Every faculty call requires an explicit `workspace` ID from that list; there
+is no default or connection-global selection. The app resolves the configured
+binding once per call and freezes that value for the operation. IDs are opaque,
+not cryptographic manifests: native additive facts can change a revision's
+interpretable value, and subsequent calls use the new value. Normal UI edits
+publish a successor and reject the previous ID instead of redirecting it.
+Unavailable revisions can be withdrawn from **Query Workspaces** without
+decoding their full binding or deleting data.
+
+Each call uses only its configured data routes and signer, including auxiliary
+faculty collections. Requests cannot supply replacement pile paths, keys or
+root mappings. This routing is not an execution sandbox for tools that support
+host paths or user-invoked commands. Reading workspace A and then writing
+workspace B are separate explicit operations, not an automatic copy, union,
+transfer tool or cross-pile transaction. Existing collection admission still
+applies. Local-only query access does not start synchronization, notifications
+or acquisition networking; separately configured managed sync remains separate.
 
 The controller retains native config observations and task ownership, not a
 second configuration database. Metrics writes do not invalidate the config
@@ -102,9 +132,7 @@ Package staging allows only the intended manifest, shared skill and `.mcp.json`;
 unexpected files or symlinks are refused rather than executed or distributed.
 The ZIP contains exactly those three files and no top-level `bin/` directory.
 
-MCP remains exclusively attached to the node pile; managed-pile routing and
-automatic unions across data worlds are deliberately not implemented. A stored
-MCP-port change takes effect on the next launch. Metrics contain cumulative
+A stored MCP-port change takes effect on the next launch. Metrics contain cumulative
 observed bytes/publications/failures by managed entry, worker and session;
 absent counters remain unknown. Measurements are coalesced at a ten-second
 cadence, with observed failures and shutdown flushed sooner. The managed
@@ -114,8 +142,8 @@ appends are visible in the menu and are never reported as persisted success.
 
 The crown is static at rest and with macOS Reduce Motion. Animation follows
 payload-transfer counters, not connection state or QUIC keepalives. Current
-receive progress is published after a reconcile completes; lazy Faculty fetches
-are not included, so this is not yet a continuous in-flight byte meter.
+receive progress is published after a reconcile completes, so this is not yet
+a continuous in-flight byte meter. Local-only workspace reads add no network traffic.
 
 ## Validation and packaging
 

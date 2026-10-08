@@ -1,0 +1,358 @@
+//! Request-scoped MCP selection of an explicitly configured workspace binding.
+//!
+//! Protocol connections have no current workspace. Only live native owners are
+//! retained here; target data and configuration remain queried at their source.
+
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result, bail};
+use ed25519_dalek::VerifyingKey;
+use faculties::mcp::{self, Bytes, Faculty, Tool, catalog};
+use faculties::out::Out;
+use faculties::storage::Storage;
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+use serde_json::{Value, json, value::RawValue};
+use triblespace::core::id::Id;
+
+use crate::node_store::ConfigView;
+use crate::workspace::Workspace;
+
+const LIST: Tool = Tool {
+    name: "list_workspaces",
+    description: "List explicitly configured Erlkonig workspaces, exact revision IDs, public signers and collection roles, alongside unavailable revisions. This reads app configuration only; it does not open target piles or keys. Pass one returned workspace ID on every faculty tool call. Names are labels, never selectors; each call resolves and freezes the current binding value.",
+    input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+};
+
+pub struct WorkspaceDispatch {
+    config: Box<dyn Fn() -> Result<ConfigView>>,
+    tools: Vec<Tool>,
+    schemas: BTreeMap<&'static str, String>,
+    // Handles and their adapters, never a materialized dataset or config cache.
+    owners: RefCell<BTreeMap<Id, Owner>>,
+}
+
+struct Owner {
+    binding: Workspace,
+    catalog: catalog::Catalog,
+}
+
+impl WorkspaceDispatch {
+    pub fn new(config: impl Fn() -> Result<ConfigView> + 'static) -> Result<Self> {
+        // Catalog construction is I/O-free. The schema-only catalog has no
+        // usable path and is never dispatched; there is no node-pile fallback.
+        let path = PathBuf::new();
+        let catalog = catalog::Catalog::with_storage(
+            catalog::Config::new(&path),
+            Storage::shared_with_peers(path, None, Vec::new()).with_collections(BTreeMap::new()),
+        );
+        let mut tools = vec![LIST];
+        let mut schemas = BTreeMap::new();
+        for faculty in catalog.registrations() {
+            for tool in faculty.tools() {
+                register_tool(&mut tools, &mut schemas, tool, faculty.input_schema(tool))?;
+            }
+        }
+        Ok(Self {
+            config: Box::new(config),
+            tools,
+            schemas,
+            owners: RefCell::new(BTreeMap::new()),
+        })
+    }
+
+    /// Stop owners whose binding was removed or superseded. HTTP dispatch is
+    /// sequential: an already admitted native call drains before this runs.
+    fn retire(&self, view: &ConfigView, selected: Option<Id>) -> Result<()> {
+        let ids: Vec<_> = self.owners.borrow().keys().copied().collect();
+        let mut failures = Vec::new();
+        for id in ids {
+            // The selected value is resolved exactly once by its caller.
+            if selected == Some(id) {
+                continue;
+            }
+            let current = view.workspace(id);
+            let unchanged = matches!(&current, Ok(Some(binding))
+                if self.owners.borrow().get(&id).is_some_and(|owner| owner.binding == *binding));
+            if !unchanged {
+                if let Some(owner) = self.owners.borrow_mut().remove(&id) {
+                    if let Err(error) = owner.catalog.close() {
+                        failures.push(format!("close workspace {id:X}: {error:#}"));
+                    }
+                }
+            }
+        }
+        if !failures.is_empty() {
+            bail!(failures.join("; "));
+        }
+        Ok(())
+    }
+
+    fn open(workspace: Workspace) -> Result<Owner> {
+        let signer = VerifyingKey::from_bytes(&workspace.signer)
+            .context("workspace has an invalid configured signing identity")?;
+        // Workspace selection alone does not authorize an acquisition network
+        // owner. Missing payloads are reported; managed sync is independent.
+        let storage = Storage::shared_local(workspace.pile.clone(), Some(workspace.key.clone()))
+            .with_collections(workspace.routes.clone())
+            .with_expected_signer(signer);
+        let mut config = catalog::Config::new(&workspace.pile);
+        config.key = Some(workspace.key.clone());
+        Ok(Owner {
+            binding: workspace,
+            catalog: catalog::Catalog::with_storage(config, storage),
+        })
+    }
+
+    /// Transport shutdown first drains requests; then close every native owner,
+    /// reporting all close failures rather than relying on best-effort Drop.
+    pub fn close(&self) -> Result<()> {
+        let owners = std::mem::take(&mut *self.owners.borrow_mut());
+        let mut failures = Vec::new();
+        for (id, owner) in owners {
+            if let Err(error) = owner.catalog.close() {
+                failures.push(format!("close workspace {id:X}: {error:#}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            bail!(failures.join("; "))
+        }
+    }
+
+    pub fn finish<T>(&self, result: Result<T>) -> Result<T> {
+        match (result, self.close()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(close)) => {
+                Err(error.context(format!("workspace shutdown: {close:#}")))
+            }
+        }
+    }
+}
+
+impl Drop for WorkspaceDispatch {
+    fn drop(&mut self) {
+        if let Err(error) = self.close() {
+            eprintln!("Erlkonig workspace shutdown: {error:#}");
+        }
+    }
+}
+
+impl Faculty for WorkspaceDispatch {
+    fn tools(&self) -> &[Tool] {
+        &self.tools
+    }
+
+    fn input_schema<'a>(&'a self, tool: &'a Tool) -> &'a str {
+        self.schemas
+            .get(tool.name)
+            .map(String::as_str)
+            .unwrap_or(tool.input_schema)
+    }
+
+    fn call(&self, name: &str, arguments: Bytes, out: &mut Out<'_>) -> Result<()> {
+        if name == LIST.name {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Empty {}
+            let _: Empty = mcp::decode_arguments(arguments)?;
+            let view = (self.config)()?;
+            self.retire(&view, None)?;
+            let mut workspaces = Vec::new();
+            let mut unavailable = Vec::new();
+            for id in view.workspace_ids()? {
+                match view.workspace(id) {
+                    Ok(Some(workspace)) => {
+                        let roles: Vec<_> = workspace
+                            .routes
+                            .iter()
+                            .map(|(role, root)| {
+                                json!({
+                                    "role": faculties::collection_names::name_for(*role),
+                                    "role_id": format!("{role:X}"),
+                                    "root": format!("blake3:{}", hex::encode(root.raw)),
+                                })
+                            })
+                            .collect();
+                        workspaces.push(json!({
+                            "workspace": format!("{:X}", workspace.id),
+                            "label": workspace.label,
+                            "signer": hex::encode(workspace.signer),
+                            "roles": roles,
+                        }));
+                    }
+                    other => unavailable.push(json!({
+                        "workspace": format!("{id:X}"),
+                        "reason": match other {
+                            Err(error) => format!("{error:#}"),
+                            _ => "managed enrollment changed or was removed".to_owned(),
+                        },
+                    })),
+                }
+            }
+            return out.text(serde_json::to_string(&json!({
+                "workspaces": workspaces, "unavailable": unavailable,
+            }))?);
+        }
+        if !self.schemas.contains_key(name) {
+            bail!("unknown workspace MCP tool {name:?}");
+        }
+        let selected: SelectedArguments = mcp::decode_arguments(arguments)?;
+        let view = (self.config)()?;
+        let resolved = view.workspace(selected.workspace);
+        // IDs are opaque: native annotation can change the value under an
+        // existing ID. Reuse only an owner for this exact observed value.
+        let unchanged = matches!(&resolved, Ok(Some(binding))
+            if self.owners.borrow().get(&selected.workspace).is_some_and(|owner| owner.binding == *binding));
+        if !unchanged {
+            if let Some(owner) = self.owners.borrow_mut().remove(&selected.workspace) {
+                owner
+                    .catalog
+                    .close()
+                    .context("close replaced workspace owner")?;
+            }
+        }
+        self.retire(&view, Some(selected.workspace))?;
+        let workspace = resolved?.ok_or_else(|| {
+            mcp::invalid_arguments("unknown, removed, or superseded workspace binding; call list_workspaces and explicitly choose a current ID")
+        })?;
+        // Even a tool without a storage entrypoint must not run under a
+        // silently replaced binding. Storage repeats this at its own opening
+        // boundary, so a replacement between these checks cannot retarget it.
+        let signer = triblespace::core::signing_key_file::load_existing(&workspace.key)
+            .context("load explicitly selected workspace signing identity")?;
+        if signer.verifying_key().to_bytes() != workspace.signer {
+            bail!("workspace signing identity changed; configure and select a new binding");
+        }
+        let mut owners = self.owners.borrow_mut();
+        if let std::collections::btree_map::Entry::Vacant(entry) = owners.entry(workspace.id) {
+            entry.insert(Self::open(workspace.clone())?);
+        }
+        let owner = &owners[&workspace.id];
+        let faculty = owner
+            .catalog
+            .registrations()
+            .into_iter()
+            .find(|faculty| faculty.tools().iter().any(|tool| tool.name == name))
+            .context("registered workspace tool has no native adapter")?;
+        faculty.call(name, selected.arguments, out)
+    }
+}
+
+fn register_tool(
+    tools: &mut Vec<Tool>,
+    schemas: &mut BTreeMap<&'static str, String>,
+    tool: &Tool,
+    schema: &str,
+) -> Result<()> {
+    if tool.name == LIST.name || schemas.contains_key(tool.name) {
+        bail!("workspace MCP tool name collision: {}", tool.name);
+    }
+    schemas.insert(
+        tool.name,
+        wrapped_schema(schema).with_context(|| format!("wrap MCP tool {}", tool.name))?,
+    );
+    tools.push(Tool {
+        name: tool.name,
+        description: tool.description,
+        input_schema: tool.input_schema,
+    });
+    Ok(())
+}
+
+fn wrapped_schema(source: &str) -> Result<String> {
+    let mut schema: Value = serde_json::from_str(source)?;
+    if schema["type"] != "object" {
+        bail!("workspace wrapper requires an object input schema");
+    }
+    let properties = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .context("workspace wrapper requires explicit object properties")?;
+    if properties.contains_key("workspace") {
+        bail!("faculty input schema already declares the reserved workspace argument");
+    }
+    properties.insert("workspace".into(), json!({
+        "type": "string",
+        "pattern": "^[0-9A-F]{32}$",
+        "description": "Exact workspace revision ID returned by list_workspaces. The current configured binding value is frozen for this call. Required on every call; never a label, prefix, path, key, or connection-global selection.",
+    }));
+    let required = schema
+        .as_object_mut()
+        .context("object schema")?
+        .entry("required")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .context("schema required must be an array")?;
+    if required.iter().any(|field| field == "workspace") {
+        bail!("faculty input schema already requires reserved workspace argument");
+    }
+    required.push(json!("workspace"));
+    Ok(serde_json::to_string(&schema)?)
+}
+
+struct SelectedArguments {
+    workspace: Id,
+    arguments: Bytes,
+}
+
+impl<'de> Deserialize<'de> for SelectedArguments {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct Selection;
+        impl<'de> Visitor<'de> for Selection {
+            type Value = SelectedArguments;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("tool argument object with one exact workspace ID")
+            }
+            fn visit_map<M: MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<Self::Value, M::Error> {
+                use serde::de::Error;
+                let mut seen = BTreeSet::new();
+                let mut workspace = None;
+                let mut arguments = String::from("{");
+                while let Some(key) = map.next_key::<String>()? {
+                    if !seen.insert(key.clone()) {
+                        return Err(M::Error::custom(format!("duplicate argument {key:?}")));
+                    }
+                    if key == "workspace" {
+                        let text = map.next_value::<String>()?;
+                        let id = Id::from_hex(&text)
+                            .filter(|id| format!("{id:X}") == text)
+                            .ok_or_else(|| {
+                                M::Error::custom(
+                                    "workspace must be an exact ID returned by list_workspaces",
+                                )
+                            })?;
+                        workspace = Some(id);
+                    } else {
+                        // Keep nested JSON verbatim, especially duplicate keys
+                        // that the adapter must reject rather than normalize.
+                        let value = map.next_value::<Box<RawValue>>()?;
+                        if arguments.len() > 1 {
+                            arguments.push(',');
+                        }
+                        arguments.push_str(&serde_json::to_string(&key).map_err(M::Error::custom)?);
+                        arguments.push(':');
+                        arguments.push_str(value.get());
+                    }
+                }
+                arguments.push('}');
+                Ok(SelectedArguments {
+                    workspace: workspace.ok_or_else(|| M::Error::missing_field("workspace"))?,
+                    arguments: Bytes::from(arguments.into_bytes()),
+                })
+            }
+        }
+        deserializer.deserialize_map(Selection)
+    }
+}
+
+#[cfg(test)]
+mod tests;

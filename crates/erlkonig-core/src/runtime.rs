@@ -7,10 +7,11 @@ use crate::{
     node_store::{ConfigView, ManagedPile, NodeStore},
     paths::{Layout, ensure_private_dir},
     status::{PileStatus, Status},
+    workspace::Workspace,
+    workspace_dispatch::WorkspaceDispatch,
 };
 use anyhow::{Context, Result, bail};
-use faculties::mcp::{catalog, http};
-use faculties::storage::Storage;
+use faculties::mcp::http;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -98,22 +99,15 @@ impl Runtime {
         };
         let http_stop = app.stop.subscribe();
         let state = app.status.clone();
+        let node = app.node.clone();
         app.workers.push(
             thread::Builder::new()
                 .name("erlkonig-faculties".into())
                 .spawn(move || {
                     let result = (|| {
-                        // MCP is deliberately one data world: the fixed node pile only.
-                        let storage = Storage::shared_with_peers(
-                            bootstrap.pile.clone(),
-                            Some(bootstrap.key.clone()),
-                            Vec::new(),
-                        );
-                        let mut config = catalog::Config::new(&bootstrap.pile);
-                        config.key = Some(bootstrap.key);
-                        let catalog = catalog::Catalog::with_storage(config, storage);
-                        let registrations = catalog.registrations();
-                        catalog.finish(endpoint.serve_until(&registrations, stopping(http_stop)))
+                        let dispatch =
+                            WorkspaceDispatch::new(move || with_node(&node, NodeStore::config))?;
+                        dispatch.finish(endpoint.serve_until(&[&dispatch], stopping(http_stop)))
                     })();
                     if let Err(error) = &result {
                         update(&state, |s| {
@@ -163,6 +157,27 @@ impl Runtime {
         with_node(&self.node, |node| {
             node.remove_managed(expected, id).map(|_| ())
         })
+    }
+
+    pub fn put_workspace(&self, expected: &ConfigView, workspace: &Workspace) -> Result<Id> {
+        if *self.stop.borrow() {
+            bail!("application is shutting down");
+        }
+        with_node(&self.node, |node| node.put_workspace(expected, workspace))
+    }
+
+    pub fn remove_workspace(&self, expected: &ConfigView, anchor: Id) -> Result<Id> {
+        if *self.stop.borrow() {
+            bail!("application is shutting down");
+        }
+        with_node(&self.node, |node| node.remove_workspace(expected, anchor))
+    }
+
+    pub fn remove_workspace_revision(&self, expected: &ConfigView, revision: Id) -> Result<Id> {
+        if *self.stop.borrow() {
+            bail!("application is shutting down");
+        }
+        with_node(&self.node, |node| node.remove_workspace_revision(expected, revision))
     }
 
     pub fn status(&self) -> Status {

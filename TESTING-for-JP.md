@@ -1,8 +1,8 @@
-# Interactive Erlkönig checks
+# Interactive Erlkonig checks
 
 Use only the explicitly selected native candidate. The previous signed native
 bundle remains rollback, not evidence for this implementation. Do not overwrite
-an app while it is running. Stop any legacy Erlkönig node before migration;
+an app while it is running. Stop any legacy Erlkonig node before migration;
 the app deliberately refuses to share its data-owner lock with it.
 
 These are pending interactive checks, not an already-passed checklist:
@@ -42,8 +42,9 @@ These are pending interactive checks, not an already-passed checklist:
 
 Configuration and metrics share the fixed self.pile. A malformed/unreadable
 control observation stops managed services; an individual conflicting revision
-stops its entry. Data is not silently unioned into MCP: it remains on the node
-pile. App-private leases cannot police nonparticipating standalone daemons.
+stops its entry. MCP requires an explicit query workspace on every faculty
+call; data is neither silently unioned nor defaulted to the node pile.
+App-private leases cannot police nonparticipating standalone daemons.
 
 Normal Quit cooperatively drains; after 15 seconds a stuck native operation
 causes final process termination with ordinary Force Quit durability limits.
@@ -55,10 +56,30 @@ on all admitted work.
    authorized test account, upload that package and verify tools in Cowork;
    account-synced Code copies must point removal back to the account UI. The
    same Claude package serves Code and Cowork, not a separate Chat extension.
-8. With a native stdio client connected, quit/force-quit Erlkönig: the owner
+8. With a native stdio client connected, quit/force-quit Erlkonig: the owner
    listener and transport must disappear, no new pile should be opened, and no
    restart should occur. A new client attempt while the app is absent must fail
    visibly on stderr without printing a credential or bootstrapping a backend.
+9. From two enrolled scratch piles, create query workspaces with selected exact
+   roots. Confirm same-name roots have distinct handles and separate READ/WRITE
+   admission. An omitted role must remain unconfigured. Saving, listing or
+   selecting a workspace must not enable Sync, maintenance, notifications or
+   acquisition networking. Discovery must leave the target bytes unchanged.
+10. Call `list_workspaces` and check labels, exact IDs, public signers and
+    role/root handles without key paths. Interleave explicit A and B requests
+    in one client and across clients; omitted/unknown IDs must fail with no
+    node/default fallback. A missing role or local payload must fail clearly.
+    A read from A followed by an authorized write to B is two operations, not
+    an automatic transfer or atomic transaction; routing is not a sandbox for
+    tools with host-path or command execution features.
+11. Edit a workspace and confirm the old ID is rejected, not redirected. A
+    malformed/conflicted entry must remain visible as unavailable without
+    hiding healthy entries; Remove workspace revision must work without
+    opening its target. Other concurrent revisions stay separately visible.
+    A native additive route annotation under an existing opaque revision ID
+    must affect later requests equally for warm and fresh owners, while an
+    already admitted operation keeps its resolved binding. Quit must drain
+    admitted operations and close all retained workspace owners.
 
 Native menu compilation and GUI interactions require a reserved Mac build/run;
 Rust parser checks and Linux tests do not establish AppKit correctness. Local

@@ -1,6 +1,6 @@
 //! Erlkönig facts in the node pile's existing private `config` collection.
 //! The Faculty `config::selects` attribute keeps its collection-handle meaning;
-//! these application settings do not pretend to be collection selections.
+//! workspace role selections use it only for exact collection handles.
 //!
 //! Anchors below were minted verbatim with installed `trible genid`, 2026-10-06.
 //! Attribute identity also incorporates the declared encoding. Entity IDs are
@@ -13,6 +13,9 @@ use triblespace::prelude::*;
 pub const NODE_SETTINGS: Id = id_hex!("E0A9165929ABA080F204EB244CD49C3A");
 /// A revision of one explicitly enrolled managed pile.
 pub const MANAGED_PILE: Id = id_hex!("55BCBF80A24F613FF984BD79DF1D6360");
+/// An explicit query workspace revision, separate from service enrollment.
+/// Minted with `trible genid` on 2026-10-08.
+pub const WORKSPACE: Id = id_hex!("F4D15E6C2AA3263C1B6DBDD0D5880539");
 
 attributes! {
     /// Explicit local path to an existing managed pile; not an ownership claim.
@@ -34,4 +37,11 @@ attributes! {
     /// Explicit enrollment or withdrawal of a managed entry. False retains
     /// history but withdraws the node's request to manage it.
     "6029BC6E30BF94DB16A5D4C96FF6B4E8" as enrolled: inlineencodings::Boolean;
+    /// Workspace revision -> role selection (config::anchor + config::selects).
+    /// Minted with `trible genid` on 2026-10-08.
+    "57DCA7F297BF848DA19CFD2730D6293E" as workspace_route: inlineencodings::GenId;
+    /// Public identity expected when loading the explicitly selected key file.
+    /// Not an attestation author or an admission-policy authority.
+    /// Minted with `trible genid` on 2026-10-08.
+    "D461447F2732ABF6FF9E68AE2528BF8F" as expected_signer: inlineencodings::ED25519PublicKey;
 }

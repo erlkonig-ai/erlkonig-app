@@ -23,6 +23,105 @@ fn entry(label: &str) -> ManagedPile {
 }
 
 #[test]
+fn workspace_revisions_persist_and_never_retarget_old_requests() {
+    let (_dir, path, signer, mut node) = scratch();
+    let mut managed = entry("workspace");
+    let view = node.config().unwrap();
+    node.put_managed(&view, &managed).unwrap();
+    let mut workspace = Workspace::new("Research", &managed, signer.verifying_key().to_bytes());
+    let role = faculties::schemas::wiki::DEFAULT_SCOPE_ID;
+    let first = CollectionHandle::new([91; 32]);
+    let second = CollectionHandle::new([92; 32]);
+    workspace.routes.insert(role, first);
+    let view = node.config().unwrap();
+    let old_id = node.put_workspace(&view, &workspace).unwrap();
+    node.close().unwrap();
+
+    let mut node = NodeStore::open(&path, signer).unwrap();
+    let view = node.config().unwrap();
+    let mut saved = view.workspace(old_id).unwrap().unwrap();
+    assert_eq!(saved.routes.get(&role), Some(&first));
+    assert_eq!(saved.id, old_id);
+    assert_eq!(saved.anchor, workspace.anchor);
+    assert_eq!(view.workspace_ids().unwrap(), [old_id]);
+    assert_eq!(view.managed(managed.id).unwrap(), Some(managed.clone()));
+    saved.routes.insert(role, second);
+    let new_id = node.put_workspace(&view, &saved).unwrap();
+    assert_ne!(old_id, new_id);
+    let view = node.config().unwrap();
+    assert!(view.workspace(old_id).unwrap().is_none());
+    assert_eq!(view.workspace(new_id).unwrap().unwrap().routes.get(&role), Some(&second));
+    assert!(view.workspace(genid().id).unwrap().is_none());
+    assert!(!view.managed(managed.id).unwrap().unwrap().sync_enabled);
+    assert!(!view.managed(managed.id).unwrap().unwrap().maintenance_enabled);
+
+    managed.pile = "/explicit/moved.pile".into();
+    node.put_managed(&view, &managed).unwrap();
+    let view = node.config().unwrap();
+    assert!(view.workspace(new_id).unwrap().is_none());
+    assert!(node.put_workspace(&view, &saved).is_err());
+    node.remove_workspace(&view, saved.anchor).unwrap();
+    assert!(node.config().unwrap().workspace_ids().unwrap().is_empty());
+    node.close().unwrap();
+    assert!(!Path::new("/explicit/workspace.pile").exists());
+}
+
+#[test]
+fn workspace_empty_roles_and_removed_managed_entry_remain_unconfigured() {
+    let (_dir, _path, signer, mut node) = scratch();
+    let managed = entry("empty-workspace");
+    let view = node.config().unwrap();
+    node.put_managed(&view, &managed).unwrap();
+    let workspace = Workspace::new("Empty by choice", &managed, signer.verifying_key().to_bytes());
+    let view = node.config().unwrap();
+    let id = node.put_workspace(&view, &workspace).unwrap();
+    let view = node.config().unwrap();
+    assert!(view.workspace(id).unwrap().unwrap().routes.is_empty());
+    node.remove_managed(&view, managed.id).unwrap();
+    assert!(node.config().unwrap().workspace(id).unwrap().is_none());
+    node.close().unwrap();
+}
+
+#[test]
+fn incomplete_workspace_without_anchor_can_be_withdrawn_without_projection() {
+    let (_dir, _path, _signer, mut node) = scratch();
+    let revision = genid();
+    node.pile.commit(node.config, &node.signer, entity! { &revision @
+        metadata::tag: attrs::WORKSPACE, attrs::enrolled: true,
+    }).unwrap();
+    let view = node.config().unwrap();
+    assert_eq!(view.workspace_ids().unwrap(), [revision.id]);
+    assert!(view.workspace_revision(revision.id).is_err());
+    node.remove_workspace_revision(&view, revision.id).unwrap();
+    let current = node.config().unwrap();
+    assert!(current.workspace_ids().unwrap().is_empty());
+    assert!(node.remove_workspace_revision(&current, revision.id).is_err());
+    node.close().unwrap();
+}
+
+#[test]
+fn withdrawing_one_unavailable_revision_does_not_choose_a_concurrent_winner() {
+    let (_dir, _path, _signer, mut node) = scratch();
+    let anchor = genid().id;
+    let first = genid();
+    let second = genid();
+    for revision in [first.id, second.id] {
+        node.pile.commit(node.config, &node.signer, entity! { ExclusiveId::force_ref(&revision) @
+            metadata::tag: attrs::WORKSPACE, attrs::enrolled: true,
+            config::anchor: anchor,
+        }).unwrap();
+    }
+    let view = node.config().unwrap();
+    node.remove_workspace_revision(&view, first.id).unwrap();
+    let view = node.config().unwrap();
+    assert_eq!(view.workspace_ids().unwrap(), [second.id]);
+    assert!(view.workspace_revision(second.id).is_err());
+    node.remove_workspace_revision(&view, second.id).unwrap();
+    assert!(node.config().unwrap().workspace_ids().unwrap().is_empty());
+    node.close().unwrap();
+}
+
+#[test]
 fn empty_configuration_is_known_and_off_and_store_is_send() {
     fn send<T: Send>() {}
     send::<NodeStore>();

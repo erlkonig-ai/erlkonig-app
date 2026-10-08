@@ -25,6 +25,7 @@ use triblespace::prelude::*;
 use triblespace_net::health_record;
 
 use crate::node_schema as attrs;
+use crate::workspace::Workspace;
 
 /// An edit request or one effective entry projection, never a store mirror.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -257,6 +258,104 @@ impl ConfigView {
             _ => bail!("node settings have conflicting MCP ports: {ports:?}"),
         }
     }
+
+    /// Exact current revision IDs, never a global or per-session selection.
+    /// Resolving each ID remains fallible: unknown/conflicting settings are
+    /// visible as unavailable rather than falling back to another workspace.
+    pub fn workspace_ids(&self) -> Result<Vec<Id>> {
+        let facts = self.facts()?;
+        let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+        let mut ids: Vec<Id> = find!(state: Id, and!(
+            pattern!(&facts, [{ ?state @ metadata::tag: attrs::WORKSPACE,
+                attrs::enrolled: true }]),
+            maximal(state, &order),
+        )).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// Resolve the requested revision at the point of use. Editing
+    /// a workspace or changing its managed path/key withdraws old authority;
+    /// an obsolete ID never redirects to a replacement revision.
+    /// This only queries node facts; it does not open the managed pile/key.
+    pub fn workspace(&self, revision: Id) -> Result<Option<Workspace>> {
+        let Some(value) = self.workspace_revision(revision)? else {
+            return Ok(None);
+        };
+        let Some(managed) = self.managed(value.managed_id)? else {
+            return Ok(None);
+        };
+        if managed.pile != value.pile || managed.key != value.key {
+            return Ok(None);
+        }
+        Ok(Some(value))
+    }
+
+    /// Current revision as saved, including a binding whose enrollment moved
+    /// or was withdrawn. For UI inspection/removal only; request dispatch
+    /// must use `workspace`, which also checks the enrolled binding.
+    pub fn workspace_revision(&self, revision: Id) -> Result<Option<Workspace>> {
+        let facts = self.facts()?;
+        let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+        let current = find!(state: Id, and!(
+            pattern!(&facts, [{ ?state @ metadata::tag: attrs::WORKSPACE,
+                attrs::enrolled: true }]),
+            state.is(revision.to_inline()), maximal(state, &order),
+        )).next().is_some();
+        if !current {
+            return Ok(None);
+        }
+        let mut routes = std::collections::BTreeMap::new();
+        for (role, root) in find!((role: Id, root: CollectionHandle),
+            pattern!(&facts, [
+                { revision @ attrs::workspace_route: _?route },
+                { _?route @ config::anchor: ?role, config::selects: ?root },
+            ])
+        ) {
+            if routes.insert(role, root).is_some_and(|old| old != root) {
+                bail!("workspace {revision:X} has conflicting exact roots for role {role:X}");
+            }
+        }
+        let mut candidates = Vec::new();
+        for (anchor, managed_id, label, pile, key, signer) in find!(
+            (anchor: Id, managed_id: Id,
+             label: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+             pile: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+             key: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+             signer: VerifyingKey),
+            pattern!(&facts, [{ revision @ config::anchor: ?anchor,
+                attrs::managed_pile: ?managed_id, metadata::name: ?label,
+                attrs::pile_path: ?pile, attrs::key_path: ?key,
+                attrs::expected_signer: ?signer }])
+        ) {
+            let heads: Vec<Id> = find!(state: Id, and!(
+                pattern!(&facts, [{ ?state @ metadata::tag: attrs::WORKSPACE,
+                    config::anchor: anchor }]), maximal(state, &order),
+            )).collect();
+            if heads.iter().any(|head| *head != revision)
+                || exists!(pattern!(&facts, [{ revision @ attrs::enrolled: false }]))
+            {
+                bail!("workspace {revision:X} has concurrent revisions; explicitly reconcile before use");
+            }
+            let value = Workspace {
+                id: revision, anchor, managed_id,
+                label: self.text(label)?, pile: self.text(pile)?.into(),
+                key: self.text(key)?.into(), signer: signer.to_bytes(),
+                routes: routes.clone(),
+            };
+            if !value.pile.is_absolute() || !value.key.is_absolute() {
+                bail!("workspace {revision:X} needs absolute pile and key paths");
+            }
+            if !candidates.contains(&value) {
+                candidates.push(value);
+            }
+        }
+        if candidates.len() != 1 {
+            bail!("workspace {revision:X} has no unambiguous understood binding");
+        }
+        Ok(candidates.pop())
+    }
 }
 
 pub struct NodeStore {
@@ -431,6 +530,101 @@ impl NodeStore {
             metadata::supersedes*: previous,
         };
         let id = fragment.root().expect("settings entity has a root");
+        self.pile.commit(self.config, &self.signer, fragment)?;
+        self.pile.flush()?;
+        Ok(id)
+    }
+
+    /// Save only after explicit UI action. The exact binding and routes are
+    /// facts in this revision; no managed-pile settings are changed here.
+    pub fn put_workspace(&mut self, expected: &ConfigView, value: &Workspace) -> Result<Id> {
+        if self.config_changed(expected)? {
+            bail!("node configuration changed since this edit was opened; reload before saving");
+        }
+        let managed = expected.managed(value.managed_id)?
+            .context("workspace pile is no longer enrolled")?;
+        if managed.pile != value.pile || managed.key != value.key {
+            bail!("workspace binding no longer matches the enrolled pile and key paths");
+        }
+        if value.label.trim().is_empty() {
+            bail!("workspace name is required");
+        }
+        let signer = VerifyingKey::from_bytes(&value.signer)?;
+        let pile = value.pile.to_str().context("workspace pile path is not UTF-8")?;
+        let key = value.key.to_str().context("workspace key path is not UTF-8")?;
+        let facts = expected.facts()?;
+        let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+        let previous: Vec<Id> = find!(state: Id, and!(
+            pattern!(&facts, [{ ?state @ metadata::tag: attrs::WORKSPACE,
+                config::anchor: value.anchor }]), maximal(state, &order),
+        )).collect();
+        let mut routes = Fragment::empty();
+        for (role, root) in &value.routes {
+            routes += entity! {
+                config::anchor: *role, config::selects: *root,
+            };
+        }
+        let fragment = entity! {
+            metadata::tag: attrs::WORKSPACE, config::anchor: value.anchor,
+            attrs::enrolled: true, metadata::name: value.label.clone(),
+            attrs::managed_pile: value.managed_id, attrs::pile_path: pile.to_owned(),
+            attrs::key_path: key.to_owned(), attrs::expected_signer: signer,
+            attrs::workspace_route*: routes, metadata::supersedes*: previous,
+        };
+        let id = fragment.root().expect("workspace revision has a root");
+        self.pile.commit(self.config, &self.signer, fragment)?;
+        self.pile.flush()?;
+        Ok(id)
+    }
+
+    pub fn remove_workspace(&mut self, expected: &ConfigView, anchor: Id) -> Result<Id> {
+        if self.config_changed(expected)? {
+            bail!("node configuration changed since this edit was opened; reload before saving");
+        }
+        let facts = expected.facts()?;
+        let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+        let previous: Vec<Id> = find!(state: Id, and!(
+            pattern!(&facts, [{ ?state @ metadata::tag: attrs::WORKSPACE,
+                config::anchor: anchor }]), maximal(state, &order),
+        )).collect();
+        if previous.is_empty() {
+            bail!("workspace {anchor:X} has no revision to remove");
+        }
+        let fragment = entity! {
+            metadata::tag: attrs::WORKSPACE, config::anchor: anchor,
+            attrs::enrolled: false, metadata::supersedes*: previous,
+        };
+        let id = fragment.root().expect("workspace withdrawal has a root");
+        self.pile.commit(self.config, &self.signer, fragment)?;
+        self.pile.flush()?;
+        Ok(id)
+    }
+
+    /// Withdraw one selected current revision even when its complete binding
+    /// cannot be interpreted. Other concurrent revisions remain separately
+    /// visible; no target pile, key, route or signer must be reconstructed.
+    pub fn remove_workspace_revision(&mut self, expected: &ConfigView, revision: Id) -> Result<Id> {
+        if self.config_changed(expected)? {
+            bail!("node configuration changed since this edit was opened; reload before saving");
+        }
+        let facts = expected.facts()?;
+        let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+        let current = find!(state: Id, and!(
+            pattern!(&facts, [{ ?state @ metadata::tag: attrs::WORKSPACE,
+                attrs::enrolled: true }]),
+            state.is(revision.to_inline()), maximal(state, &order),
+        )).next().is_some();
+        if !current {
+            bail!("workspace revision {revision:X} is no longer current");
+        }
+        let anchors: Vec<Id> = find!(anchor: Id,
+            pattern!(&facts, [{ revision @ config::anchor: ?anchor }])
+        ).collect();
+        let fragment = entity! {
+            metadata::tag: attrs::WORKSPACE, config::anchor*: anchors,
+            attrs::enrolled: false, metadata::supersedes: revision,
+        };
+        let id = fragment.root().expect("workspace withdrawal has a root");
         self.pile.commit(self.config, &self.signer, fragment)?;
         self.pile.flush()?;
         Ok(id)

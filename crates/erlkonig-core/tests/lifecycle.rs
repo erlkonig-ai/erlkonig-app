@@ -127,8 +127,20 @@ fn authenticated_native_mcp_quit_and_restart() {
     let native: Value = request("tools/call", json!({"name":"compass_list","arguments":{}}))
         .json()
         .unwrap();
-    assert!(native.get("error").is_none(), "{native}");
-    assert_ne!(native["result"]["isError"], true, "{native}");
+    assert_eq!(
+        native["error"]["code"], -32602,
+        "no implicit node workspace: {native}"
+    );
+    let listed: Value = request("tools/call", json!({"name":"list_workspaces","arguments":{}}))
+        .json()
+        .unwrap();
+    assert!(listed.get("error").is_none(), "{listed}");
+    assert_ne!(listed["result"]["isError"], true, "{listed}");
+    let workspaces: Value = serde_json::from_str(
+        listed["result"]["content"][0]["text"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(workspaces["workspaces"], json!([]));
     let before = Instant::now();
     app.begin_shutdown();
     while !app.is_finished() && before.elapsed() < Duration::from_secs(5) {

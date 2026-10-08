@@ -7,11 +7,12 @@ use erlkonig_core::{
     node_store::ManagedPile,
     paths::{self, Layout},
     runtime::Runtime,
+    workspace::{self, Discovery, Workspace},
 };
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSApplication, NSModalResponseOK, NSOpenPanel, NSPasteboard,
-    NSPasteboardTypeString, NSTextField, NSView, NSWorkspace,
+    NSPasteboardTypeString, NSPopUpButton, NSTextField, NSView, NSWorkspace,
 };
 use objc2_foundation::{NSBundle, NSPoint, NSRect, NSSize, NSString, NSURL};
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
@@ -43,6 +44,7 @@ struct Items {
     login: CheckMenuItem,
     piles: Submenu,
     add_pile: MenuItem,
+    workspaces: Submenu,
     quit: MenuItem,
 }
 
@@ -53,6 +55,15 @@ struct PileItems {
     maintenance: CheckMenuItem,
     edit: MenuItem,
     details: MenuItem,
+    remove: MenuItem,
+    workspace: MenuItem,
+}
+
+struct WorkspaceItems {
+    id: String,
+    edit: MenuItem,
+    details: MenuItem,
+    copy_id: MenuItem,
     remove: MenuItem,
 }
 
@@ -72,6 +83,7 @@ struct App {
     quitting: Option<Instant>,
     terminate: Arc<AtomicBool>,
     pile_items: Vec<PileItems>,
+    workspace_items: Vec<WorkspaceItems>,
     config_generation: u64,
     plugin_states: [Option<Result<install::Inventory, String>>; 2],
     clients: Option<install::ClientAvailability>,
@@ -201,6 +213,7 @@ impl App {
             if status.config_generation != self.config_generation {
                 self.config_generation = status.config_generation;
                 self.rebuild_piles(status);
+                self.rebuild_workspaces();
             }
             for items in &self.pile_items {
                 if let Some(pile) = status.managed.iter().find(|pile| pile.id == items.id) {
@@ -271,6 +284,7 @@ impl App {
         self.items.login.set_enabled(false);
         self.items.preview.set_enabled(false);
         self.items.piles.set_enabled(false);
+        self.items.workspaces.set_enabled(false);
         self.items.integrations.set_enabled(false);
         if let Some(runtime) = &self.runtime {
             runtime.begin_shutdown();
@@ -692,12 +706,14 @@ impl App {
                 edit: MenuItem::new("Edit configuration…", true, None),
                 details: MenuItem::new("Status and paths…", true, None),
                 remove: MenuItem::new("Remove from Erlkönig…", true, None),
+                workspace: MenuItem::new("Create query workspace…", true, None),
             };
             let _ = submenu.append_items(&[
                 &items.sync,
                 &items.maintenance,
                 &items.edit,
                 &items.details,
+                &items.workspace,
                 &PredefinedMenuItem::separator(),
                 &items.remove,
             ]);
@@ -736,7 +752,7 @@ impl App {
         NSApplication::sharedApplication(self.mtm).activateIgnoringOtherApps(true);
         let alert = NSAlert::new(self.mtm);
         alert.setMessageText(&NSString::from_str("Managed pile configuration"));
-        alert.setInformativeText(&NSString::from_str("Enter exact IDs and collection handles, separated by spaces or commas. Adding a pile leaves Sync and Local maintenance off. MCP continues to use the node pile only."));
+        alert.setInformativeText(&NSString::from_str("Enter exact IDs and collection handles, separated by spaces or commas. Adding a pile leaves Sync and Local maintenance off. Query workspaces are configured separately; each MCP data request must name an exact workspace ID."));
         alert.addButtonWithTitle(&NSString::from_str("Save"));
         alert.addButtonWithTitle(&NSString::from_str("Cancel"));
         let view = NSView::initWithFrame(
@@ -903,6 +919,14 @@ impl App {
                 .managed(id)
                 .map_err(|e| e.to_string())?
                 .ok_or("This entry was removed.")?;
+            if action == "workspace" {
+                let discovery = Discovery::open(&pile).map_err(|e| format!("{e:#}"))?;
+                let mut workspace = Workspace::new(&pile.label, &pile, discovery.signer());
+                if self.edit_workspace(&mut workspace, &discovery)? {
+                    runtime.put_workspace(&expected, &workspace).map_err(|e| format!("{e:#}"))?;
+                }
+                return Ok(());
+            }
             match action {
                 "sync" => pile.sync_enabled = !pile.sync_enabled,
                 "maintenance" => pile.maintenance_enabled = !pile.maintenance_enabled,
@@ -920,6 +944,225 @@ impl App {
         if let Err(error) = result {
             self.alert("Configuration not saved", &error, &["OK"]);
         }
+    }
+
+    fn rebuild_workspaces(&mut self) {
+        while self.items.workspaces.remove_at(0).is_some() {}
+        self.workspace_items.clear();
+        let _ = self.items.workspaces.append(&MenuItem::new(
+            "Each tool request chooses an exact workspace", false, None,
+        ));
+        let _ = self.items.workspaces.append(&PredefinedMenuItem::separator());
+        let result = (|| {
+            let runtime = self.runtime.as_ref().ok_or("Not running".to_owned())?;
+            let config = runtime.config().map_err(|e| format!("{e:#}"))?;
+            for id in config.workspace_ids().map_err(|e| format!("{e:#}"))? {
+                let exact_id = format!("{id:X}");
+                let short_id = &exact_id[..8];
+                let (label, editable) = match config.workspace_revision(id) {
+                    Ok(Some(workspace)) => {
+                        let available = matches!(config.workspace(id), Ok(Some(_)));
+                        (format!("{}{}", workspace.label, if available { "" } else { " · binding unavailable" }), true)
+                    }
+                    result => {
+                        let reason = match result {
+                            Err(error) => format!("{error:#}"),
+                            _ => "enrollment changed or removed".to_owned(),
+                        };
+                        (format!("Unavailable: {reason}"), false)
+                    }
+                };
+                let submenu = Submenu::new(format!("{label} · {short_id}"), true);
+                let items = WorkspaceItems {
+                    id: format!("{id:X}"),
+                    edit: MenuItem::new("Discover and edit roots…", editable, None),
+                    details: MenuItem::new("Exact binding and roots…", editable, None),
+                    copy_id: MenuItem::new("Copy exact workspace ID", true, None),
+                    remove: MenuItem::new("Remove workspace revision…", true, None),
+                };
+                let _ = submenu.append_items(&[&items.edit, &items.details, &items.copy_id, &items.remove]);
+                let _ = self.items.workspaces.append(&submenu);
+                self.workspace_items.push(items);
+            }
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = result {
+            let _ = self.items.workspaces.append(&MenuItem::new(format!("Unavailable: {error}"), false, None));
+        }
+        let _ = self.items.workspaces.append(&PredefinedMenuItem::separator());
+        let _ = self.items.workspaces.append(&MenuItem::new(
+            "Create from Managed Piles → a pile → Create query workspace…", false, None,
+        ));
+    }
+
+    /// One native popup; its values are display labels, its index selects the
+    /// exact object held by this dialog. Names never resolve root identity.
+    fn choose_index(&self, title: &str, detail: &str, choices: &[String], initial: usize, buttons: &[&str]) -> (usize, Option<usize>) {
+        let alert = NSAlert::new(self.mtm);
+        alert.setMessageText(&NSString::from_str(title));
+        alert.setInformativeText(&NSString::from_str(detail));
+        for button in buttons {
+            alert.addButtonWithTitle(&NSString::from_str(button));
+        }
+        let popup = NSPopUpButton::initWithFrame_pullsDown(
+            NSPopUpButton::alloc(self.mtm),
+            NSRect::new(NSPoint::ZERO, NSSize::new(780.0, 32.0)), false,
+        );
+        for choice in choices {
+            popup.addItemWithTitle(&NSString::from_str(choice));
+        }
+        if initial < choices.len() {
+            popup.selectItemAtIndex(initial as isize);
+        }
+        alert.setAccessoryView(Some(&popup));
+        let button = (alert.runModal() - NSAlertFirstButtonReturn).max(0) as usize;
+        let index = usize::try_from(popup.indexOfSelectedItem()).ok();
+        (button, index)
+    }
+
+    fn text_input(&self, title: &str, detail: &str, initial: &str) -> Option<String> {
+        let alert = NSAlert::new(self.mtm);
+        alert.setMessageText(&NSString::from_str(title));
+        alert.setInformativeText(&NSString::from_str(detail));
+        alert.addButtonWithTitle(&NSString::from_str("Use exact handle"));
+        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+        let field = NSTextField::textFieldWithString(&NSString::from_str(initial), self.mtm);
+        field.setFrame(NSRect::new(NSPoint::ZERO, NSSize::new(780.0, 26.0)));
+        alert.setAccessoryView(Some(&field));
+        (alert.runModal() == NSAlertFirstButtonReturn).then(|| field.stringValue().to_string())
+    }
+
+    fn edit_workspace(&self, workspace: &mut Workspace, discovery: &Discovery) -> Result<bool, String> {
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(self.mtm).activateIgnoringOtherApps(true);
+        let (roots, unavailable) = discovery.roots().map_err(|e| format!("{e:#}"))?;
+        let roles = workspace::roles();
+        loop {
+            let selected = roles.iter().filter_map(|(role, name)| {
+                workspace.routes.get(role).map(|root| {
+                    let access = discovery.probe(*root).map(|root| format!("READ {} / WRITE {}", root.read, root.write))
+                        .unwrap_or_else(|_| "unavailable locally".into());
+                    format!("{name} ({access})")
+                })
+            }).collect::<Vec<_>>().join(", ");
+            let detail = format!(
+                "Pile: {}\nSigning identity: {}\n\n{}\n\nOmitted roles stay unconfigured. Saving creates a new exact request ID; previous IDs stop working. Sync and maintenance are not changed.\n\nDiscovery lists local indexed collection records only ({} unavailable). Descriptor-only roots require an exact handle.",
+                workspace.pile.display(), hex::encode(workspace.signer),
+                if selected.is_empty() { "No roles selected." } else { &selected }, unavailable.len(),
+            );
+            let alert = NSAlert::new(self.mtm);
+            alert.setMessageText(&NSString::from_str("Query workspace"));
+            alert.setInformativeText(&NSString::from_str(&detail));
+            for title in ["Save workspace", "Choose a role…", "Cancel"] {
+                alert.addButtonWithTitle(&NSString::from_str(title));
+            }
+            let name = NSTextField::textFieldWithString(&NSString::from_str(&workspace.label), self.mtm);
+            name.setPlaceholderString(Some(&NSString::from_str("Workspace name")));
+            name.setFrame(NSRect::new(NSPoint::ZERO, NSSize::new(780.0, 26.0)));
+            alert.setAccessoryView(Some(&name));
+            let action = alert.runModal() - NSAlertFirstButtonReturn;
+            workspace.label = name.stringValue().to_string();
+            match action {
+                0 => {
+                    if workspace.label.trim().is_empty() {
+                        self.alert("Name required", "Give this workspace a name before saving.", &["OK"]);
+                        continue;
+                    }
+                    for (role, root) in &workspace.routes {
+                        discovery.select(*role, *root).map_err(|e| format!("{e:#}"))?;
+                    }
+                    return Ok(true);
+                }
+                1 => {}
+                _ => return Ok(false),
+            }
+            let role_names = roles.iter().map(|(role, name)| format!("{name} · {}", if workspace.routes.contains_key(role) { "selected" } else { "unconfigured" })).collect::<Vec<_>>();
+            let (button, index) = self.choose_index("Choose faculty role", "Choose which role to configure. Nothing is saved until Save workspace.", &role_names, 0, &["Choose root…", "Cancel"]);
+            let Some((role, role_name)) = index.filter(|_| button == 0).and_then(|i| roles.get(i)) else { continue; };
+            let mut candidates = roots.iter().filter(|root| root.name == *role_name).cloned().collect::<Vec<_>>();
+            if let Some(root) = workspace.routes.get(role) {
+                if !candidates.iter().any(|candidate| candidate.handle == *root) {
+                    if let Ok(candidate) = discovery.probe(*root) {
+                        candidates.push(candidate); // Previously selected exact descriptor-only root.
+                    }
+                }
+            }
+            let initial = workspace.routes.get(role).and_then(|root| candidates.iter().position(|candidate| candidate.handle == *root)).map_or(0, |index| index + 1);
+            let mut choices = vec!["Unconfigured — do not route this role".to_owned()];
+            choices.extend(candidates.iter().map(|root| root.description()));
+            let (button, index) = self.choose_index(&format!("Exact root for {role_name}"),
+                "Same-name roots are different identities. READ and WRITE show this workspace signer's local admission. Exact handle also permits locally present descriptor-only roots, which discovery cannot enumerate.",
+                &choices, initial, &["Select", "Enter exact handle…", "Cancel"]);
+            let handle = match button {
+                0 => match index {
+                    Some(0) => { workspace.routes.remove(role); continue; }
+                    Some(index) => candidates.get(index - 1).map(|root| Ok(root.handle)),
+                    None => None,
+                },
+                1 => self.text_input("Exact collection handle", "Paste the complete blake3: descriptor handle. It must be present locally and carry this role's name; no download or fallback will occur.", "")
+                    .map(|text| config::parse_handle(text.trim()).map_err(|e| e.to_string())),
+                _ => None,
+            };
+            let Some(handle) = handle else { continue; };
+            let selection = handle.and_then(|handle| discovery.select(*role, handle).map_err(|e| format!("{e:#}")));
+            match selection {
+                Ok(root) => { workspace.routes.insert(*role, root.handle); }
+                Err(error) => { self.alert("Root not selected", &error, &["OK"]); }
+            }
+        }
+    }
+
+    fn workspace_action(&self, selected: &str, action: &str) {
+        let Some(runtime) = &self.runtime else { return; };
+        let result = (|| {
+            let expected = runtime.config().map_err(|e| format!("{e:#}"))?;
+            let id = expected.workspace_ids().map_err(|e| format!("{e:#}"))?.into_iter()
+                .find(|id| format!("{id:X}") == selected).ok_or("This workspace revision is no longer available.")?;
+            // Copy/withdraw need only the selected native revision. A malformed
+            // binding must not make its own removal inaccessible.
+            if action == "copy" {
+                let pasteboard = NSPasteboard::generalPasteboard();
+                pasteboard.clearContents();
+                if !unsafe { pasteboard.setString_forType(&NSString::from_str(selected), NSPasteboardTypeString) } {
+                    return Err("The clipboard could not be updated.".into());
+                }
+                return Ok(());
+            }
+            if action == "remove" {
+                if self.alert("Remove query workspace revision?", &format!("Withdraw {id:X}? Its exact request ID will stop working. Other concurrent revisions remain separately visible. No data, enrollment, sync or maintenance configuration is deleted."), &["Remove", "Cancel"]) == 0 {
+                    runtime.remove_workspace_revision(&expected, id).map_err(|e| format!("{e:#}"))?;
+                }
+                return Ok(());
+            }
+            let mut workspace = expected.workspace_revision(id).map_err(|e| format!("{e:#}"))?
+                .ok_or("This workspace revision is no longer available.")?;
+            match action {
+                "details" => {
+                    let roles = workspace::roles();
+                    let routes = workspace.routes.iter().map(|(role, root)| format!("{}: blake3:{}", roles.iter().find(|(id, _)| id == role).map(|(_, name)| *name).unwrap_or("unknown role"), hex::encode(root.raw))).collect::<Vec<_>>().join("\n");
+                    self.alert("Exact workspace binding", &format!("{}\nWorkspace ID: {id:X}\nManaged pile ID: {:X}\nPile: {}\nKey file: {}\nPublic signer: {}\n\n{}\n\nThese are query routes, not sync or maintenance selections.", workspace.label, workspace.managed_id, workspace.pile.display(), workspace.key.display(), hex::encode(workspace.signer), routes), &["OK"]);
+                }
+                "edit" => {
+                    let managed = expected.managed(workspace.managed_id).map_err(|e| format!("{e:#}"))?.ok_or("Managed pile no longer enrolled.")?;
+                    if workspace.pile != managed.pile || workspace.key != managed.key {
+                        if self.alert("Managed binding changed", &format!("The enrolled pile now uses:\nPile: {}\nKey: {}\n\nCreate a new workspace revision for these paths? The previous request ID will not be reused.", managed.pile.display(), managed.key.display()), &["Use new binding", "Cancel"]) != 0 { return Ok(()); }
+                        workspace.pile = managed.pile.clone();
+                        workspace.key = managed.key.clone();
+                    }
+                    let discovery = Discovery::open(&managed).map_err(|e| format!("{e:#}"))?;
+                    if discovery.signer() != workspace.signer {
+                        if self.alert("Signing identity changed", &format!("The selected key file now names {} instead of {}. Create a new workspace revision for this identity? The old revision cannot use the replacement key.", hex::encode(discovery.signer()), hex::encode(workspace.signer)), &["Use new identity", "Cancel"]) != 0 { return Ok(()); }
+                        workspace.signer = discovery.signer();
+                    }
+                    if self.edit_workspace(&mut workspace, &discovery)? {
+                        runtime.put_workspace(&expected, &workspace).map_err(|e| format!("{e:#}"))?;
+                    }
+                }
+                _ => {}
+            }
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = result { self.alert("Workspace unavailable", &error, &["OK"]); }
     }
 
     fn on_menu(&mut self, event: MenuEvent, event_loop: &ActiveEventLoop) {
@@ -948,12 +1191,20 @@ impl App {
                 (p.edit.id(), "edit"),
                 (p.details.id(), "details"),
                 (p.remove.id(), "remove"),
+                (p.workspace.id(), "workspace"),
             ]
             .into_iter()
             .find(|(item, _)| id == *item)
             .map(|(_, action)| (p.id.clone(), action))
         }) {
             self.pile_action(&entry, action);
+        } else if let Some((entry, action)) = self.workspace_items.iter().find_map(|workspace| {
+            [(workspace.edit.id(), "edit"), (workspace.details.id(), "details"),
+                (workspace.copy_id.id(), "copy"), (workspace.remove.id(), "remove")]
+                .into_iter().find(|(item, _)| id == *item)
+                .map(|(_, action)| (workspace.id.clone(), action))
+        }) {
+            self.workspace_action(&entry, action);
         } else if id == self.items.copy_id.id() {
             if let Some(id) = self.runtime.as_ref().and_then(|r| r.status().node_id) {
                 let pb = NSPasteboard::generalPasteboard();
@@ -1081,6 +1332,7 @@ pub fn main() {
         login: CheckMenuItem::new("Open at login", true, false, None),
         piles: Submenu::new("Managed Piles", true),
         add_pile: MenuItem::new("Add existing pile…", true, None),
+        workspaces: Submenu::new("Query Workspaces", true),
         quit: MenuItem::new("Quit Erlkönig", true, None),
     };
     items
@@ -1092,6 +1344,7 @@ pub fn main() {
         &items.status,
         &items.preview,
         &items.piles,
+        &items.workspaces,
         &PredefinedMenuItem::separator(),
         &items.copy_id,
         &items.integrations,
@@ -1116,6 +1369,7 @@ pub fn main() {
         quitting: None,
         terminate,
         pile_items: Vec::new(),
+        workspace_items: Vec::new(),
         config_generation: u64::MAX,
         plugin_states: [None, None],
         clients: None,
