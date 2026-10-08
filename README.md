@@ -1,9 +1,11 @@
 # Erlkönig
 
-One macOS menu-bar application, one executable, one resident process. The
+One macOS menu-bar application, one executable, one resident backend. The
 main thread owns the menu; native Rust workers own replication, maintenance
 and the authenticated local Faculty MCP endpoint. No node executable,
-stdio launcher, LaunchAgent or KeepAlive restarter is bundled.
+LaunchAgent or KeepAlive restarter is bundled. A client may start the same
+executable in `mcp-stdio` mode: this connection-scoped transport only forwards
+to the running app, and never owns a pile or starts a backend.
 
 `erlkonig-core` owns configuration, credentials, lifecycle and client setup.
 `erlkonig` owns the macOS menu and crown. `faculties`, `trible` and
@@ -56,12 +58,44 @@ this final fallback has Force Quit semantics, including no promise to finish
 an in-flight write. Open at Login starts this same application, not a daemon.
 
 The local MCP endpoint defaults to `http://127.0.0.1:41773/`. All requests
-require a machine-local bearer token. Connect ChatGPT and Connect Claude Code
-write private HTTP client configuration only after an explicit menu action.
-The bundled plugin template contains no credential and no launcher. Claude
-chat's cloud connectors cannot reach loopback. Local Cowork plugin support is
-documented, but this app's authenticated HTTP integration is not yet verified
-in Cowork and is not claimed by the setup menu.
+require a machine-local bearer token. The stdio transport reads the existing
+private token only when connecting; no credential is put in a plugin or client
+profile. Quit disconnects the transports, which never relaunch the app.
+
+**OpenAI local plugin** and **Claude Code plugin** are explicit local install
+controls. Their checkmarks mean installed, not enabled or connected. Disabled
+and load-error states are labelled separately; unavailable status preserves
+the last-known check and disables mutation until a successful refresh.
+Inventory runs on startup, after changes, or on **Refresh plugin status**—not
+on the crown's display timer. CLI commands run off the main thread, with a
+30-second limit each, bounded output and cancellation/child cleanup on Quit.
+
+The OpenAI package targets supported ChatGPT Work/Codex local hosts; its status
+is read from the selected Codex CLI and does not certify ChatGPT UI refresh.
+Claude Code installation is user-scoped. Neither is an account-install claim.
+Removal verifies our exact marketplace source and plugin ID, leaves other
+plugins/settings untouched, and keeps the marketplace registered. Existing
+direct MCP settings named `erlkonig` are warned about, never removed by guess.
+
+After moving or updating the app, select an installed row and **Refresh
+package** to reinstall the current absolute executable path, then enable/reload
+the plugin in the client if needed. Refresh is a remove/install sequence; if a
+client step fails, the menu reports uncertainty, not a successful rollback.
+
+**Manage Cowork plugin** creates a ZIP of the same Claude package used by Code
+and opens the documented account Plugins page after confirmation. Upload and
+remove it there manually; there is no checked Cowork state or private account
+API. A synced Claude plugin is identified as account-managed and routes here.
+This is not a standalone Desktop Chat extension. Cowork's local plugin server
+runs through Claude Desktop, not in its shell VM; cloud Cowork can also access
+local connectors through the open Desktop app. Actual interactive Cowork
+loading remains a validation gate, not a claim made by an installed checkbox.
+See [Claude's cross-platform guide](https://support.claude.com/en/articles/15520349-use-claude-cowork-on-web-desktop-and-mobile)
+and [plugin lifecycle reference](https://code.claude.com/docs/en/plugins/cli-reference).
+
+Package staging allows only the intended manifest, shared skill and `.mcp.json`;
+unexpected files or symlinks are refused rather than executed or distributed.
+The ZIP contains exactly those three files and no top-level `bin/` directory.
 
 MCP remains exclusively attached to the node pile; managed-pile routing and
 automatic unions across data worlds are deliberately not implemented. A stored
@@ -87,9 +121,13 @@ containing only `Contents/MacOS/erlkonig`. It does not launch or install it.
 
 `scripts/accept.sh APP` checks that signed bundle's inventory. Native lifecycle
 tests use temporary piles and a test-harness fixture, not a production headless
-mode. `scripts/accept/host_clients.py TEST_BINARY SCRATCH_DIR` probes installed
-ChatGPT/Codex and Claude Code clients with scratch HOME and client directories.
-No validation step requires changing real client profiles or opening the GUI.
+mode. `node scripts/accept/plugin_lifecycle/probe.mjs --codex /path/to/codex
+--claude /path/to/claude` exercises plugin lifecycle and stdio in fresh scratch
+profiles. Add `--binary /path/to/erlkonig` to test the compiled native transport
+against its disposable authenticated HTTP owner. No model request or account
+credential is required. See the probe's own output for the precise evidence;
+mock transport results are not native binary acceptance. No validation step
+requires changing real client profiles or opening the GUI.
 
 The adjacent native dependency repositories must be the frozen source cohort
 recorded by the validation run. See `TESTING-for-JP.md` for the remaining

@@ -20,8 +20,10 @@ anyhow = "1"
 getrandom = "0.4"
 hex = "0.4"
 hifitime = "4.3"
-tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros"] }
-toml_edit = "0.25"
+tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros", "io-util"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 faculties = { path = "../faculties", default-features = false }
 triblespace = { path = "../triblespace-rs", default-features = false }
 triblespace-net = { path = "../triblespace-rs/triblespace-net" }

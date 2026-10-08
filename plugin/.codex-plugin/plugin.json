@@ -8,7 +8,7 @@
   "interface": {
     "displayName": "Erlkönig",
     "shortDescription": "Your goals, wiki and journal in the Erlkönig pile on this computer",
-    "longDescription": "Starts the faculties tools of the Erlkönig app on this computer. Everything is kept in one append-only pile that the app owns and, when you set it up, syncs with your other computers and your team.",
+    "longDescription": "Connects to the already-running Erlkönig app on this computer. Everything is kept in one append-only pile that the app owns and, when you set it up, syncs with your other computers and your team. Quitting the app disconnects its tools; the plugin never starts a backend.",
     "developerName": "Erlkönig",
     "category": "Productivity",
     "capabilities": ["Read", "Write"],

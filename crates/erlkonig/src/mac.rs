@@ -10,11 +10,10 @@ use erlkonig_core::{
 };
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSApplication,
-    NSModalResponseOK, NSOpenPanel, NSPasteboard, NSPasteboardTypeString, NSTextField, NSView,
-    NSWorkspace,
+    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSModalResponseOK, NSOpenPanel, NSPasteboard,
+    NSPasteboardTypeString, NSTextField, NSView, NSWorkspace,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSURL};
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
 use std::path::PathBuf;
 use std::sync::{
@@ -34,8 +33,10 @@ struct Items {
     status: MenuItem,
     preview: CheckMenuItem,
     copy_id: MenuItem,
-    chatgpt: MenuItem,
-    claude: MenuItem,
+    chatgpt: CheckMenuItem,
+    claude: CheckMenuItem,
+    cowork: MenuItem,
+    refresh_plugins: MenuItem,
     login: CheckMenuItem,
     piles: Submenu,
     add_pile: MenuItem,
@@ -69,6 +70,26 @@ struct App {
     terminate: Arc<AtomicBool>,
     pile_items: Vec<PileItems>,
     config_generation: u64,
+    plugin_states: [Option<Result<install::Inventory, String>>; 2],
+    plugin_task: Option<PluginTask>,
+}
+
+enum PluginResult {
+    Inventory([Result<install::Inventory, String>; 2]),
+    Changed(install::Host, Result<install::Inventory, String>),
+    Archive(Result<PathBuf, String>),
+}
+
+struct PluginTask {
+    cancel: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<PluginResult>,
+}
+
+fn host_index(host: install::Host) -> usize {
+    match host {
+        install::Host::OpenAi => 0,
+        install::Host::ClaudeCode => 1,
+    }
 }
 
 fn login() -> objc2::rc::Retained<SMAppService> {
@@ -110,7 +131,15 @@ impl App {
                 } else {
                     "Finishing admitted work… app exits after 15 seconds"
                 });
-            if self.runtime.as_ref().is_none_or(Runtime::is_finished) {
+            if self.runtime.as_ref().is_none_or(Runtime::is_finished)
+                && self
+                    .plugin_task
+                    .as_ref()
+                    .is_none_or(|task| task.thread.is_finished())
+            {
+                if let Some(task) = self.plugin_task.take() {
+                    let _ = task.thread.join();
+                }
                 if let Some(mut runtime) = self.runtime.take() {
                     if let Err(error) = runtime.finish() {
                         // Quit is final even when cleanup reports an error.
@@ -128,6 +157,7 @@ impl App {
         if Instant::now() < self.next_refresh {
             return;
         }
+        self.finish_plugin_task();
         let status = self.runtime.as_ref().map(Runtime::status);
         let text = self.problem.clone().unwrap_or_else(|| {
             status
@@ -162,11 +192,7 @@ impl App {
                 }
             }
         }
-        let usable = status
-            .as_ref()
-            .is_some_and(|s| s.running && s.mcp_url.is_some());
-        self.items.chatgpt.set_enabled(usable);
-        self.items.claude.set_enabled(usable);
+        self.update_plugin_items();
         self.items
             .copy_id
             .set_enabled(status.as_ref().is_some_and(|s| s.node_id.is_some()));
@@ -197,9 +223,14 @@ impl App {
     fn quit(&mut self) {
         self.quitting.get_or_insert_with(Instant::now);
         self.crown.take(); // Invalidate display callbacks before service teardown.
+        if let Some(task) = &self.plugin_task {
+            task.cancel.store(true, Ordering::Relaxed);
+        }
+        self.items.chatgpt.set_enabled(false);
+        self.items.claude.set_enabled(false);
         for item in [
-            &self.items.chatgpt,
-            &self.items.claude,
+            &self.items.cowork,
+            &self.items.refresh_plugins,
             &self.items.copy_id,
             &self.items.quit,
         ] {
@@ -218,9 +249,29 @@ impl App {
     /// before returning to AppKit, with the same final process-exit deadline.
     fn finish_termination(&mut self) {
         self.crown.take();
-        if let Some(mut runtime) = self.runtime.take() {
+        if let Some(task) = &self.plugin_task {
+            task.cancel.store(true, Ordering::Relaxed);
+        }
+        // AppKit may exit without going through quit(). Stop admission before
+        // waiting for any child cleanup, even if that cleanup cannot finish.
+        if let Some(runtime) = &self.runtime {
             runtime.begin_shutdown();
-            let since = self.quitting.unwrap_or_else(Instant::now);
+        }
+        let since = self.quitting.unwrap_or_else(Instant::now);
+        while self
+            .plugin_task
+            .as_ref()
+            .is_some_and(|task| !task.thread.is_finished())
+        {
+            if since.elapsed() >= Duration::from_secs(15) {
+                std::process::exit(1);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if let Some(task) = self.plugin_task.take() {
+            let _ = task.thread.join();
+        }
+        if let Some(mut runtime) = self.runtime.take() {
             while !runtime.is_finished() {
                 if since.elapsed() >= Duration::from_secs(15) {
                     eprintln!("Erlkönig: shutdown grace elapsed during application termination");
@@ -234,53 +285,235 @@ impl App {
         }
     }
 
-    fn connect_chatgpt(&self) {
-        let Some(url) = self.runtime.as_ref().and_then(|r| r.status().mcp_url) else {
+    fn start_plugin_task(
+        &mut self,
+        work: impl FnOnce(Arc<AtomicBool>) -> PluginResult + Send + 'static,
+    ) {
+        if self.plugin_task.is_some() || self.quitting.is_some() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        match std::thread::Builder::new()
+            .name("plugin-lifecycle".into())
+            .spawn(move || work(worker_cancel))
+        {
+            Ok(thread) => self.plugin_task = Some(PluginTask { cancel, thread }),
+            Err(error) => {
+                self.alert("Cannot start plugin operation", &error.to_string(), &["OK"]);
+            }
+        }
+        self.update_plugin_items();
+    }
+
+    fn check_plugins(&mut self) {
+        let layout = self.layout.clone();
+        self.start_plugin_task(move |cancel| {
+            PluginResult::Inventory([
+                install::inventory(install::Host::OpenAi, &layout, &cancel),
+                install::inventory(install::Host::ClaudeCode, &layout, &cancel),
+            ])
+        });
+    }
+
+    fn update_plugin_items(&self) {
+        for (host, item) in [
+            (install::Host::OpenAi, &self.items.chatgpt),
+            (install::Host::ClaudeCode, &self.items.claude),
+        ] {
+            let state = self.plugin_states[host_index(host)].as_ref();
+            let suffix = match state {
+                Some(Ok(state)) => {
+                    item.set_checked(state.installed);
+                    if state.installed && state.load_errors {
+                        " · load errors"
+                    } else if state.installed && !state.enabled {
+                        " · disabled"
+                    } else if state.installed {
+                        " · installed"
+                    } else if state.account_managed {
+                        " · account-managed"
+                    } else {
+                        " · not installed"
+                    }
+                }
+                Some(Err(_)) => " · status unavailable",
+                None => " · checking…",
+            };
+            // On an error retain the last-known check, disable the control and
+            // explicitly mark uncertainty instead of claiming uninstallation.
+            item.set_text(format!("{}{suffix}", host.label()));
+            item.set_enabled(self.plugin_task.is_none() && state.is_some_and(Result::is_ok));
+        }
+        self.items
+            .refresh_plugins
+            .set_text(if self.plugin_task.is_some() {
+                "Checking / updating plugins…"
+            } else {
+                "Refresh plugin status…"
+            });
+        self.items
+            .refresh_plugins
+            .set_enabled(self.plugin_task.is_none());
+        self.items.cowork.set_enabled(self.plugin_task.is_none());
+    }
+
+    fn finish_plugin_task(&mut self) {
+        if !self
+            .plugin_task
+            .as_ref()
+            .is_some_and(|task| task.thread.is_finished())
+        {
+            return;
+        }
+        let Some(task) = self.plugin_task.take() else {
             return;
         };
-        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-        if !PathBuf::from("/Applications/ChatGPT.app").exists()
-            && !home.join("Applications/ChatGPT.app").exists()
-        {
+        match task.thread.join() {
+            Ok(PluginResult::Inventory(states)) => {
+                self.plugin_states = states.map(Some);
+            }
+            Ok(PluginResult::Changed(host, result)) => {
+                let text = match &result {
+                    Ok(state) if state.installed => {
+                        "The local client reports the plugin installed. Its enabled state is shown in the menu. Restart/reload the client to use the current package; installation is not proof of an active MCP connection."
+                    }
+                    Ok(_) => {
+                        "The local client confirms the plugin was removed. Other plugins, marketplace registration and unrelated settings were left alone. A separate Claude account installation, if any, is unchanged."
+                    }
+                    Err(error) => error,
+                };
+                self.alert(host.label(), text, &["OK"]);
+                self.plugin_states[host_index(host)] = Some(result);
+            }
+            Ok(PluginResult::Archive(result)) => match result {
+                Ok(path) => {
+                    if self.alert(
+                        "Manage Cowork plugin",
+                        &format!("{}\n\nArchive: {}", install::COWORK_HELP, path.display()),
+                        &["Open account plugins", "Cancel"],
+                    ) == 0
+                    {
+                        let workspace = NSWorkspace::sharedWorkspace();
+                        if let Some(url) =
+                            NSURL::URLWithString(&NSString::from_str(install::COWORK_URL))
+                        {
+                            workspace.openURL(&url);
+                        }
+                        workspace.selectFile_inFileViewerRootedAtPath(
+                            Some(&NSString::from_str(&path.to_string_lossy())),
+                            &NSString::from_str(""),
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.alert("Cowork package unavailable", &error, &["OK"]);
+                }
+            },
+            Err(_) => {
+                self.plugin_states = [
+                    Some(Err("Plugin worker failed".into())),
+                    Some(Err("Plugin worker failed".into())),
+                ];
+            }
+        }
+        self.update_plugin_items();
+    }
+
+    fn plugin_action(&mut self, host: install::Host) {
+        // AppKit toggles a check item immediately; restore observed state until
+        // the client has actually confirmed the requested mutation.
+        self.update_plugin_items();
+        let Some(Ok(state)) = self.plugin_states[host_index(host)].clone() else {
+            return;
+        };
+        if state.account_managed && !state.installed {
+            self.manage_cowork();
+            return;
+        }
+        let scope = match host {
+            install::Host::OpenAi => {
+                "This is the local OpenAI package for supported ChatGPT Work/Codex clients on this Mac. Status is the installed Codex CLI's inventory, not proof of ChatGPT UI refresh."
+            }
+            install::Host::ClaudeCode => {
+                "This changes only this Mac's user-scope Claude Code plugin. It does not install or remove a Cowork account plugin."
+            }
+        };
+        let text = format!(
+            "{scope}\n\nKeep Erlkönig open while using its tools. After moving/updating the app, Refresh package reinstalls the current executable path; enable/reload it in the client if needed.\n\n{}",
+            install::legacy_config_notice(host)
+                .unwrap_or("No credentials are copied to the plugin or client settings.")
+        );
+        let wanted = if state.installed {
+            match self.alert(
+                host.label(),
+                &text,
+                &["Remove plugin", "Refresh package", "Cancel"],
+            ) {
+                0 => false,
+                1 => true,
+                _ => return,
+            }
+        } else {
+            if self.alert(host.label(), &text, &["Install plugin", "Cancel"]) != 0 {
+                return;
+            }
+            true
+        };
+        let url = self.runtime.as_ref().and_then(|r| r.status().mcp_url);
+        if wanted && url.is_none() {
             self.alert(
-                "Connect ChatGPT",
-                "ChatGPT was not found in Applications. Install and open it first.",
+                "Erlkönig is not running",
+                "Start the app's services before installing the plugin.",
                 &["OK"],
             );
             return;
         }
-        if self.alert("Connect ChatGPT", "Add Erlkönig's authenticated HTTP endpoint to this computer's Codex/ChatGPT config? Its credential stays in your private local config. Keep Erlkönig open while using its tools.", &["Connect", "Cancel"]) != 0 { return; }
-        match install::install_chatgpt(&self.layout, &home.join(".codex"), &url) {
-            Ok(_) => {
-                self.alert("ChatGPT configured", "Restart MCP servers in ChatGPT Settings. Missing or rejected credentials are shown by the client; Erlkönig never falls back to unauthenticated access.", &["OK"]);
-            }
+        let executable = match std::env::current_exe() {
+            Ok(path) => path,
             Err(error) => {
-                self.alert("Connection setup failed", &error, &["OK"]);
+                self.alert("Plugin operation unavailable", &error.to_string(), &["OK"]);
+                return;
             }
-        }
+        };
+        let layout = self.layout.clone();
+        self.start_plugin_task(move |cancel| {
+            PluginResult::Changed(
+                host,
+                install::set_installed(
+                    host,
+                    wanted,
+                    &layout,
+                    &executable,
+                    url.as_deref().unwrap_or(""),
+                    &cancel,
+                ),
+            )
+        });
     }
 
-    fn connect_claude(&self) {
-        if self.alert(
-            "Connect Claude",
-            install::CLAUDE_DESKTOP_LIMIT,
-            &["Configure Claude Code", "Cancel"],
-        ) != 0
-        {
-            return;
-        }
+    fn manage_cowork(&mut self) {
         let Some(url) = self.runtime.as_ref().and_then(|r| r.status().mcp_url) else {
+            if self.alert(
+                "Manage Cowork plugin",
+                install::COWORK_HELP,
+                &["Open account plugins", "Cancel"],
+            ) == 0
+            {
+                if let Some(url) = NSURL::URLWithString(&NSString::from_str(install::COWORK_URL)) {
+                    NSWorkspace::sharedWorkspace().openURL(&url);
+                }
+            }
             return;
         };
-        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-        match install::install_claude_code(&self.layout, &home.join(".claude.json"), &url) {
-            Ok(_) => {
-                self.alert("Claude Code configured", "Open a new Claude Code session, then inspect /mcp. This did not install a Claude chat or Cowork connector.", &["OK"]);
-            }
-            Err(error) => {
-                self.alert("Connection setup failed", &error, &["OK"]);
-            }
-        }
+        let executable = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+        let layout = self.layout.clone();
+        self.start_plugin_task(move |cancel| {
+            PluginResult::Archive(install::cowork_archive(&layout, &executable, &url, &cancel))
+        });
     }
 
     fn toggle_login(&self) {
@@ -613,9 +846,13 @@ impl App {
                 }
             }
         } else if id == self.items.chatgpt.id() {
-            self.connect_chatgpt();
+            self.plugin_action(install::Host::OpenAi);
         } else if id == self.items.claude.id() {
-            self.connect_claude();
+            self.plugin_action(install::Host::ClaudeCode);
+        } else if id == self.items.cowork.id() {
+            self.manage_cowork();
+        } else if id == self.items.refresh_plugins.id() {
+            self.check_plugins();
         } else if id == self.items.login.id() {
             self.toggle_login();
         } else if id == self.items.status.id() {
@@ -650,7 +887,9 @@ impl ApplicationHandler<MenuEvent> for App {
                 .build()
             {
                 Ok(tray) => {
-                    if let Some(button) = tray.ns_status_item().and_then(|item| item.button(self.mtm)) {
+                    if let Some(button) =
+                        tray.ns_status_item().and_then(|item| item.button(self.mtm))
+                    {
                         self.crown = Some(DisplayCrown::new(button, self.origin, self.mtm));
                     } else {
                         self.problem = Some("Cannot create crown display".into());
@@ -672,6 +911,7 @@ impl ApplicationHandler<MenuEvent> for App {
                     Err(error) => self.problem = Some(format!("{error:#}")),
                 }
             }
+            self.check_plugins();
         }
         self.refresh(event_loop);
     }
@@ -706,8 +946,10 @@ pub fn main() {
         status: MenuItem::new("Starting…", true, None),
         preview: CheckMenuItem::new("Preview sync animation", true, false, None),
         copy_id: MenuItem::new("Copy my ID", true, None),
-        chatgpt: MenuItem::new("Connect ChatGPT…", true, None),
-        claude: MenuItem::new("Connect Claude…", true, None),
+        chatgpt: CheckMenuItem::new("OpenAI local plugin · checking…", false, false, None),
+        claude: CheckMenuItem::new("Claude Code plugin · checking…", false, false, None),
+        cowork: MenuItem::new("Manage Cowork plugin…", false, None),
+        refresh_plugins: MenuItem::new("Refresh plugin status…", false, None),
         login: CheckMenuItem::new("Open at login", true, false, None),
         piles: Submenu::new("Managed Piles", true),
         add_pile: MenuItem::new("Add existing pile…", true, None),
@@ -722,6 +964,8 @@ pub fn main() {
         &items.copy_id,
         &items.chatgpt,
         &items.claude,
+        &items.cowork,
+        &items.refresh_plugins,
         &PredefinedMenuItem::separator(),
         &items.login,
         &items.quit,
@@ -744,6 +988,8 @@ pub fn main() {
         terminate,
         pile_items: Vec::new(),
         config_generation: u64::MAX,
+        plugin_states: [None, None],
+        plugin_task: None,
     };
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("Erlkönig: {error}");

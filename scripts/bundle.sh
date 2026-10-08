@@ -1,5 +1,5 @@
 #!/bin/sh
-# One app, one executable. The native libraries are linked into erlkonig.
+# One app executable. Client-scoped stdio uses a forwarding-only mode of it.
 # Usage: scripts/bundle.sh [--release-dir DIR] [--out DIR] [--sign IDENTITY]
 set -eu
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
@@ -37,7 +37,7 @@ cp -R "$repo/plugin" "$tmp/Contents/Resources/plugin"
     done
     printf 'cargo-lock-sha256 %s\n' "$(shasum -a 256 "$repo/Cargo.lock" | cut -d' ' -f1)"
     printf 'sha256-before-signing %s erlkonig\n' "$(shasum -a 256 "$tmp/Contents/MacOS/erlkonig" | cut -d' ' -f1)"
-    printf 'lifecycle one application process; no helper executables or LaunchAgents\n'
+    printf 'lifecycle one resident app owner; same-executable connection-scoped stdio; no second backend or LaunchAgent\n'
 } >"$tmp/Contents/Resources/provenance.txt"
 xattr -cr "$tmp"
 codesign --force --sign "$identity" --timestamp=none "$tmp"

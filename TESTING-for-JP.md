@@ -9,7 +9,8 @@ These are pending interactive checks, not an already-passed checklist:
 
 1. Launch the candidate. Expect one crown, no Dock window, and a clickable
    status line. A fresh app store reports sync off. No background-node approval
-   or helper process should appear.
+   or resident helper backend should appear. A client can separately start the
+   same executable's connection-scoped `mcp-stdio` forwarding mode.
 2. Copy my ID, quit, reopen and confirm the same identity. Quit must remove the
    crown and local MCP listener, not leave a resident sync service. Force Quit
    must remove app-owned native threads/listeners as well.
@@ -20,10 +21,17 @@ These are pending interactive checks, not an already-passed checklist:
    sync fixture, confirm real transfer activity and settling. Current receive
    counters update after reconcile, so continuous long-transfer motion is not
    yet established by this implementation.
-5. Client setup is a separate explicit action. Do not click Connect in a real
-   profile during validation. A scratch launch must isolate HOME as well as
-   CODEX_HOME/CLAUDE_CONFIG_DIR, since menu installers currently use HOME paths.
-   Headless scratch probes establish HTTP client support without this action.
+5. Client setup is a separate explicit action. Do not install/remove plugins in
+   a real profile during validation. A scratch launch must isolate HOME as well
+   as CODEX_HOME/CLAUDE_CONFIG_DIR. Check the two local plugin rows: installed,
+   installed-but-disabled, not installed and unavailable must remain distinct.
+   Cancel a dialog and confirm AppKit's temporary check toggle is restored.
+   During a CLI operation the menu/crown must remain responsive; Quit must
+   cancel/reap its own child. Remove must preserve unrelated plugins/settings.
+   Move the candidate and Refresh package; verify the cached command points to
+   the new absolute executable path. Test failure between remove and reinstall
+   without mistaking it for rollback. Existing direct MCP settings remain
+   untouched and are warned about rather than silently creating duplicate tools.
 6. In a scratch HOME/node pile, use Managed Piles to add two explicit existing
    scratch pile/key pairs. Both controls must initially be off. Edit exact
    collections, enable/disable Sync and Local maintenance independently, and
@@ -42,7 +50,17 @@ causes final process termination with ordinary Force Quit durability limits.
 Do not describe the library's five-second transport-close timeout as a bound
 on all admitted work.
 
-Claude Code supports the HTTP configuration. Claude chat's remote connectors
-cannot reach this machine's loopback address. Cowork has native local-plugin
-execution, but this specific authenticated HTTP connection remains unverified.
-There is no hidden stdio bridge or unauthenticated fallback.
+7. Manage Cowork plugin must reveal a three-file ZIP and the account Plugins
+   page, with no checkbox or installation-success claim. With a separately
+   authorized test account, upload that package and verify tools in Cowork;
+   account-synced Code copies must point removal back to the account UI. The
+   same Claude package serves Code and Cowork, not a separate Chat extension.
+8. With a native stdio client connected, quit/force-quit Erlkönig: the owner
+   listener and transport must disappear, no new pile should be opened, and no
+   restart should occur. A new client attempt while the app is absent must fail
+   visibly on stderr without printing a credential or bootstrapping a backend.
+
+Native menu compilation and GUI interactions require a reserved Mac build/run;
+Rust parser checks and Linux tests do not establish AppKit correctness. Local
+MCP runs on the host through Desktop; Cowork's shell VM is a separate execution
+environment. No remote Connector or public tunnel is configured by this app.

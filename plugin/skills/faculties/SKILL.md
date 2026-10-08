@@ -49,9 +49,11 @@ goal, not a wiki page.
 - **Tool errors are answers.** A tool that returns an error has said what is
   missing. Tell the user in one sentence and continue; do not retry the same
   call in a loop.
-- **Erlkönig is not installed.** If the tools fail to start with "Erlkonig is
-  not installed", the user needs the Erlkönig app on this computer, opened
-  once.
+- **Keep Erlkönig open.** The plugin forwards to the already-running app; it
+  never opens the pile or starts a background backend itself. If the connection
+  fails, ask the user to open Erlkönig on this computer. After the app is moved
+  or updated, use its plugin menu's Refresh package action (or upload the new
+  Cowork ZIP), then reload the client. Never start another service to repair it.
 - **Shared spaces are shared.** Content written to a team space reaches
   everyone in it. Do not copy local files or private notes into a shared
   space unless the user asked for exactly that.
