@@ -111,6 +111,27 @@ pub fn run(args: &[OsString]) -> Result<bool> {
                 let config = Collection::open(&observed, config_handle)?;
                 let view = ConfigView::from_snapshot(observed.clone(), config)?;
                 let facts = view.facts()?;
+                // Distinguish the default projection from explicit native
+                // preferences before an operator prepares a key handoff.
+                use crate::node_schema as attrs;
+                use faculties::schemas::config::config as config_attrs;
+                use triblespace::core::query::register::{ObservationOrder, maximal};
+                let has_settings = exists!(
+                    pattern!(&facts,[{_?state @ config_attrs::anchor:attrs::NODE_SETTINGS}])
+                );
+                let order =
+                    ObservationOrder::new(&facts, triblespace::core::metadata::supersedes.id());
+                let settings_heads=find!(state:Id,and!(
+                    pattern!(&facts,[{?state @ config_attrs::anchor:attrs::NODE_SETTINGS}]),
+                    maximal(state,&order),
+                )).map(|state|json!({
+                    "revision":format!("{state:X}"),
+                    "ports":find!(port:u16,pattern!(&facts,[{state @ attrs::mcp_port:?port}])).collect::<Vec<_>>(),
+                    "sync":find!(value:bool,pattern!(&facts,[{state @ attrs::sync_enabled:?value}])).collect::<Vec<_>>(),
+                    "maintenance":find!(value:bool,pattern!(&facts,[{state @ attrs::maintenance_enabled:?value}])).collect::<Vec<_>>(),
+                    "peers":find!(peer:VerifyingKey,pattern!(&facts,[{state @ triblespace_net::health_record::attrs::peer:?peer}]))
+                        .map(|peer|hex::encode(peer.to_bytes())).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>();
                 seeds.extend(find!(root: CollectionHandle, pattern!(&facts, [
                     { _?workspace @ triblespace::core::metadata::tag: crate::node_schema::WORKSPACE,
                         crate::node_schema::workspace_route: _?route },
@@ -125,6 +146,7 @@ pub fn run(args: &[OsString]) -> Result<bool> {
                     Err(error) => json!({"revision":format!("{id:X}"),"problem":format!("{error:#}")}),
                 }).collect::<Vec<_>>();
                 config_report = json!({"handle":hex::encode(config_handle.raw),"resident":true,
+                    "has_settings":has_settings,"settings_heads":settings_heads,
                     "settings":match view.settings() {Ok(value)=>json!({"port":value.mcp_port,
                         "sync":value.sync_enabled,"maintenance":value.maintenance_enabled,
                         "peers":value.peers.iter().map(hex::encode).collect::<Vec<_>>()}),
