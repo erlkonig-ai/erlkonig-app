@@ -31,6 +31,9 @@ fn main() {
 }
 
 fn transport_command(args: &[std::ffi::OsString]) -> Result<(), String> {
+    if erlkonig_core::node_cli::run(args).map_err(|error| format!("{error:#}"))? {
+        return Ok(());
+    }
     let usage = "usage: erlkonig mcp-stdio --data-dir ABSOLUTE_PATH --url http://127.0.0.1:PORT/";
     if args.len() != 5 || args[0] != "mcp-stdio" || args[1] != "--data-dir" || args[3] != "--url" {
         return Err(usage.into());

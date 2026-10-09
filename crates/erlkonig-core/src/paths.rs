@@ -30,25 +30,94 @@ pub fn default_data_dir() -> io::Result<PathBuf> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub dir: PathBuf,
+    node: crate::config::Bootstrap,
+    application: bool,
 }
 
 impl Layout {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Layout { dir: dir.into() }
+        let dir = dir.into();
+        let node = crate::config::Bootstrap::new(&dir);
+        Layout {
+            dir,
+            node,
+            application: false,
+        }
+    }
+    /// Conventional fresh-install location; resolution and legacy refusal
+    /// happen inside Runtime::start so the native UI can show the error.
+    pub fn application(dir: impl Into<PathBuf>) -> io::Result<Self> {
+        let home = env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| io::Error::other("HOME is not set"))?;
+        let mut layout = Self::new(dir);
+        layout.node = crate::config::Bootstrap::new(
+            &PathBuf::from(home).join(".local/share/triblespace/custody"),
+        );
+        layout.application = true;
+        Ok(layout)
+    }
+    /// Bind one explicit store and key. Never consult ambient Faculty variables.
+    pub fn with_node(mut self, pile: impl Into<PathBuf>, key: impl Into<PathBuf>) -> Self {
+        self.node = crate::config::Bootstrap {
+            pile: pile.into(),
+            key: key.into(),
+        };
+        self.application = false;
+        self
+    }
+    pub fn selected_node(&self) -> anyhow::Result<(crate::config::Bootstrap, Option<[u8; 32]>)> {
+        if self.application {
+            let locator = self.dir.join("node.json");
+            match fs::read(&locator) {
+                Ok(bytes) => {
+                    let locator: crate::config::NodeLocator = serde_json::from_slice(&bytes)?;
+                    let binding = locator.binding()?;
+                    return Ok((
+                        crate::config::Bootstrap {
+                            pile: binding.pile,
+                            key: binding.key,
+                        },
+                        Some(binding.signer),
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            if self.dir.join("self.pile").exists() || self.dir.join("self.key").exists() {
+                anyhow::bail!(
+                    "legacy application identity is present; explicitly migrate settings and bind-node before starting the single-store node"
+                );
+            }
+        }
+        Ok((self.node.clone(), None))
+    }
+    /// Unresolved construction default, for explicit isolated fixtures.
+    /// Application callers use selected_node; running callers use Runtime::binding.
+    pub fn bootstrap(&self) -> crate::config::Bootstrap {
+        self.node.clone()
     }
     pub fn lock(&self) -> PathBuf {
         self.dir.join("node.lock")
     }
+    /// Unresolved fixture default, never runtime diagnostics or routing.
     pub fn default_pile(&self) -> PathBuf {
-        self.dir.join("self.pile")
+        self.node.pile.clone()
     }
+    /// Unresolved fixture default, never runtime diagnostics or routing.
     pub fn default_key(&self) -> PathBuf {
-        self.dir.join("self.key")
+        self.node.key.clone()
     }
 }
 
 /// Files whose presence marks a folder as an Erlkonig data or log folder.
-const OUR_FILES: &[&str] = &["node.lock", "self.pile", "self.key", "mcp.token"];
+const OUR_FILES: &[&str] = &[
+    "node.lock",
+    "node.json",
+    "self.pile",
+    "self.key",
+    "mcp.token",
+];
 
 /// True when `dir` is empty or holds one of Erlkonig's own files.
 fn looks_like_ours(dir: &Path) -> io::Result<bool> {

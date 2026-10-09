@@ -16,6 +16,7 @@ anyhow.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 hifitime.workspace = true
+rayon.workspace = true
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true

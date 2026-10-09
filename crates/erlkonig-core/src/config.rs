@@ -1,13 +1,52 @@
-//! Fixed bootstrap only. App settings and managed-pile intent live in self.pile.
+//! Immutable process bootstrap. Workspaces never select a store or identity.
 
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 use triblespace::core::collection::CollectionHandle;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bootstrap {
     pub pile: PathBuf,
     pub key: PathBuf,
+}
+
+/// One immutable node binding captured when its owner starts. Public identity
+/// is pinned independently of the key path, including on every faculty call.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NodeBinding {
+    pub pile: PathBuf,
+    pub key: PathBuf,
+    pub signer: [u8; 32],
+}
+
+/// The only external node document: bootstrap location and expected public
+/// identity. Application settings and workspace facts remain in the pile.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeLocator {
+    pub pile: PathBuf,
+    pub key: PathBuf,
+    pub expected_signer: String,
+}
+
+impl NodeLocator {
+    pub fn binding(&self) -> Result<NodeBinding> {
+        if !self.pile.is_absolute() || !self.key.is_absolute() {
+            bail!("node locator requires explicit absolute pile and key paths");
+        }
+        if !is_node_id(&self.expected_signer) {
+            bail!("node locator expected_signer must be a full public key");
+        }
+        let signer: [u8; 32] = hex::decode(&self.expected_signer)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid public key"))?;
+        ed25519_dalek::VerifyingKey::from_bytes(&signer)?;
+        Ok(NodeBinding {
+            pile: self.pile.clone(),
+            key: self.key.clone(),
+            signer,
+        })
+    }
 }
 
 impl Bootstrap {

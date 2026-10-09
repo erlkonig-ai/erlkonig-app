@@ -7,9 +7,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct PileStatus {
-    pub id: String,
-    pub label: String,
+pub struct NodeStatus {
     pub pile: String,
     pub key: String,
     pub node_id: Option<String>,
@@ -36,7 +34,7 @@ pub struct Status {
     /// Actual payload bytes transferred. Connection/idle events never advance it.
     pub transfer_bytes: u64,
     pub maintenance_publications: u64,
-    pub managed: Vec<PileStatus>,
+    pub node: NodeStatus,
     pub config_generation: u64,
     pub config_problem: Option<String>,
     pub metrics_problem: Option<String>,
@@ -56,15 +54,13 @@ impl Status {
         if self.metrics_problem.is_some() {
             return "Running · metrics could not be saved".into();
         }
-        let active = self.managed.iter().filter(|p| p.sync_running).count();
-        let sync = if active == 0 {
-            "sync off".into()
+        let sync = if self.node.sync_running {
+            "syncing accessible collections"
         } else {
-            format!("{active} syncing piles")
+            "sync paused"
         };
-        let problems = self.managed.iter().filter(|p| p.problem.is_some()).count();
-        if problems > 0 {
-            format!("Running · {sync} · {problems} pile problems")
+        if let Some(problem) = &self.node.problem {
+            format!("Running · {sync} · {problem}")
         } else {
             format!("Running · {sync} · authenticated MCP")
         }

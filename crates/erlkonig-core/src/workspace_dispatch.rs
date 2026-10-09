@@ -18,16 +18,18 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json, value::RawValue};
 use triblespace::core::id::Id;
 
+use crate::config::NodeBinding;
 use crate::node_store::ConfigView;
 use crate::workspace::Workspace;
 
 const LIST: Tool = Tool {
     name: "list_workspaces",
-    description: "List explicitly configured Erlkonig workspaces, exact revision IDs, public signers and collection roles, alongside unavailable revisions. This reads app configuration only; it does not open target piles or keys. Pass one returned workspace ID on every faculty tool call. Names are labels, never selectors; each call resolves and freezes the current binding value.",
+    description: "List explicitly configured Erlkonig workspaces, exact revision IDs, collection roles, alongside unavailable revisions. This reads app configuration only; it does not open the store or key. Pass one returned workspace ID on every faculty tool call. Names are labels, never selectors; each call resolves and freezes the current binding value.",
     input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
 };
 
 pub struct WorkspaceDispatch {
+    node: NodeBinding,
     config: Box<dyn Fn() -> Result<ConfigView>>,
     tools: Vec<Tool>,
     schemas: BTreeMap<&'static str, String>,
@@ -41,7 +43,10 @@ struct Owner {
 }
 
 impl WorkspaceDispatch {
-    pub fn new(config: impl Fn() -> Result<ConfigView> + 'static) -> Result<Self> {
+    pub fn new(
+        node: NodeBinding,
+        config: impl Fn() -> Result<ConfigView> + 'static,
+    ) -> Result<Self> {
         // Catalog construction is I/O-free. The schema-only catalog has no
         // usable path and is never dispatched; there is no node-pile fallback.
         let path = PathBuf::new();
@@ -57,6 +62,7 @@ impl WorkspaceDispatch {
             }
         }
         Ok(Self {
+            node,
             config: Box::new(config),
             tools,
             schemas,
@@ -91,16 +97,16 @@ impl WorkspaceDispatch {
         Ok(())
     }
 
-    fn open(workspace: Workspace) -> Result<Owner> {
-        let signer = VerifyingKey::from_bytes(&workspace.signer)
+    fn open(&self, workspace: Workspace) -> Result<Owner> {
+        let signer = VerifyingKey::from_bytes(&self.node.signer)
             .context("workspace has an invalid configured signing identity")?;
         // Workspace selection alone does not authorize an acquisition network
         // owner. Missing payloads are reported; managed sync is independent.
-        let storage = Storage::shared_local(workspace.pile.clone(), Some(workspace.key.clone()))
+        let storage = Storage::shared_local(self.node.pile.clone(), Some(self.node.key.clone()))
             .with_collections(workspace.routes.clone())
             .with_expected_signer(signer);
-        let mut config = catalog::Config::new(&workspace.pile);
-        config.key = Some(workspace.key.clone());
+        let mut config = catalog::Config::new(&self.node.pile);
+        config.key = Some(self.node.key.clone());
         Ok(Owner {
             binding: workspace,
             catalog: catalog::Catalog::with_storage(config, storage),
@@ -182,7 +188,7 @@ impl Faculty for WorkspaceDispatch {
                         workspaces.push(json!({
                             "workspace": format!("{:X}", workspace.id),
                             "label": workspace.label,
-                            "signer": hex::encode(workspace.signer),
+
                             "roles": roles,
                         }));
                     }
@@ -190,13 +196,13 @@ impl Faculty for WorkspaceDispatch {
                         "workspace": format!("{id:X}"),
                         "reason": match other {
                             Err(error) => format!("{error:#}"),
-                            _ => "managed enrollment changed or was removed".to_owned(),
+                            _ => "workspace was removed or superseded".to_owned(),
                         },
                     })),
                 }
             }
             return out.text(serde_json::to_string(&json!({
-                "workspaces": workspaces, "unavailable": unavailable,
+                "node_signer": hex::encode(self.node.signer), "workspaces": workspaces, "unavailable": unavailable,
             }))?);
         }
         if !self.schemas.contains_key(name) {
@@ -224,14 +230,14 @@ impl Faculty for WorkspaceDispatch {
         // Even a tool without a storage entrypoint must not run under a
         // silently replaced binding. Storage repeats this at its own opening
         // boundary, so a replacement between these checks cannot retarget it.
-        let signer = triblespace::core::signing_key_file::load_existing(&workspace.key)
+        let signer = triblespace::core::signing_key_file::load_existing(&self.node.key)
             .context("load explicitly selected workspace signing identity")?;
-        if signer.verifying_key().to_bytes() != workspace.signer {
+        if signer.verifying_key().to_bytes() != self.node.signer {
             bail!("workspace signing identity changed; configure and select a new binding");
         }
         let mut owners = self.owners.borrow_mut();
         if let std::collections::btree_map::Entry::Vacant(entry) = owners.entry(workspace.id) {
-            entry.insert(Self::open(workspace.clone())?);
+            entry.insert(self.open(workspace.clone())?);
         }
         let owner = &owners[&workspace.id];
         let faculty = owner

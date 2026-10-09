@@ -30,6 +30,11 @@ pub fn ensure_pile(pile: &Path, create: bool) -> Result<(), String> {
 }
 
 pub fn prepare(config: &Bootstrap) -> Result<ed25519_dalek::SigningKey, String> {
+    if fs::metadata(&config.pile).is_ok_and(|meta| meta.len() > 0) && !config.key.exists() {
+        return Err(
+            "existing pile has no signing key; refusing to generate a replacement identity".into(),
+        );
+    }
     ensure_pile(&config.pile, true)?;
     if fs::symlink_metadata(&config.key).is_err() {
         signing_key_file::init(&config.key)
@@ -60,5 +65,18 @@ mod tests {
         std::os::unix::fs::symlink(&target, &path).unwrap();
         assert!(ensure_pile(&path, true).is_err());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn existing_data_never_gets_a_replacement_key() {
+        let d = tempfile::tempdir().unwrap();
+        let bootstrap = Bootstrap::new(d.path());
+        fs::write(&bootstrap.pile, b"retained existing data").unwrap();
+        assert!(prepare(&bootstrap).is_err());
+        assert!(!bootstrap.key.exists());
+        assert_eq!(
+            fs::read(&bootstrap.pile).unwrap(),
+            b"retained existing data"
+        );
     }
 }

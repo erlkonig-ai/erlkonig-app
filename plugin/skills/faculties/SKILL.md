@@ -5,19 +5,21 @@ description: Use the Erlkonig faculties tools to keep durable memory across conv
 
 # Faculties
 
-The `faculties` tools come from the Erlkonig app on this computer. Data lives
-in append-only piles selected through explicitly configured query workspaces.
-Each workspace binds an enrolled pile, its signing identity and exact roots
-for configured faculty roles. Writes use that selected signer, not necessarily
-the app's node key. Faculty tool names include `compass_add` and `wiki_search`.
+The `faculties` tools come from the Erlkonig app on this computer. One node
+identity and one append-only local store serve every workspace. A workspace
+is a named bundle of collections for the tools, not another pile or key.
+Collection capabilities determine access. Faculty tool names include
+`compass_add` and `wiki_search`.
 
 ## Choose the data workspace
 
 Call `list_workspaces` first. It reads app configuration only and returns
-available workspaces with human labels, exact revision IDs, public signers and
-configured role/root handles, plus unavailable entries with reasons. Choose
+available workspaces with human labels, opaque revision IDs and configured
+collection routes, plus unavailable entries with reasons. Choose
 the workspace appropriate to the user's request; ask when the destination is
-ambiguous. Do not guess from a label alone.
+ambiguous. Do not guess from a label alone. Use the returned identifiers
+yourself; do not ask the person to transcribe hexadecimal IDs. The native
+Workspaces menu is for creating or editing named bundles.
 
 Pass its exact returned ID as `workspace` on **every faculty tool call**.
 There is no default, node-pile fallback or connection-global selection.
@@ -30,12 +32,18 @@ can change the value resolved under an existing ID on later calls.
 Omitted roles are unavailable, including auxiliary roles a tool needs. Report
 the missing configuration; do not synthesize a private root or switch
 workspaces silently. Workspace reads are local-only and may report missing
-payloads. Selection never activates sync, maintenance, notifications or network
-acquisition; separately configured managed sync is independent.
+payloads. Workspace selection does not change the node's sync or maintenance
+settings or start a second service. Node synchronization includes permitted
+collections independently of the current request's workspace.
+
+If access is missing, explain that the collection owner must invite or grant
+the existing node identity the required read/write capability. The native
+editor does not yet send access requests or import invitations. Do not invent
+that flow, ask for a secret key, or create another identity as a workaround.
 
 Reading workspace A and writing workspace B require separate explicit calls
 and the user's authority for that destination. Selection does not automatically
-copy or union data, and there is no cross-pile transaction. Workspace routing
+copy or union data, and there is no cross-workspace transaction. Workspace routing
 is not an execution sandbox for tools that accept host paths or commands.
 
 ## Where things go

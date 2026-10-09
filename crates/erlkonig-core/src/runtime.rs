@@ -1,21 +1,21 @@
-//! One app-owned lifetime, with independently cancellable managed-pile sessions.
+//! One node identity, one logical store and one app-owned network endpoint.
 
 use crate::{
-    config::Bootstrap,
+    config::NodeBinding,
     credentials, init,
     node_metrics::Sample,
-    node_store::{ConfigView, ManagedPile, NodeStore},
+    node_store::{ConfigView, NodeSettings, NodeStore},
     paths::{Layout, ensure_private_dir},
-    status::{PileStatus, Status},
-    workspace::Workspace,
+    status::{NodeStatus, Status},
+    workspace::{AllAccessible, Workspace},
     workspace_dispatch::WorkspaceDispatch,
 };
 use anyhow::{Context, Result, bail};
 use faculties::mcp::http;
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
@@ -24,7 +24,7 @@ use tokio::sync::watch;
 use trible::maintenance::{Driver, Event, SuccinctBackend, Target};
 use triblespace::core::{
     id::{Id, genid},
-    repo::StorageClose,
+    repo::{SnapshotSource, StorageClose, StoreChanges, StoreSnapshot},
     signing_key_file,
 };
 use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
@@ -33,6 +33,7 @@ use triblespace_net::reconcile::ReplicationMode;
 type SharedNode = Arc<Mutex<Option<NodeStore>>>;
 
 pub struct Runtime {
+    binding: NodeBinding,
     status: Arc<Mutex<Status>>,
     node: SharedNode,
     stop: watch::Sender<bool>,
@@ -42,14 +43,6 @@ pub struct Runtime {
 
 fn update(status: &Arc<Mutex<Status>>, f: impl FnOnce(&mut Status)) {
     f(&mut status.lock().unwrap_or_else(|e| e.into_inner()));
-}
-
-fn update_pile(status: &Arc<Mutex<Status>>, id: Id, f: impl FnOnce(&mut PileStatus)) {
-    update(status, |s| {
-        if let Some(p) = s.managed.iter_mut().find(|p| p.id == id.to_string()) {
-            f(p);
-        }
-    });
 }
 
 async fn stopping(mut stop: watch::Receiver<bool>) {
@@ -69,9 +62,24 @@ impl Runtime {
         let lock = lease(&layout.lock()).context(
             "another Erlkönig owner is using this data directory; stop it before starting this app",
         )?;
-        let bootstrap = Bootstrap::new(&layout.dir);
-        let signer = init::prepare(&bootstrap).map_err(anyhow::Error::msg)?;
-        let mut node = NodeStore::open(&bootstrap.pile, signer.clone())?;
+        let (bootstrap, expected_signer) = layout.selected_node()?;
+        let signer = if let Some(expected) = expected_signer {
+            init::ensure_pile(&bootstrap.pile, false).map_err(anyhow::Error::msg)?;
+            let signer = signing_key_file::load_existing(&bootstrap.key)?;
+            if signer.verifying_key().to_bytes() != expected {
+                bail!("node locator signing identity mismatch");
+            }
+            signer
+        } else {
+            ensure_private_dir(bootstrap.pile.parent().context("node pile parent")?)?;
+            init::prepare(&bootstrap).map_err(anyhow::Error::msg)?
+        };
+        let binding = NodeBinding {
+            pile: bootstrap.pile,
+            key: bootstrap.key,
+            signer: signer.verifying_key().to_bytes(),
+        };
+        let mut node = NodeStore::open(&binding.pile, signer.clone())?;
         let port = node.config()?.settings()?.mcp_port;
         let token = credentials::load_or_create(&layout.dir.join("mcp.token"))
             .map_err(anyhow::Error::msg)?;
@@ -86,11 +94,18 @@ impl Runtime {
             running: true,
             node_id: Some(hex::encode(signer.verifying_key().as_bytes())),
             mcp_url: Some(format!("http://{}/", endpoint.local_addr()?)),
+            node: NodeStatus {
+                pile: binding.pile.display().to_string(),
+                key: binding.key.display().to_string(),
+                node_id: Some(hex::encode(binding.signer)),
+                ..NodeStatus::default()
+            },
             ..Status::default()
         }));
         let node = Arc::new(Mutex::new(Some(node)));
         let (stop, _) = watch::channel(false);
         let mut app = Self {
+            binding,
             status,
             node,
             stop,
@@ -100,13 +115,15 @@ impl Runtime {
         let http_stop = app.stop.subscribe();
         let state = app.status.clone();
         let node = app.node.clone();
+        let binding = app.binding.clone();
         app.workers.push(
             thread::Builder::new()
                 .name("erlkonig-faculties".into())
                 .spawn(move || {
                     let result = (|| {
-                        let dispatch =
-                            WorkspaceDispatch::new(move || with_node(&node, NodeStore::config))?;
+                        let dispatch = WorkspaceDispatch::new(binding, move || {
+                            with_node(&node, NodeStore::config)
+                        })?;
                         dispatch.finish(endpoint.serve_until(&[&dispatch], stopping(http_stop)))
                     })();
                     if let Err(error) = &result {
@@ -120,12 +137,24 @@ impl Runtime {
         let state = app.status.clone();
         let node = app.node.clone();
         let control_stop = app.stop.subscribe();
-        let layout = layout.clone();
+        let binding = app.binding.clone();
+        let identity_lock = std::env::temp_dir().join(format!(
+            "erlkonig-endpoint-{}.lock",
+            hex::encode(binding.signer)
+        ));
         app.workers.push(
             thread::Builder::new()
                 .name("erlkonig-controller".into())
                 .spawn(move || {
-                    let result = controller(layout, node, control_stop, state.clone(), port);
+                    let result = controller(
+                        binding,
+                        signer,
+                        identity_lock,
+                        node,
+                        control_stop,
+                        state.clone(),
+                        port,
+                    );
                     if let Err(error) = &result {
                         update(&state, |s| {
                             s.config_problem = Some(format!("controller: {error:#}"))
@@ -141,22 +170,24 @@ impl Runtime {
         with_node(&self.node, NodeStore::config)
     }
 
-    pub fn put_managed(&self, expected: &ConfigView, pile: &ManagedPile) -> Result<()> {
+    pub fn binding(&self) -> &NodeBinding {
+        &self.binding
+    }
+
+    pub fn put_settings(&self, expected: &ConfigView, value: &NodeSettings) -> Result<()> {
         if *self.stop.borrow() {
             bail!("application is shutting down");
         }
         with_node(&self.node, |node| {
-            node.put_managed(expected, pile).map(|_| ())
+            node.put_settings(expected, value).map(|_| ())
         })
     }
 
-    pub fn remove_managed(&self, expected: &ConfigView, id: Id) -> Result<()> {
+    pub fn create_workspace(&self, expected: &ConfigView, label: &str) -> Result<Id> {
         if *self.stop.borrow() {
             bail!("application is shutting down");
         }
-        with_node(&self.node, |node| {
-            node.remove_managed(expected, id).map(|_| ())
-        })
+        with_node(&self.node, |node| node.create_workspace(expected, label))
     }
 
     pub fn put_workspace(&self, expected: &ConfigView, workspace: &Workspace) -> Result<Id> {
@@ -177,7 +208,9 @@ impl Runtime {
         if *self.stop.borrow() {
             bail!("application is shutting down");
         }
-        with_node(&self.node, |node| node.remove_workspace_revision(expected, revision))
+        with_node(&self.node, |node| {
+            node.remove_workspace_revision(expected, revision)
+        })
     }
 
     pub fn status(&self) -> Status {
@@ -243,313 +276,186 @@ fn lease(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn file_identity(path: &Path) -> Result<(u64, u64)> {
-    let metadata = fs::metadata(path).with_context(|| format!("cannot open {}", path.display()))?;
-    if !metadata.is_file() {
-        bail!("{} is not a regular file", path.display());
-    }
-    Ok((metadata.dev(), metadata.ino()))
-}
-
 struct Task {
-    config: ManagedPile,
+    settings: NodeSettings,
     stop: watch::Sender<bool>,
     worker: JoinHandle<Result<()>>,
 }
 
 fn join_task(task: Task, status: &Arc<Mutex<Status>>) {
     task.stop.send_replace(true);
-    let id = task.config.id;
     let error = match task.worker.join() {
         Ok(Ok(())) => None,
         Ok(Err(error)) => Some(format!("{error:#}")),
-        Err(_) => Some("pile worker panicked".into()),
+        Err(_) => Some("node worker panicked".into()),
     };
-    update_pile(status, id, |p| {
-        p.sync_running = false;
-        p.maintenance_running = false;
-        p.bound_sockets.clear();
+    update(status, |s| {
+        s.node.sync_running = false;
+        s.node.maintenance_running = false;
+        s.node.bound_sockets.clear();
         if error.is_some() {
-            p.problem = error;
+            s.node.problem = error;
         }
     });
 }
 
 fn controller(
-    layout: Layout,
+    binding: NodeBinding,
+    signer: ed25519_dalek::SigningKey,
+    identity_lock: std::path::PathBuf,
     node: SharedNode,
     stop: watch::Receiver<bool>,
     status: Arc<Mutex<Status>>,
     initial_port: u16,
 ) -> Result<()> {
-    let ownership_dir = layout.dir.join("owners");
-    ensure_private_dir(&ownership_dir)?;
-    let root_identity = file_identity(&layout.default_pile())?;
     let (reports, receiver) = mpsc::channel();
-    let mut tasks: Vec<Task> = Vec::new();
-    let mut pending: HashMap<(Option<Id>, Id, String), Sample> = HashMap::new();
+    let mut task: Option<Task> = None;
+    let mut pending: HashMap<(Id, String), Sample> = HashMap::new();
     let mut failures = Vec::new();
-    let mut last_metrics = Instant::now() - Duration::from_secs(10);
+    let mut last_metrics = Instant::now();
+    let mut last_guard = Instant::now() - Duration::from_secs(1);
     while !*stop.borrow() {
+        if last_guard.elapsed() >= Duration::from_secs(1) {
+            if let Err(error) = crate::resource_guard::sample() {
+                if let Some(task) = &task {
+                    task.stop.send_replace(true);
+                }
+                update(&status, |s| s.node.problem = Some(format!("{error:#}")));
+            }
+            last_guard = Instant::now();
+        }
         match with_node(&node, |node| {
-            node.poll_config()?
-                .map(|view| {
-                    let ids = view.managed_ids()?;
-                    let settings = view.settings()?;
-                    Ok((view, ids, settings))
-                })
-                .transpose()
+            node.poll_config()?.map(|view| view.settings()).transpose()
         }) {
-            Ok(Some((view, ids, settings))) => {
-                let mut desired = Vec::new();
-                let mut entries = Vec::new();
-                for id in ids {
-                    match view.managed(id) {
-                        Ok(Some(config)) => {
-                            entries.push(PileStatus {
-                                id: id.to_string(),
-                                label: config.label.clone(),
-                                pile: config.pile.display().to_string(),
-                                key: config.key.display().to_string(),
-                                sync_enabled: config.sync_enabled,
-                                maintenance_enabled: config.maintenance_enabled,
-                                ..PileStatus::default()
-                            });
-                            desired.push(config);
-                        }
-                        Ok(None) => {}
-                        Err(error) => entries.push(PileStatus {
-                            id: id.to_string(),
-                            label: id.to_string(),
-                            problem: Some(format!("Configuration: {error:#}")),
-                            ..PileStatus::default()
-                        }),
+            Ok(Some(settings)) => {
+                // Workspaces select views: changing their facts must not reopen
+                // the node endpoint or alter what it is allowed to synchronize.
+                let unchanged = task.as_ref().is_some_and(|task| {
+                    task.settings.sync_enabled == settings.sync_enabled
+                        && task.settings.maintenance_enabled == settings.maintenance_enabled
+                        && task.settings.peers == settings.peers
+                });
+                if !unchanged {
+                    if let Some(old) = task.take() {
+                        join_task(old, &status);
                     }
                 }
-                // This is a disposable activation plan, not a second configuration store.
-                let mut identities = HashMap::new();
-                let mut signers = HashMap::new();
-                let mut invalid = HashMap::new();
-                for config in &desired {
-                    if !config.sync_enabled && !config.maintenance_enabled {
-                        continue;
-                    }
-                    let result = (|| {
-                        let identity = file_identity(&config.pile)?;
-                        if identity == root_identity {
-                            bail!(
-                                "the node pile is already owned by the app; it cannot be added as a managed pile"
-                            );
-                        }
-                        if let Some(other) = identities.insert(identity, config.id) {
-                            invalid.insert(other, "the same pile file is configured more than once (including aliases)".to_owned());
-                            bail!(
-                                "the same pile file is configured more than once (including aliases)"
-                            );
-                        }
-                        let signer = signing_key_file::load_existing(&config.key)
-                            .context("cannot load the selected signing identity")?;
-                        if config.sync_enabled {
-                            if config.sync_collections.is_empty() {
-                                bail!("Sync is enabled but no exact collections are selected");
-                            }
-                            if let Some(other) =
-                                signers.insert(signer.verifying_key().to_bytes(), config.id)
-                            {
-                                invalid.insert(other, "another syncing pile uses this signing identity; choose a distinct key".to_owned());
-                                bail!(
-                                    "another syncing pile uses this signing identity; choose a distinct key"
-                                );
-                            }
-                        }
-                        if config.maintenance_enabled && config.maintain_targets.is_empty() {
-                            bail!("Maintenance is enabled but no exact targets are selected");
-                        }
-                        Ok::<_, anyhow::Error>(())
-                    })();
-                    if let Err(error) = result {
-                        invalid.insert(config.id, format!("{error:#}"));
-                    }
-                }
-                let keep: HashSet<Id> = tasks
-                    .iter()
-                    .filter(|task| {
-                        !task.worker.is_finished()
-                            && desired.iter().any(|config| config == &task.config)
-                            && !invalid.contains_key(&task.config.id)
-                    })
-                    .map(|task| task.config.id)
-                    .collect();
-                let mut retained = Vec::new();
-                for task in tasks.drain(..) {
-                    if keep.contains(&task.config.id) {
-                        retained.push(task);
-                    } else {
-                        task.stop.send_replace(true);
-                        join_task(task, &status);
-                    }
-                }
-                tasks = retained;
                 update(&status, |s| {
-                    for entry in &mut entries {
-                        if let Some(old) = s.managed.iter().find(|old| old.id == entry.id) {
-                            entry.transfer_bytes = old.transfer_bytes;
-                            entry.maintenance_publications = old.maintenance_publications;
-                            entry.sessions_started = old.sessions_started;
-                            entry.node_id = old.node_id.clone();
-                            if keep.iter().any(|id| id.to_string() == entry.id) {
-                                entry.sync_running = old.sync_running;
-                                entry.maintenance_running = old.maintenance_running;
-                                entry.bound_sockets = old.bound_sockets.clone();
-                                entry.problem = old.problem.clone();
-                            }
-                        }
-                        if let Some((_, problem)) =
-                            invalid.iter().find(|(id, _)| id.to_string() == entry.id)
-                        {
-                            entry.problem = Some(problem.clone());
-                        }
-                    }
-                    s.managed = entries;
+                    s.config_generation += 1;
                     s.config_problem = None;
+                    s.node.sync_enabled = settings.sync_enabled;
+                    s.node.maintenance_enabled = settings.maintenance_enabled;
                     s.warnings = if settings.mcp_port != initial_port {
-                        vec!["The MCP port changed in the node pile; restart Erlkönig to bind the new port.".into()]
+                        vec!["Restart Erlkönig to use the changed MCP port.".into()]
                     } else {
                         Vec::new()
                     };
-                    s.config_generation += 1;
-                    s.sync_collections = desired
-                        .iter()
-                        .filter(|c| c.sync_enabled && !invalid.contains_key(&c.id))
-                        .map(|c| c.sync_collections.len())
-                        .sum();
-                    s.maintenance_targets = desired
-                        .iter()
-                        .filter(|c| c.maintenance_enabled && !invalid.contains_key(&c.id))
-                        .map(|c| c.maintain_targets.len())
-                        .sum();
                 });
-                for config in desired {
-                    if invalid.contains_key(&config.id)
-                        || keep.contains(&config.id)
-                        || (!config.sync_enabled && !config.maintenance_enabled)
-                    {
-                        continue;
-                    }
+                if task.is_none() && (settings.sync_enabled || settings.maintenance_enabled) {
                     let (cancel, cancel_rx) = watch::channel(false);
-                    let worker_config = config.clone();
+                    let worker_settings = settings.clone();
+                    let worker_binding = binding.clone();
+                    let worker_signer = signer.clone();
+                    let lock = identity_lock.clone();
                     let state = status.clone();
                     let metrics = reports.clone();
-                    let owner_dir = ownership_dir.clone();
-                    let result = thread::Builder::new()
-                        .name(format!("erlkonig-pile-{}", config.id))
-                        .spawn(move || {
-                            let result = managed_session(
-                                &worker_config,
-                                &owner_dir,
-                                cancel_rx,
-                                &state,
-                                &metrics,
-                            );
-                            update_pile(&state, worker_config.id, |p| {
-                                p.sync_running = false;
-                                p.maintenance_running = false;
-                                p.bound_sockets.clear();
-                                if let Err(error) = &result {
-                                    p.problem = Some(format!("{error:#}"));
-                                }
-                            });
-                            result
-                        });
-                    match result {
-                        Ok(worker) => tasks.push(Task {
-                            config,
-                            stop: cancel,
-                            worker,
-                        }),
-                        Err(error) => update_pile(&status, config.id, |p| {
-                            p.problem = Some(format!("cannot start session: {error}"))
-                        }),
-                    }
+                    let shared = node.clone();
+                    let worker =
+                        thread::Builder::new()
+                            .name("erlkonig-node".into())
+                            .spawn(move || {
+                                let result = (|| {
+                                    crate::resource_guard::sample()?;
+                                    let pool = rayon::ThreadPoolBuilder::new()
+                                        .num_threads(4)
+                                        .start_handler(|_| crate::resource_guard::background())
+                                        .build()?;
+                                    pool.install(|| {
+                                        node_session(
+                                            &worker_binding,
+                                            &worker_signer,
+                                            &worker_settings,
+                                            &lock,
+                                            shared,
+                                            cancel_rx,
+                                            &state,
+                                            &metrics,
+                                        )
+                                    })
+                                })();
+                                update(&state, |s| {
+                                    s.node.sync_running = false;
+                                    s.node.maintenance_running = false;
+                                    s.node.bound_sockets.clear();
+                                    if let Err(error) = &result {
+                                        s.node.problem = Some(format!("{error:#}"));
+                                    }
+                                });
+                                result
+                            })?;
+                    task = Some(Task {
+                        settings,
+                        stop: cancel,
+                        worker,
+                    });
                 }
             }
             Ok(None) => {}
             Err(error) => {
-                // A failed observation cannot authorize retaining the previous worker plan.
-                for task in &tasks {
-                    task.stop.send_replace(true);
-                }
-                for task in tasks.drain(..) {
-                    join_task(task, &status);
+                if let Some(old) = task.take() {
+                    join_task(old, &status);
                 }
                 update(&status, |s| {
-                    s.config_problem = Some(format!("{error:#}; managed services stopped"))
+                    s.config_problem = Some(format!("{error:#}; node services stopped"))
                 });
             }
         }
-        let mut failure = false;
-        for report in receiver.try_iter() {
-            failure |= report.error.is_some();
-            if report.error.is_some() {
-                failures.push(report.clone());
+        for sample in receiver.try_iter() {
+            if sample.error.is_some() {
+                failures.push(sample.clone());
             }
-            pending.insert(
-                (report.managed, report.session, report.role.clone()),
-                report,
-            );
+            pending.insert((sample.session, sample.role.clone()), sample);
         }
-        if !pending.is_empty() && (failure || last_metrics.elapsed() >= Duration::from_secs(10)) {
+        if (!pending.is_empty() && last_metrics.elapsed() >= Duration::from_secs(10))
+            || !failures.is_empty()
+        {
             let mut batch: Vec<_> = pending.drain().map(|(_, sample)| sample).collect();
             batch.append(&mut failures);
             let result = with_node(&node, |node| node.append_metrics(&batch));
             update(&status, |s| {
-                s.metrics_problem = result.err().map(|e| format!("metrics persistence: {e:#}"))
+                s.metrics_problem = result.err().map(|error| format!("{error:#}"))
             });
             last_metrics = Instant::now();
         }
-        // Controller scheduling only. No detached retry/watch process exists.
         thread::sleep(Duration::from_millis(200));
     }
-    for task in &tasks {
-        task.stop.send_replace(true);
+    if let Some(old) = task.take() {
+        join_task(old, &status);
     }
-    for task in tasks {
-        join_task(task, &status);
-    }
-    for report in receiver.try_iter() {
-        if report.error.is_some() {
-            failures.push(report.clone());
-        }
-        pending.insert(
-            (report.managed, report.session, report.role.clone()),
-            report,
-        );
+    for sample in receiver.try_iter() {
+        pending.insert((sample.session, sample.role.clone()), sample);
     }
     let mut batch: Vec<_> = pending.into_values().collect();
     batch.append(&mut failures);
-    if !batch.is_empty() {
-        with_node(&node, |node| node.append_metrics(&batch))?;
-    }
+    with_node(&node, |node| node.append_metrics(&batch))?;
     Ok(())
 }
 
 fn sample(
-    config: &ManagedPile,
     endpoint: ed25519_dalek::VerifyingKey,
     session: Id,
     role: &str,
     elapsed: Duration,
 ) -> Option<Sample> {
-    Sample::now(Some(config.id), "native", role, session, elapsed)
+    Sample::now(None, "native", role, session, elapsed)
         .ok()
-        .map(|mut sample| {
-            sample.endpoint = Some(endpoint);
-            sample
+        .map(|mut value| {
+            value.endpoint = Some(endpoint);
+            value
         })
 }
 
 fn maintenance_observer<'a>(
-    config: &'a ManagedPile,
     endpoint: ed25519_dalek::VerifyingKey,
     session: Id,
     status: &'a Arc<Mutex<Status>>,
@@ -558,100 +464,75 @@ fn maintenance_observer<'a>(
     let started = Instant::now();
     let mut published = 0u128;
     let mut failed = 0u128;
-    move |event| match event {
-        Event::HopFinished {
-            publications,
-            error,
-            ..
-        } => {
-            let count = publications
-                .merges
-                .saturating_add(publications.derives)
-                .saturating_add(publications.maps);
-            published = published.saturating_add(count);
-            failed = failed.saturating_add(u128::from(error.is_some()));
-            update(status, |s| {
-                s.maintenance_publications = s
-                    .maintenance_publications
-                    .saturating_add(count.min(u64::MAX as u128) as u64);
-                if let Some(p) = s.managed.iter_mut().find(|p| p.id == config.id.to_string()) {
-                    p.maintenance_publications = p
-                        .maintenance_publications
-                        .saturating_add(count.min(u64::MAX as u128) as u64);
-                    p.problem = error.clone().map(|e| format!("Maintenance: {e}"));
-                }
-            });
-            if let Some(mut observation) =
-                sample(config, endpoint, session, "maintenance", started.elapsed())
-            {
-                observation.failed = Some(failed);
-                observation.publications = Some(published);
-                observation.error = error;
-                let _ = metrics.send(observation);
+    move |event| {
+        let (count, error) = match event {
+            Event::HopFinished {
+                publications,
+                error,
+                ..
+            } => (
+                publications
+                    .merges
+                    .saturating_add(publications.derives)
+                    .saturating_add(publications.maps),
+                error,
+            ),
+            Event::Failure { error, .. } => (0, Some(error)),
+            _ => return,
+        };
+        published = published.saturating_add(count);
+        failed += u128::from(error.is_some());
+        update(status, |s| {
+            s.maintenance_publications = s
+                .maintenance_publications
+                .saturating_add(count.min(u64::MAX as u128) as u64);
+            s.node.maintenance_publications = s.maintenance_publications;
+            if let Some(error) = &error {
+                s.node.problem = Some(format!("Maintenance: {error}"));
             }
+        });
+        if let Some(mut value) = sample(endpoint, session, "maintenance", started.elapsed()) {
+            value.publications = Some(published);
+            value.failed = Some(failed);
+            value.error = error;
+            let _ = metrics.send(value);
         }
-        Event::Failure { error, .. } => {
-            failed = failed.saturating_add(1);
-            update_pile(status, config.id, |p| {
-                p.problem = Some(format!("Maintenance: {error}"))
-            });
-            if let Some(mut observation) =
-                sample(config, endpoint, session, "maintenance", started.elapsed())
-            {
-                observation.publications = Some(published);
-                observation.failed = Some(failed);
-                observation.error = Some(error);
-                let _ = metrics.send(observation);
-            }
-        }
-        _ => {}
     }
 }
 
-fn managed_session(
-    config: &ManagedPile,
-    ownership_dir: &Path,
+fn node_session(
+    binding: &NodeBinding,
+    signer: &ed25519_dalek::SigningKey,
+    settings: &NodeSettings,
+    identity_lock: &Path,
+    node: SharedNode,
     stop: watch::Receiver<bool>,
     status: &Arc<Mutex<Status>>,
     metrics: &mpsc::Sender<Sample>,
 ) -> Result<()> {
-    let identity = file_identity(&config.pile)?;
-    let signer = signing_key_file::load_existing(&config.key)?;
-    // Advisory app ownership is separate from Pile's short-lived append locks.
-    // Non-participating standalone daemons require an explicit ownership handoff.
-    let _pile_lease =
-        lease(&ownership_dir.join(format!("pile-{}-{}.lock", identity.0, identity.1)))?;
-    let _key_lease = if config.sync_enabled {
-        Some(lease(&ownership_dir.join(format!(
-            "peer-{}.lock",
-            hex::encode(signer.verifying_key().as_bytes())
-        )))?)
+    // This lock guards endpoint identity, NEVER exclusive access to the pile.
+    // Other native appenders and readers are legitimate concurrent users.
+    let _endpoint_lease = if settings.sync_enabled {
+        Some(lease(identity_lock)?)
     } else {
         None
     };
+    let current = signing_key_file::load_existing(&binding.key)?;
+    if current.verifying_key().to_bytes() != binding.signer {
+        bail!("node identity changed");
+    }
     let session = genid().id;
-    update_pile(status, config.id, |p| {
-        p.node_id = Some(hex::encode(signer.verifying_key().as_bytes()))
-    });
     let started = Instant::now();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let targets: Vec<_> = config
-        .maintain_targets
-        .iter()
-        .copied()
-        .map(Target::Handle)
-        .collect();
-    let store = faculties::storage::open_pile_strict_as(&config.pile, signer.verifying_key())?;
-    // Reject a path exchanged while we were opening. Normal appenders are allowed.
-    if file_identity(&config.pile)? != identity {
-        bail!("pile file identity changed during activation");
-    }
-    let mut observer =
-        maintenance_observer(config, signer.verifying_key(), session, status, metrics);
-    let result = if config.sync_enabled {
-        let peers = config
+    let store = faculties::storage::open_pile_strict_as(&binding.pile, signer.verifying_key())?;
+    let mut observer = maintenance_observer(signer.verifying_key(), session, status, metrics);
+    let result = if settings.sync_enabled {
+        // Same startup and bounded periodic backstop as the native CLI.
+        // Its RAII handle joins only this app's walker during shutdown.
+        let held_walker = store.start_held_walker(Default::default());
+        let peers = settings
             .peers
             .iter()
             .map(|bytes| {
@@ -670,29 +551,23 @@ fn managed_session(
                 bind: None,
             },
         )
-        .context("cannot start native sync host")?;
-        peer.set_replication(
-            ReplicationMode::Full,
-            config.sync_collections.iter().copied(),
-        );
-        peer.activate_collections(config.sync_collections.iter().copied());
-        let mut driver = if config.maintenance_enabled {
-            Some(Driver::new(targets, true, SuccinctBackend::Cpu)?)
-        } else {
-            None
-        };
-        update_pile(status, config.id, |p| {
-            p.sync_running = true;
-            p.maintenance_running = config.maintenance_enabled;
-            p.bound_sockets = peer
+        .context("cannot start native node endpoint")?;
+        let mut driver = None;
+        let mut selection = AllAccessible::default();
+        let mut previous_snapshot = None;
+        let mut previous_sent = 0u64;
+        let mut received = 0u128;
+        update(status, |s| {
+            s.node.sync_running = true;
+            s.node.maintenance_running = settings.maintenance_enabled;
+            s.node.bound_sockets = peer
                 .bound_sockets()
                 .iter()
                 .map(ToString::to_string)
                 .collect();
-            p.sessions_started += 1;
+            s.node.sessions_started += 1;
+            s.node.problem = None;
         });
-        let mut previous_sent = 0u64;
-        let mut received = 0u128;
         let driven: Result<()> = runtime.block_on(async {
             let stopped = stopping(stop); tokio::pin!(stopped);
             loop {
@@ -701,24 +576,37 @@ fn managed_session(
                     _ = &mut stopped => break,
                     result = async {
                         peer.try_refresh()?;
-                        let progress = peer.reconcile().await;
-                        received = received.saturating_add(progress.received_bytes as u128);
-                        let sent = peer.health().blob_serving.sent_bytes;
-                        let sent_delta = sent.saturating_sub(previous_sent);
-                        previous_sent = sent;
-                        let delta = progress.received_bytes.saturating_add(sent_delta);
-                        if delta > 0 {
+                        let snapshot = peer.snapshot()?;
+                        if previous_snapshot.as_ref().is_none_or(|previous| snapshot.changes_since(previous) != StoreChanges::NONE) {
+                            let roots = with_node(&node, NodeStore::workspace_roots)?;
+                            let next = AllAccessible::discover(&snapshot, signer.verifying_key(), roots)?;
+                            if previous_snapshot.is_none() || selection.sync != next.sync {
+                                peer.set_replication(ReplicationMode::Full, next.sync.iter().copied());
+                                peer.activate_collections(next.sync.iter().copied());
+                            }
+                            if settings.maintenance_enabled && (driver.is_none() || selection.maintenance != next.maintenance) {
+                                driver = Some(Driver::new(next.maintenance.iter().copied().map(Target::Handle), true, SuccinctBackend::Cpu)?);
+                            }
                             update(status, |s| {
-                                s.transfer_bytes = s.transfer_bytes.saturating_add(delta);
-                                if let Some(p) = s.managed.iter_mut().find(|p| p.id == config.id.to_string()) { p.transfer_bytes = p.transfer_bytes.saturating_add(delta); }
+                                s.sync_collections = next.sync.len(); s.maintenance_targets = next.maintenance.len();
+                                s.warnings = next.pending.clone();
                             });
-                            if let Some(mut observation) = sample(config, signer.verifying_key(), session, "sync", started.elapsed()) {
-                                observation.received_bytes = Some(received); observation.sent_bytes = Some(sent as u128);
-                                let _ = metrics.send(observation);
+                            selection = next;
+                        }
+                        previous_snapshot = Some(snapshot);
+                        let progress = peer.reconcile().await;
+                        received += progress.received_bytes as u128;
+                        let sent = peer.health().blob_serving.sent_bytes;
+                        let delta = progress.received_bytes.saturating_add(sent.saturating_sub(previous_sent));
+                        previous_sent = sent;
+                        if delta > 0 {
+                            update(status, |s| { s.transfer_bytes += delta; s.node.transfer_bytes = s.transfer_bytes; });
+                            if let Some(mut value) = sample(signer.verifying_key(), session, "sync", started.elapsed()) {
+                                value.received_bytes = Some(received); value.sent_bytes = Some(sent as u128); let _ = metrics.send(value);
                             }
                         }
-                        if let Some(driver) = &mut driver { driver.tick(&mut peer, &signer, &mut observer).await?; }
-                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        if let Some(driver) = &mut driver { driver.tick(&mut peer, signer, &mut observer).await?; }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                         Ok::<(), anyhow::Error>(())
                     } => result?,
                 }
@@ -726,28 +614,44 @@ fn managed_session(
             Ok(())
         });
         drop(driver);
-        let stopped = peer.shutdown_and_join().context("stop managed native host");
-        let closed = peer.close().context("close managed pile");
+        drop(previous_snapshot);
+        let stopped = peer
+            .shutdown_and_join()
+            .context("stop owned native endpoint");
+        drop(held_walker);
+        let closed = peer.close().context("close owned node handle");
         driven.and(stopped).and(closed)
     } else {
-        // Sync off means no serving, repair, discovery or network acquisition.
         let mut store = store;
-        let mut driver = Driver::new(targets, true, SuccinctBackend::Cpu)?;
-        update_pile(status, config.id, |p| {
-            p.maintenance_running = true;
-            p.sessions_started += 1;
+        let mut driver = None;
+        let mut selection = AllAccessible::default();
+        let mut previous_snapshot = None;
+        update(status, |s| {
+            s.node.maintenance_running = true;
+            s.node.sessions_started += 1;
+            s.node.problem = None;
         });
         let driven: Result<()> = runtime.block_on(async {
-            let stopped = stopping(stop);
-            tokio::pin!(stopped);
+            let stopped = stopping(stop); tokio::pin!(stopped);
             loop {
                 tokio::select! {
                     biased;
                     _ = &mut stopped => break,
                     result = async {
                         store.refresh()?;
-                        driver.tick(&mut store, &signer, &mut observer).await?;
-                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        let snapshot = store.snapshot()?;
+                        if previous_snapshot.as_ref().is_none_or(|previous| snapshot.changes_since(previous) != StoreChanges::NONE) {
+                            let next = AllAccessible::discover(&snapshot, signer.verifying_key(),
+                                with_node(&node, NodeStore::workspace_roots)?)?;
+                            if driver.is_none() || selection.maintenance != next.maintenance {
+                                driver = Some(Driver::new(next.maintenance.iter().copied().map(Target::Handle), true, SuccinctBackend::Cpu)?);
+                            }
+                            update(status, |s| { s.maintenance_targets = next.maintenance.len(); s.warnings = next.pending.clone(); });
+                            selection = next;
+                        }
+                        previous_snapshot = Some(snapshot);
+                        if let Some(driver) = &mut driver { driver.tick(&mut store, signer, &mut observer).await?; }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                         Ok::<(), anyhow::Error>(())
                     } => result?,
                 }
@@ -755,18 +659,18 @@ fn managed_session(
             Ok(())
         });
         drop(driver);
-        driven.and(store.close().context("close local maintenance pile"))
+        drop(previous_snapshot);
+        driven.and(store.close().context("close local maintenance handle"))
     };
-    if let Some(mut observation) = sample(
-        config,
+    if let Some(mut value) = sample(
         signer.verifying_key(),
         session,
         "session",
         started.elapsed(),
     ) {
-        observation.failed = Some(if result.is_err() { 1 } else { 0 });
-        observation.error = result.as_ref().err().map(|e| format!("{e:#}"));
-        let _ = metrics.send(observation);
+        value.failed = Some(u128::from(result.is_err()));
+        value.error = result.as_ref().err().map(|e| format!("{e:#}"));
+        let _ = metrics.send(value);
     }
     result
 }

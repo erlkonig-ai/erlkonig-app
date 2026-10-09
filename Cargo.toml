@@ -20,6 +20,7 @@ anyhow = "1"
 getrandom = "0.4"
 hex = "0.4"
 hifitime = "4.3"
+rayon = "1.12"
 tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros", "io-util"] }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

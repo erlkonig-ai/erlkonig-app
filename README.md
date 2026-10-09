@@ -7,13 +7,97 @@ LaunchAgent or KeepAlive restarter is bundled. A client may start the same
 executable in `mcp-stdio` mode: this connection-scoped transport only forwards
 to the running app, and never owns a pile or starts a backend.
 
+## One node, named workspaces
+
+One node identity, one logical pile and one local MCP endpoint serve every
+workspace. A workspace is a named bundle of collections, not a separate
+identity, key or physical data store. Collection capabilities define what the
+node can read, write and share.
+
+Choose **Workspaces → New workspace…**, give it a name and choose **Create**.
+This makes private collections for notes, goals, files, your journal and the
+other faculty tools, using the existing node identity. The dialog explains the
+bundle before creating it; Cancel does not enroll or create anything.
+
+To organize collections already available on this node, choose **Use existing
+collections…** in that dialog. The editor shows familiar areas such as Notes &
+knowledge, Goals & tasks and Files & documents. **More collection settings…**
+exposes less common areas and read-only diagnostics. New existing-collection
+bundles suggest only a sole eligible collection with the corresponding name;
+ambiguous or absent choices stay **Not included**. Existing workspace edits
+preserve the selected collection, including a visibly unavailable selection.
+
+The collection pickers show names and separate read/write access. Same-name
+collections are separate numbered choices, never silently combined or selected
+by position. Exact handles appear only in optional diagnostics; ordinary setup
+does not require typing hexadecimal IDs or choosing pile/key files. Selection
+is from a frozen, read-only local discovery snapshot; it does not download data
+or grant permissions. Already selected descriptor-only collections are retained,
+but unindexed descriptor-only collections cannot yet be discovered by name.
+
+Missing access calls for an invitation or capability grant to this node's
+existing identity. **Need access?** explains that the owner or administrator
+must arrange this; the editor does not yet import invitations or send requests.
+Creating another identity is not an access workaround.
+
+Choose **Advanced → Identity, storage and services…** to inspect the one
+bootstrap binding or pause node sync/maintenance. Fresh-node defaults are
+**Sync all permitted collections** and **Maintain supported attached
+collections**. There is no per-workspace sync target list, managed-pile list,
+or keyring. Workspace changes do not toggle these services. Settings and
+workspace editors save through native configuration operations; Cancel only
+discards the draft, and stale observations are rejected rather than overwriting
+concurrent changes.
+
+Fresh installations use
+`~/.local/share/triblespace/custody/self.pile` and `self.key`.
+An existing legacy app pile/key requires an explicit settings migration and
+`bind-node`; the app never silently swaps its identity. The application folder
+holds only the private `mcp.token`, process lock and optional `node.json`
+locator (pile/key paths plus expected public signer). Settings remain in the
+pile. A validated binding is captured once at startup; workspaces cannot change it.
+App configuration is typed facts in the node pile's private Faculty `config`
+collection; measured metrics live in a separate private collection in that
+same pile. There is no parallel mutable workspace database, and raw credentials
+are never stored as facts.
+
 `erlkonig-core` owns configuration, credentials, lifecycle and client setup.
 `erlkonig` owns the macOS menu and crown. `faculties`, `trible` and
-`triblespace-net` are linked libraries, not launched commands. Each syncing pile
-owns a durable Peer; enabled maintenance shares it. With sync off, maintenance
-uses a resident-only Pile, with no network acquisition. Workspace Faculty reads
-are local-only: missing payloads fail rather than starting acquisition peers.
-These native owners and their safe pile handles all end with the app.
+`triblespace-net` are linked libraries, not launched commands. The node's
+single sync owner provides its durable Peer and enabled maintenance. With
+sync paused, maintenance is local-only and starts no acquisition networking.
+Workspace Faculty reads are local-only: missing payloads fail instead of
+starting acquisition peers. Native owners and safe pile handles end with the app.
+
+Maintenance uses a dedicated four-worker CPU pool, dependency-first ordering,
+and value-change gating at a one-second cadence. Sync owns its startup/periodic
+held-blob walker (four workers, 30-minute interval). The in-process resource
+guard pauses services at 48 GiB process RSS or below 20% kernel memory headroom
+(`kern.memorystatus_level` on macOS, not the separate `memory_pressure`
+estimate). The UI remains responsive; service threads use Darwin background
+priority. After recovery, turn both advanced service switches off, Save, then
+on and Save to retry. Ordinary workspace edits do not restart paused services.
+
+Passive operator commands never start transport:
+
+```sh
+erlkonig public-key --key /absolute/existing/self.key
+erlkonig inspect-node --pile /absolute/existing/self.pile --public PUBLIC_HEX
+erlkonig migration-plan --request /absolute/prepared-request.json
+```
+
+`migration-plan` preserves source config/metrics facts and conflicting heads.
+The explicit request carries source collection handles, target locator,
+approved old workspace bindings, service defaults and optional exact existing
+role routes. Each added bundle requires an anchor minted once with
+`trible genid` and retained in the request. The plan does not import another
+pile or infer routes from labels. Unavailable or unapproved old workspaces stay
+reported and retained, not silently redirected. Quiesce the old app before
+preparing the final request; `migrate-settings` applies only to the target and
+rejects target config changes since preparation. Keep the original pile/key
+for rollback. `bind-node --data-dir APP_DIR --pile EXISTING_PILE --key
+EXISTING_KEY --expect-public PUBLIC_HEX` then writes only the validated locator.
+
 Code's local Git operations use linked, vendored libgit2; no Git executable,
 external diff/filter/credential helper, or SSH/HTTPS transport is used. Its
 rename-similarity and clock-skewed history ordering can differ from Git CLI.
@@ -21,65 +105,40 @@ User-invoked Habit shell predicates remain an explicit subprocess exception.
 They are not resident app sidecars, but arbitrary descendants are outside the
 native shutdown guarantee.
 
-The app uses `~/Library/Application Support/Erlkonig/self.pile` as its one node
-pile, retaining the existing `self.key` and private `mcp.token`. The only
-bootstrap is these fixed paths. App configuration is typed facts in the node
-pile's existing private Faculty `config` collection; measured metrics live in
-a separate private collection in that same pile. There is no `node.toml` or
-parallel configuration file, and raw credentials are never stored as facts.
+## Workspace requests
 
-Choose **Managed Piles → Add existing pile…** to explicitly pick an existing
-pile and signing-key file. The editor accepts peer IDs and exact collection
-handles, not ambiguous collection names. Each entry has independent **Sync**
-and **Local maintenance** controls, both initially off, plus its status and
-configuration editor. No other pile is discovered, created, attached or taken
-over automatically. Routes never inherit `TRIBLESPACE_PEERS`.
+Tell your assistant the workspace to use. Clients call `list_workspaces` to
+obtain its opaque request ID; people do not need to copy or transcribe it.
+Listing returns labels and configured collection routes, alongside unavailable
+entries with reasons. Every faculty call requires an explicit `workspace` ID.
+Switching workspace means choosing another bundle for that request, not changing
+a global selection shared with other clients.
 
-Choose **Managed Piles → a pile → Create query workspace…** to name a query
-workspace and select exact local collection roots for its faculty roles.
-Discovery is read-only and user-triggered; same-name roots remain distinct,
-and an exact handle can probe a locally present descriptor-only root. READ
-and WRITE admission are shown separately. The selected pile/key paths, public
-signer and role-to-root bindings are saved in node configuration, not copied
-datasets. Omitted roles are unavailable: they never fall back to signer-private
-roots or the node pile. Creating a workspace does not enable Sync or maintenance.
-
-MCP clients call `list_workspaces` first. It returns healthy entries with labels,
-exact revision IDs, public signers and configured role/root handles, alongside
-unavailable entries with reasons. Listing does not open target piles or keys.
-Every faculty call requires an explicit `workspace` ID from that list; there
-is no default or connection-global selection. The app resolves the configured
-binding once per call and freezes that value for the operation. IDs are opaque,
+The app freezes the resolved bundle for each admitted call. IDs are opaque,
 not cryptographic manifests: native additive facts can change a revision's
 interpretable value, and subsequent calls use the new value. Normal UI edits
 publish a successor and reject the previous ID instead of redirecting it.
-Unavailable revisions can be withdrawn from **Query Workspaces** without
-decoding their full binding or deleting data.
+Unavailable revisions can be removed from **Workspaces** without deleting data.
 
-Each call uses only its configured data routes and signer, including auxiliary
-faculty collections. Requests cannot supply replacement pile paths, keys or
-root mappings. This routing is not an execution sandbox for tools that support
-host paths or user-invoked commands. Reading workspace A and then writing
-workspace B are separate explicit operations, not an automatic copy, union,
-transfer tool or cross-pile transaction. Existing collection admission still
-applies. Local-only query access does not start synchronization, notifications
-or acquisition networking; separately configured managed sync remains separate.
+Each call uses the node's one signer and only the selected collection routes,
+including auxiliary faculty collections. Omitted roles are unavailable; they
+never fall back to private or default roots. Requests cannot supply replacement
+pile paths, keys or root mappings. Routing is not an execution sandbox for
+tools that support host paths or user-invoked commands. Reading workspace A
+and writing workspace B are separate explicit operations, not an automatic
+copy, union or cross-workspace transaction. Existing collection admission
+still applies.
 
-The controller retains native config observations and task ownership, not a
-second configuration database. Metrics writes do not invalidate the config
-observation. Changes cancel and join the old session before replacement;
-read faults stop managed services, while an individual conflicting entry stays
-off without stopping unrelated entries. Concurrent config edits remain visible
-conflicts; an editor opened on an older observation refuses to overwrite it.
-Removing an entry appends a withdrawal revision and never deletes pile/key files.
+The controller retains native config observations and task ownership.
+Metrics writes do not invalidate the config observation. Node configuration
+changes cancel and join the old service session before replacement; malformed
+control observations stop services instead of guessing. A conflicting workspace
+remains unavailable without hiding other workspaces. Removing a workspace
+withdraws its configuration, never deletes collection data or changes sync scope.
 
-Duplicate pile file identities (including hard links/symlinks) and simultaneous
-sync sessions sharing a signing identity are refused. App-private advisory
-leases complement the existing data-owner lock; they are coordination, not
-configuration. Nonparticipating standalone daemons do not honor these leases:
-their ownership must be handed off separately before enabling a managed pile.
-The node pile itself is not a second sync session. Maintenance-only sessions on
-different files may share a signer.
+Nonparticipating standalone daemons do not honor app-private coordination.
+An existing node owner must be handed off explicitly before this app starts
+owning that same store and endpoint.
 
 Quit stops accepting requests, cancels async work and joins workers while the
 menu reports shutdown. An admitted synchronous Faculty operation can need time
@@ -133,11 +192,10 @@ unexpected files or symlinks are refused rather than executed or distributed.
 The ZIP contains exactly those three files and no top-level `bin/` directory.
 
 A stored MCP-port change takes effect on the next launch. Metrics contain cumulative
-observed bytes/publications/failures by managed entry, worker and session;
+observed bytes/publications/failures by node, worker and session;
 absent counters remain unknown. Measurements are coalesced at a ten-second
-cadence, with observed failures and shutdown flushed sooner. The managed
-signing identity and the collecting node are distinct telemetry subjects;
-maintenance-only roles do not claim a live network listener. Failed metrics
+cadence, with observed failures and shutdown flushed sooner. Local-only
+maintenance does not claim a live network listener. Failed metrics
 appends are visible in the menu and are never reported as persisted success.
 
 The crown is static at rest and with macOS Reduce Motion. Animation follows
