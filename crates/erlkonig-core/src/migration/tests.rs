@@ -198,7 +198,14 @@ fn cancelled_or_failed_plan_leaves_both_piles_unchanged_and_metrics_keep_collect
     );
     assert_eq!(std::fs::read(&b.pile).unwrap(), before_failed_apply);
     assert_eq!(std::fs::read(&a.pile).unwrap(), before_a);
-    let target_snapshot = target.pile.snapshot().unwrap();
+    // The CLI reads a passive snapshot before opening its own writer. A
+    // reopened but equal record set must pass; pointer lineage is not a
+    // portable version token.
+    let file = triblespace::core::repo::pile::PileFile::open_read_only(&b.pile).unwrap();
+    let mut reopened =
+        triblespace::core::repo::pile::Pile::with_host(file, Some(new.verifying_key()));
+    let target_snapshot = reopened.snapshot().unwrap();
+    drop(reopened);
     let plan = MigrationPlan::prepare(
         &source_snapshot,
         source.config.handle(),

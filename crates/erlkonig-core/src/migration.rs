@@ -7,15 +7,14 @@ use anyhow::{Context, Result, bail};
 use ed25519_dalek::VerifyingKey;
 use faculties::schemas::config::config;
 use triblespace::core::collection::{
-    Collection, CollectionHandle, CollectionRecordSelector, CollectionSnapshotExt,
+    Collection, CollectionHandle, CollectionRead, CollectionRecordSelector, CollectionSnapshotExt,
     CollectionStoreExt,
 };
 use triblespace::core::metadata;
 use triblespace::core::query::register::{ObservationOrder, maximal};
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{
-    BlobStoreGet, BlobStoreList, SnapshotSource, StorageFlush, StoreChanges, StoreDependencies,
-    StoreSnapshot, potential_handles, reachable,
+    BlobStoreGet, BlobStoreList, SnapshotSource, StorageFlush, potential_handles, reachable,
 };
 use triblespace::prelude::*;
 use triblespace_net::health_record;
@@ -239,16 +238,17 @@ impl MigrationPlan {
     /// publication. No transaction across collections is claimed.
     pub fn apply(self, target: &mut NodeStore, expected: &ConfigView) -> Result<()> {
         target.pile.refresh()?;
-        let mut interests = StoreDependencies::default();
-        interests
-            .records
-            .insert(CollectionRecordSelector::Collection(self.target_config));
-        if target
+        // Preparation and publication may use separately opened Pile handles.
+        // Native semantic record differences work across those lineages;
+        // StoreSnapshot::changes_for is intentionally lineage-local.
+        let routes = std::collections::BTreeSet::from([CollectionRecordSelector::Collection(
+            self.target_config,
+        )]);
+        let (added, removed) = target
             .pile
             .snapshot()?
-            .changes_for(&self.target_snapshot, &interests)
-            != StoreChanges::NONE
-        {
+            .select_record_changes(&self.target_snapshot, &routes)?;
+        if !added.is_empty() || !removed.is_empty() {
             bail!(
                 "target configuration changed since plan preparation; prepare a fresh migration plan"
             );
