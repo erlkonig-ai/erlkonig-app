@@ -352,6 +352,9 @@ fn controller(
                     };
                 });
                 if task.is_none() && (settings.sync_enabled || settings.maintenance_enabled) {
+                    // Clear only the previous session's error, before the new
+                    // worker can race with a controller guard cancellation.
+                    update(&status, |s| s.node.problem = None);
                     let (cancel, cancel_rx) = watch::channel(false);
                     let worker_settings = settings.clone();
                     let worker_binding = binding.clone();
@@ -566,7 +569,6 @@ fn node_session(
                 .map(ToString::to_string)
                 .collect();
             s.node.sessions_started += 1;
-            s.node.problem = None;
         });
         let driven: Result<()> = runtime.block_on(async {
             let stopped = stopping(stop); tokio::pin!(stopped);
@@ -629,7 +631,6 @@ fn node_session(
         update(status, |s| {
             s.node.maintenance_running = true;
             s.node.sessions_started += 1;
-            s.node.problem = None;
         });
         let driven: Result<()> = runtime.block_on(async {
             let stopped = stopping(stop); tokio::pin!(stopped);
@@ -673,4 +674,68 @@ fn node_session(
         let _ = metrics.send(value);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guard_cancellation_before_startup_status_keeps_its_explanation() {
+        for sync_enabled in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let bootstrap = crate::config::Bootstrap::new(dir.path());
+            let signer = init::prepare(&bootstrap).unwrap();
+            let node = Arc::new(Mutex::new(Some(
+                NodeStore::open(&bootstrap.pile, signer.clone()).unwrap(),
+            )));
+            let binding = NodeBinding {
+                pile: bootstrap.pile,
+                key: bootstrap.key,
+                signer: signer.verifying_key().to_bytes(),
+            };
+            let settings = NodeSettings {
+                sync_enabled,
+                ..NodeSettings::default()
+            };
+            let status = Arc::new(Mutex::new(Status::default()));
+            let (cancel, stop) = watch::channel(false);
+            let (metrics, _reports) = mpsc::channel();
+
+            // The controller deliberately started this task, then its guard
+            // fired before synchronous setup published startup status. No
+            // timing or actual memory pressure is needed to force this order.
+            let reason = crate::resource_guard::check(48 * 1024 * 1024 * 1024, 100)
+                .unwrap_err()
+                .to_string();
+            cancel.send_replace(true);
+            update(&status, |s| s.node.problem = Some(reason.clone()));
+            node_session(
+                &binding,
+                &signer,
+                &settings,
+                &dir.path().join("endpoint.lock"),
+                node.clone(),
+                stop,
+                &status,
+                &metrics,
+            )
+            .unwrap();
+
+            let state = status.lock().unwrap();
+            assert_eq!(state.node.sessions_started, 1);
+            assert_eq!(
+                state.node.problem.as_deref(),
+                Some(reason.as_str()),
+                "startup must retain the guard explanation (sync={sync_enabled})"
+            );
+            assert!(*cancel.borrow(), "startup must not undo cancellation");
+            drop(state);
+            assert_eq!(
+                triblespace::core::collection::held::held_walker_threads(),
+                0
+            );
+            node.lock().unwrap().take().unwrap().close().unwrap();
+        }
+    }
 }
