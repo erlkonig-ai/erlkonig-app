@@ -136,12 +136,16 @@ fn discord_auth_uses_only_the_explicit_workspace_secret_route() {
     args["workspace"] = json!(format!("{:X}", workspace.id));
     let error = f.call("discord_auth_set", args).unwrap_err();
     assert!(!format!("{error:#}").contains("synthetic-workspace-bot-token"));
-    assert!(format!("{error:#}").contains("is unconfigured"), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("is unconfigured"),
+        "{error:#}"
+    );
     // Metadata-only status remains available without opening Secrets.
-    assert!(f
-        .call("discord_auth_status", selection(&workspace))
-        .unwrap()
-        .contains("settled"));
+    assert!(
+        f.call("discord_auth_status", selection(&workspace))
+            .unwrap()
+            .contains("settled")
+    );
 }
 
 fn session(dispatch: &WorkspaceDispatch) -> mcp::Server<'_> {
