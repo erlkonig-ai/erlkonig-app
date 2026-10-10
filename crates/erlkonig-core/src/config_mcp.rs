@@ -20,13 +20,18 @@ use triblespace_net::health_record;
 use crate::config::{NodeBinding, parse_handle};
 use crate::node_schema as attrs;
 use crate::node_store::{ConfigView, NodeSettings};
-use crate::runtime::SharedNode;
+use crate::runtime::{ServiceControl, SharedNode};
 use crate::workspace::{self, Discovery, Workspace};
 
 const TOOLS: &[Tool] = &[
     Tool {
+        name: "config_retry_services",
+        description: "Request one retry of stopped node sync/maintenance with the current settings. No settings or workspace are changed. A fresh resource guard must pass before startup; requests are coalesced and already-running services are left alone. queued means requested, not running: inspect runtime in config_inspect for the outcome. No workspace required.",
+        input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+    },
+    Tool {
         name: "config_inspect",
-        description: "Inspect this running Erlkonig node's public identity, typed settings and workspace bundles. No workspace required. Returns an opaque observation to pass unchanged on a configuration edit. Conflicted settings remain visible; no secrets, private keys, paths or raw Config facts are returned. Configuration is local administration, not a sharing grant or a global workspace switch.",
+        description: "Inspect this running Erlkonig node's public identity, typed settings, workspace bundles and service runtime state. Runtime includes safe stop/retry reasons and cleanup failure codes, never raw local errors. No workspace required. Returns an opaque observation to pass unchanged on a configuration edit. Conflicted settings remain visible; no secrets, private keys, paths or raw Config facts are returned. Configuration is local administration, not a sharing grant or a global workspace switch.",
         input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
     },
     Tool {
@@ -61,6 +66,7 @@ pub(crate) struct ConfigMcp {
     node: SharedNode,
     mcp_url: String,
     startup_port: u16,
+    services: ServiceControl,
 }
 
 impl ConfigMcp {
@@ -69,12 +75,14 @@ impl ConfigMcp {
         node: SharedNode,
         mcp_url: String,
         startup_port: u16,
+        services: ServiceControl,
     ) -> Self {
         Self {
             binding,
             node,
             mcp_url,
             startup_port,
+            services,
         }
     }
 }
@@ -204,6 +212,11 @@ impl ConfigMcp {
             .config()
             .context("node configuration is unavailable; native data recovery is required")?;
         let result = match name {
+            "config_retry_services" => {
+                let _: Empty = mcp::decode_arguments(arguments)?;
+                let _ = view.settings()?;
+                json!({"queued":self.services.retry()?, "settings_changed":false})
+            }
             "config_inspect" => {
                 let _: Empty = mcp::decode_arguments(arguments)?;
                 let mut workspaces = Vec::new();
@@ -234,9 +247,22 @@ impl ConfigMcp {
                     Ok(value) => (settings_json(&value), None),
                     Err(error) => (Value::Null, Some(error.to_string())),
                 };
+                let status = self.services.status.lock().unwrap_or_else(|e| e.into_inner());
                 json!({"node_id":hex::encode(self.binding.signer), "observation":view.observation()?,
                     "settings":settings, "settings_problem":problem, "settings_revisions":revisions,
                     "mcp_url":self.mcp_url,
+                    // Raw session errors can include paths or capability handles.
+                    // Keep their details in the local UI, not MCP inspection.
+                    "runtime":{"services":status.node.services,
+                        "sync_running":status.node.sync_running,
+                        "maintenance_running":status.node.maintenance_running,
+                        "stop_reason":status.node.stop_reason,
+                        "retry_stop_reason":status.node.retry_stop_reason,
+                        "session_failed":status.node.problem.is_some(),
+                        "cleanup_failures":status.node.cleanup_failures,
+                        "retry_pending":status.node.retry_pending,
+                        "retry_available":status.config_problem.is_none()
+                            && status.node.services == crate::status::ServiceState::Stopped},
                     "port_restart_required":view.settings().is_ok_and(|value| value.mcp_port != self.startup_port),
                     "workspaces":workspaces, "unavailable":unavailable})
             }

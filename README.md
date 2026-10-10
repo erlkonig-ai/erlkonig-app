@@ -86,9 +86,16 @@ held-blob walker (four workers, 30-minute interval). The in-process resource
 guard pauses services at 48 GiB process RSS or below 20% kernel memory headroom
 (`kern.memorystatus_level` on macOS, not the separate `memory_pressure`
 estimate). The UI remains responsive; service threads use Darwin background
-priority. After recovery, use `config_set_settings` to disable both services,
-then restore the desired settings to retry. Ordinary workspace edits do not
-restart paused services.
+priority. Stopped services retain their initiating stop reason separately from
+session/cleanup errors; the local MCP stays available. After recovery, choose
+**Retry services** in the crown or call `config_retry_services`. This requests
+one fresh resource-guarded attempt with unchanged settings, after the previous
+owner has fully joined; it does not restart a live owner or retry automatically.
+`config_inspect.runtime` reports starting/running/stopping/stopped/disabled,
+the stop reason and whether a session failed. Full errors remain local because
+they can contain paths or capability handles. A queued retry is not a running
+service: inspect again for the outcome. Ordinary workspace edits do not restart
+stopped services, and Quit rejects retries while draining owned work.
 
 Passive operator commands never start transport:
 

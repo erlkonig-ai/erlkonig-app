@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 pub fn check(rss: u64, headroom: u32) -> Result<()> {
     if rss >= 48 * 1024 * 1024 * 1024 {
         bail!(
-            "service resource guard: process RSS reached 48 GiB; services paused. After recovery, turn Sync and Maintenance off, Save, then on and Save to retry."
+            "service resource guard: process RSS reached 48 GiB; services stopped. After recovery, use Retry services."
         );
     }
     if headroom > 100 {
@@ -13,7 +13,7 @@ pub fn check(rss: u64, headroom: u32) -> Result<()> {
     }
     if headroom < 20 {
         bail!(
-            "service resource guard: kernel memory headroom below 20%; services paused. After recovery, turn Sync and Maintenance off, Save, then on and Save to retry."
+            "service resource guard: kernel memory headroom below 20%; services stopped. After recovery, use Retry services."
         );
     }
     Ok(())

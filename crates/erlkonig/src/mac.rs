@@ -36,6 +36,7 @@ struct Items {
     refresh_plugins: MenuItem,
     login: CheckMenuItem,
     pause_sync: MenuItem,
+    retry_services: MenuItem,
     storage_folder: MenuItem,
     quit: MenuItem,
 }
@@ -178,6 +179,11 @@ impl App {
                 .unwrap_or_else(|| "Not running".into())
         });
         self.items.status.set_text(text);
+        self.items.retry_services.set_enabled(status.as_ref().is_some_and(|s| {
+            s.config_problem.is_none()
+                && !s.node.retry_pending
+                && s.node.services == erlkonig_core::status::ServiceState::Stopped
+        }));
         self.items.storage_folder.set_enabled(
             self.runtime
                 .as_ref()
@@ -230,6 +236,7 @@ impl App {
         }
         self.items.login.set_enabled(false);
         self.items.pause_sync.set_enabled(false);
+        self.items.retry_services.set_enabled(false);
         self.items.integrations.set_enabled(false);
         if let Some(runtime) = &self.runtime {
             runtime.begin_shutdown();
@@ -671,6 +678,12 @@ impl App {
             self.quit();
         } else if id == self.items.pause_sync.id() {
             self.toggle_sync();
+        } else if id == self.items.retry_services.id() {
+            if let Some(runtime) = &self.runtime {
+                if let Err(error) = runtime.retry_services() {
+                    self.alert("Services not retried", &error.to_string(), &["OK"]);
+                }
+            }
         } else if id == self.items.storage_folder.id() {
             self.show_storage_folder();
         } else if id == self.items.chatgpt.id() {
@@ -786,6 +799,7 @@ pub fn main() {
         refresh_plugins: MenuItem::new("Refresh plugin status…", false, None),
         login: CheckMenuItem::new("Open at login", true, false, None),
         pause_sync: MenuItem::new("Pause sync", false, None),
+        retry_services: MenuItem::new("Retry services", false, None),
         storage_folder: MenuItem::new("Show storage folder", false, None),
         quit: MenuItem::new("Quit Erlkönig", true, None),
     };
@@ -797,6 +811,7 @@ pub fn main() {
     menu.append_items(&[
         &items.status,
         &items.pause_sync,
+        &items.retry_services,
         &PredefinedMenuItem::separator(),
         &items.integrations,
         &items.storage_folder,

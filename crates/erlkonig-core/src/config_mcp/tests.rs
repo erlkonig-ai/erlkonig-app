@@ -13,6 +13,43 @@ struct Fixture {
     _dir: tempfile::TempDir,
 }
 
+#[test]
+fn runtime_inspection_redacts_errors_and_retry_does_not_edit_config() {
+    use crate::status::{CleanupFailure, ServiceState, Status};
+    let mut f = Fixture::new();
+    let status = Arc::new(Mutex::new(Status::default()));
+    {
+        let mut state = status.lock().unwrap();
+        state.node.services = ServiceState::Stopped;
+        state.node.stop_reason = Some("service settings changed".into());
+        state.node.problem = Some("private path /fixture/self.pile and blake3:CAPABILITY".into());
+        state.node.cleanup_failures = vec![CleanupFailure::EndpointShutdownTimeout];
+    }
+    let (stop, _) = tokio::sync::watch::channel(false);
+    let (control, requests) = ServiceControl::new(status.clone(), stop.clone());
+    f.config.services = control;
+    let before = f.inspect();
+    assert_eq!(before["runtime"]["services"], "stopped");
+    assert_eq!(before["runtime"]["cleanup_failures"], json!(["endpoint_shutdown_timeout"]));
+    assert_eq!(before["runtime"]["session_failed"], true);
+    assert!(!before.to_string().contains("CAPABILITY"));
+    assert!(!before.to_string().contains("/fixture"));
+    assert_eq!(f.call("config_retry_services", json!({})).unwrap()["queued"], true);
+    assert_eq!(f.call("config_retry_services", json!({})).unwrap()["queued"], true);
+    assert!(requests.try_recv().is_ok());
+    assert!(requests.try_recv().is_err(), "repeated retry coalesces");
+    assert_eq!(f.inspect()["observation"], before["observation"]);
+    {
+        let mut state = status.lock().unwrap();
+        state.node.services = ServiceState::Running;
+        state.node.retry_pending = false;
+    }
+    assert_eq!(f.call("config_retry_services", json!({})).unwrap()["queued"], false);
+    assert!(requests.try_recv().is_err());
+    stop.send_replace(true);
+    assert!(f.call("config_retry_services", json!({})).is_err());
+}
+
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -31,8 +68,10 @@ impl Fixture {
             reader.lock().unwrap().as_mut().unwrap().config()
         })
         .unwrap();
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let (services, _) = ServiceControl::new(Default::default(), stop);
         Self {
-            config: ConfigMcp::new(binding, node, "http://127.0.0.1:41773/".into(), 41773),
+            config: ConfigMcp::new(binding, node, "http://127.0.0.1:41773/".into(), 41773, services),
             dispatch,
             _dir: dir,
         }

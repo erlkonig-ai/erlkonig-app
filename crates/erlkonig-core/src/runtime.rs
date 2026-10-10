@@ -8,7 +8,7 @@ use crate::{
     node_metrics::Sample,
     node_store::{ConfigView, NodeSettings, NodeStore},
     paths::{Layout, ensure_private_dir},
-    status::{NodeStatus, Status},
+    status::{CleanupFailure, NodeStatus, ServiceState, Status},
     workspace::{AllAccessible, Workspace},
     workspace_dispatch::WorkspaceDispatch,
 };
@@ -33,6 +33,7 @@ use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
 use triblespace_net::reconcile::ReplicationMode;
 
 pub(crate) type SharedNode = Arc<Mutex<Option<NodeStore>>>;
+type ResourceCheck = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
 pub struct Runtime {
     binding: NodeBinding,
@@ -40,12 +41,54 @@ pub struct Runtime {
     activity: ActiveWork,
     node: SharedNode,
     stop: watch::Sender<bool>,
+    services: ServiceControl,
     workers: Vec<JoinHandle<Result<()>>>,
     lock: Option<File>,
 }
 
 fn update(status: &Arc<Mutex<Status>>, f: impl FnOnce(&mut Status)) {
     f(&mut status.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
+#[derive(Clone)]
+pub(crate) struct ServiceControl {
+    pub(crate) status: Arc<Mutex<Status>>,
+    stop: watch::Sender<bool>,
+    retry: mpsc::SyncSender<()>,
+}
+
+impl ServiceControl {
+    pub(crate) fn new(
+        status: Arc<Mutex<Status>>,
+        stop: watch::Sender<bool>,
+    ) -> (Self, mpsc::Receiver<()>) {
+        let (retry, requests) = mpsc::sync_channel(1);
+        (Self { status, stop, retry }, requests)
+    }
+
+    pub(crate) fn retry(&self) -> Result<bool> {
+        if *self.stop.borrow() {
+            bail!("application is shutting down");
+        }
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        if status.config_problem.is_some() {
+            bail!("resolve the node configuration before retrying services");
+        }
+        if matches!(status.node.services, ServiceState::Running | ServiceState::Starting) {
+            return Ok(false);
+        }
+        if status.node.retry_pending { return Ok(true); }
+        if status.node.services != ServiceState::Stopped {
+            bail!("services are not stopped; no retry was requested");
+        }
+        match self.retry.try_send(()) {
+            Ok(()) | Err(mpsc::TrySendError::Full(())) => {
+                status.node.retry_pending = true;
+                Ok(true)
+            }
+            Err(mpsc::TrySendError::Disconnected(())) => bail!("service controller is unavailable"),
+        }
+    }
 }
 
 async fn stopping(mut stop: watch::Receiver<bool>) {
@@ -61,6 +104,10 @@ fn with_node<T>(node: &SharedNode, f: impl FnOnce(&mut NodeStore) -> Result<T>) 
 
 impl Runtime {
     pub fn start(layout: &Layout) -> Result<Self> {
+        Self::start_with_guard(layout, Arc::new(crate::resource_guard::sample))
+    }
+
+    fn start_with_guard(layout: &Layout, guard: ResourceCheck) -> Result<Self> {
         ensure_private_dir(&layout.dir)?;
         let lock = lease(&layout.lock()).context(
             "another Erlkönig owner is using this data directory; stop it before starting this app",
@@ -108,12 +155,14 @@ impl Runtime {
         }));
         let node = Arc::new(Mutex::new(Some(node)));
         let (stop, _) = watch::channel(false);
+        let (services, retries) = ServiceControl::new(status.clone(), stop.clone());
         let mut app = Self {
             binding,
             status,
             activity: ActiveWork::default(),
             node,
             stop,
+            services,
             workers: Vec::new(),
             lock: Some(lock),
         };
@@ -122,13 +171,14 @@ impl Runtime {
         let activity = app.activity.clone();
         let node = app.node.clone();
         let binding = app.binding.clone();
+        let services = app.services.clone();
         let mcp_url = app.status().mcp_url.context("local MCP address")?;
         app.workers.push(
             thread::Builder::new()
                 .name("erlkonig-faculties".into())
                 .spawn(move || {
                     let result = (|| {
-                        let config = ConfigMcp::new(binding.clone(), node.clone(), mcp_url, port);
+                        let config = ConfigMcp::new(binding.clone(), node.clone(), mcp_url, port, services);
                         let dispatch = WorkspaceDispatch::new(binding, move || {
                             with_node(&node, NodeStore::config)
                         })?;
@@ -167,6 +217,8 @@ impl Runtime {
                         state.clone(),
                         activity,
                         port,
+                        retries,
+                        guard,
                     );
                     if let Err(error) = &result {
                         update(&state, |s| {
@@ -235,6 +287,10 @@ impl Runtime {
         status.active_work = self.activity.count();
         status
     }
+    /// Request one guarded retry without editing persistent settings.
+    pub fn retry_services(&self) -> Result<bool> {
+        self.services.retry()
+    }
     pub fn begin_shutdown(&self) {
         self.stop.send_replace(true);
     }
@@ -293,13 +349,37 @@ fn lease(path: &Path) -> Result<File> {
 }
 
 struct Task {
-    settings: NodeSettings,
-    stop: watch::Sender<bool>,
+    stop: watch::Sender<Option<String>>,
     worker: JoinHandle<Result<()>>,
 }
 
+fn record_stop(status: &mut NodeStatus, reason: String) {
+    if status.stop_reason.as_ref().is_some_and(|old| old != &reason) {
+        status.retry_stop_reason = Some(reason);
+    } else {
+        status.stop_reason = Some(reason);
+    }
+}
+
+impl Task {
+    fn cancel(&self, reason: String, status: &Arc<Mutex<Status>>) {
+        // First cancellation owns the explanation, even if shutdown or a later
+        // guard sample arrives while the endpoint is draining.
+        self.stop.send_if_modified(|value| {
+            if value.is_some() { return false; }
+            *value = Some(reason.clone());
+            true
+        });
+        update(status, |s| {
+            s.node.services = ServiceState::Stopping;
+            if let Some(reason) = self.stop.borrow().clone() {
+                record_stop(&mut s.node, reason);
+            }
+        });
+    }
+}
+
 fn join_task(task: Task, status: &Arc<Mutex<Status>>) {
-    task.stop.send_replace(true);
     let error = match task.worker.join() {
         Ok(Ok(())) => None,
         Ok(Err(error)) => Some(format!("{error:#}")),
@@ -309,6 +389,10 @@ fn join_task(task: Task, status: &Arc<Mutex<Status>>) {
         s.node.sync_running = false;
         s.node.maintenance_running = false;
         s.node.bound_sockets.clear();
+        s.node.services = ServiceState::Stopped;
+        if let Some(reason) = task.stop.borrow().clone() {
+            record_stop(&mut s.node, reason);
+        }
         if error.is_some() {
             s.node.problem = error;
         }
@@ -324,55 +408,96 @@ fn controller(
     status: Arc<Mutex<Status>>,
     activity: ActiveWork,
     initial_port: u16,
+    retries: mpsc::Receiver<()>,
+    guard: ResourceCheck,
 ) -> Result<()> {
     let (reports, receiver) = mpsc::channel();
     let mut task: Option<Task> = None;
+    // The last interpreted service settings are independent of task liveness.
+    // Reaping a finished handle must not turn unrelated Config edits into retries.
+    let mut settings: Option<NodeSettings> = None;
     let mut pending: HashMap<(Id, String), Sample> = HashMap::new();
     let mut failures = Vec::new();
     let mut last_metrics = Instant::now();
     let mut last_guard = Instant::now() - Duration::from_secs(1);
     while !*stop.borrow() {
+        if task.as_ref().is_some_and(|task| task.worker.is_finished()) {
+            join_task(task.take().unwrap(), &status);
+        }
         if last_guard.elapsed() >= Duration::from_secs(1) {
-            if let Err(error) = crate::resource_guard::sample() {
+            if let Err(error) = guard() {
                 if let Some(task) = &task {
-                    task.stop.send_replace(true);
+                    task.cancel(format!("{error:#}"), &status);
                 }
-                update(&status, |s| s.node.problem = Some(format!("{error:#}")));
             }
             last_guard = Instant::now();
         }
+        let mut start = false;
         match with_node(&node, |node| {
             node.poll_config()?.map(|view| view.settings()).transpose()
         }) {
-            Ok(Some(settings)) => {
+            Ok(Some(next)) => {
                 // Workspaces select views: changing their facts must not reopen
                 // the node endpoint or alter what it is allowed to synchronize.
-                let unchanged = task.as_ref().is_some_and(|task| {
-                    task.settings.sync_enabled == settings.sync_enabled
-                        && task.settings.maintenance_enabled == settings.maintenance_enabled
-                        && task.settings.peers == settings.peers
+                let unchanged = settings.as_ref().is_some_and(|old| {
+                    old.sync_enabled == next.sync_enabled
+                        && old.maintenance_enabled == next.maintenance_enabled
+                        && old.peers == next.peers
                 });
                 if !unchanged {
                     if let Some(old) = task.take() {
+                        old.cancel("service settings changed".into(), &status);
                         join_task(old, &status);
                     }
+                    start = true;
                 }
                 update(&status, |s| {
                     s.config_generation += 1;
                     s.config_problem = None;
-                    s.node.sync_enabled = settings.sync_enabled;
-                    s.node.maintenance_enabled = settings.maintenance_enabled;
-                    s.warnings = if settings.mcp_port != initial_port {
+                    s.node.sync_enabled = next.sync_enabled;
+                    s.node.maintenance_enabled = next.maintenance_enabled;
+                    s.warnings = if next.mcp_port != initial_port {
                         vec!["Restart Erlkönig to use the changed MCP port.".into()]
                     } else {
                         Vec::new()
                     };
                 });
-                if task.is_none() && (settings.sync_enabled || settings.maintenance_enabled) {
-                    // Clear only the previous session's error, before the new
-                    // worker can race with a controller guard cancellation.
-                    update(&status, |s| s.node.problem = None);
-                    let (cancel, cancel_rx) = watch::channel(false);
+                settings = Some(next);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if let Some(old) = task.take() {
+                    old.cancel("node configuration is unavailable".into(), &status);
+                    join_task(old, &status);
+                }
+                settings = None;
+                update(&status, |s| {
+                    s.config_problem = Some(format!("{error:#}; node services stopped"))
+                });
+            }
+        }
+        let retry = retries.try_iter().next().is_some();
+        // A retry never replaces a live or still-draining task. Requests are
+        // coalesced, and every attempted start samples the guard again.
+        start |= retry && task.is_none();
+        if start && !*stop.borrow() {
+            if let Some(settings) = settings.as_ref() {
+                if !settings.sync_enabled && !settings.maintenance_enabled {
+                    update(&status, |s| s.node.services = ServiceState::Disabled);
+                } else if let Err(error) = guard() {
+                    update(&status, |s| {
+                        s.node.services = ServiceState::Stopped;
+                        record_stop(&mut s.node, format!("{error:#}"));
+                    });
+                } else if task.is_none() {
+                    // Retain diagnostics until the replacement really starts.
+                    update(&status, |s| {
+                        s.node.services = ServiceState::Starting;
+                    });
+                    let (cancel, cancel_rx) = watch::channel(None);
+                    let reason = cancel_rx.clone();
+                    let worker_cancel = cancel.clone();
+                    let check = guard.clone();
                     let worker_settings = settings.clone();
                     let worker_binding = binding.clone();
                     let worker_signer = signer.clone();
@@ -386,7 +511,14 @@ fn controller(
                             .name("erlkonig-node".into())
                             .spawn(move || {
                                 let result = (|| {
-                                    crate::resource_guard::sample()?;
+                                    if let Err(error) = check() {
+                                        worker_cancel.send_if_modified(|reason| {
+                                            if reason.is_some() { return false; }
+                                            *reason = Some(format!("{error:#}"));
+                                            true
+                                        });
+                                        return Err(error);
+                                    }
                                     let pool = rayon::ThreadPoolBuilder::new()
                                         .num_threads(4)
                                         .start_handler(|_| crate::resource_guard::background())
@@ -409,6 +541,12 @@ fn controller(
                                     s.node.sync_running = false;
                                     s.node.maintenance_running = false;
                                     s.node.bound_sockets.clear();
+                                    // Only the controller can mark Stopped,
+                                    // after joining this thread and its owners.
+                                    s.node.services = ServiceState::Stopping;
+                                    if let Some(reason) = reason.borrow().clone() {
+                                        record_stop(&mut s.node, reason);
+                                    }
                                     if let Err(error) = &result {
                                         s.node.problem = Some(format!("{error:#}"));
                                     }
@@ -416,21 +554,14 @@ fn controller(
                                 result
                             })?;
                     task = Some(Task {
-                        settings,
                         stop: cancel,
                         worker,
                     });
                 }
             }
-            Ok(None) => {}
-            Err(error) => {
-                if let Some(old) = task.take() {
-                    join_task(old, &status);
-                }
-                update(&status, |s| {
-                    s.config_problem = Some(format!("{error:#}; node services stopped"))
-                });
-            }
+        }
+        if retry {
+            update(&status, |s| s.node.retry_pending = false);
         }
         for sample in receiver.try_iter() {
             if sample.error.is_some() {
@@ -452,8 +583,10 @@ fn controller(
         thread::sleep(Duration::from_millis(200));
     }
     if let Some(old) = task.take() {
+        old.cancel("application is shutting down".into(), &status);
         join_task(old, &status);
     }
+    update(&status, |s| s.node.retry_pending = false);
     for sample in receiver.try_iter() {
         pending.insert((sample.session, sample.role.clone()), sample);
     }
@@ -539,7 +672,7 @@ fn node_session(
     settings: &NodeSettings,
     identity_lock: &Path,
     node: SharedNode,
-    stop: watch::Receiver<bool>,
+    stop: watch::Receiver<Option<String>>,
     status: &Arc<Mutex<Status>>,
     activity: &ActiveWork,
     metrics: &mpsc::Sender<Sample>,
@@ -592,6 +725,15 @@ fn node_session(
         let mut previous_sent = 0u64;
         let mut received = 0u128;
         update(status, |s| {
+            s.node.services = if stop.borrow().is_some() {
+                ServiceState::Stopping
+            } else {
+                s.node.problem = None;
+                s.node.stop_reason = None;
+                s.node.retry_stop_reason = None;
+                s.node.cleanup_failures.clear();
+                ServiceState::Running
+            };
             s.node.sync_running = true;
             s.node.maintenance_running = settings.maintenance_enabled;
             s.node.bound_sockets = peer
@@ -602,7 +744,7 @@ fn node_session(
             s.node.sessions_started += 1;
         });
         let driven: Result<()> = runtime.block_on(async {
-            let stopped = stopping(stop); tokio::pin!(stopped);
+            let stopped = session_stopping(stop.clone()); tokio::pin!(stopped);
             loop {
                 tokio::select! {
                     biased;
@@ -653,18 +795,30 @@ fn node_session(
             .context("stop owned native endpoint");
         drop(held_walker);
         let closed = peer.close().context("close owned node handle");
-        driven.and(stopped).and(closed)
+        session_result(driven, [
+            (CleanupFailure::EndpointShutdownFailed, stopped),
+            (CleanupFailure::StoreCloseFailed, closed),
+        ], status)
     } else {
         let mut store = store;
         let mut driver = None;
         let mut selection = AllAccessible::default();
         let mut previous_snapshot = None;
         update(status, |s| {
+            s.node.services = if stop.borrow().is_some() {
+                ServiceState::Stopping
+            } else {
+                s.node.problem = None;
+                s.node.stop_reason = None;
+                s.node.retry_stop_reason = None;
+                s.node.cleanup_failures.clear();
+                ServiceState::Running
+            };
             s.node.maintenance_running = true;
             s.node.sessions_started += 1;
         });
         let driven: Result<()> = runtime.block_on(async {
-            let stopped = stopping(stop); tokio::pin!(stopped);
+            let stopped = session_stopping(stop.clone()); tokio::pin!(stopped);
             loop {
                 tokio::select! {
                     biased;
@@ -692,7 +846,8 @@ fn node_session(
         });
         drop(driver);
         drop(previous_snapshot);
-        driven.and(store.close().context("close local maintenance handle"))
+        session_result(driven, [(CleanupFailure::StoreCloseFailed,
+            store.close().context("close local maintenance handle"))], status)
     };
     if let Some(mut value) = sample(
         signer.verifying_key(),
@@ -707,9 +862,222 @@ fn node_session(
     result
 }
 
+async fn session_stopping(mut stop: watch::Receiver<Option<String>>) {
+    if stop.borrow().is_none() {
+        let _ = stop.changed().await;
+    }
+}
+
+fn session_result(
+    driven: Result<()>,
+    cleanup: impl IntoIterator<Item = (CleanupFailure, Result<()>)>,
+    status: &Arc<Mutex<Status>>,
+) -> Result<()> {
+    let mut failures: Vec<_> = driven.err().map(|error| format!("{error:#}")).into_iter().collect();
+    for (mut kind, result) in cleanup {
+        if let Err(error) = result {
+            // This dependency currently exposes an untyped timeout. Recognize
+            // only its exact public literal; every other error stays generic.
+            if kind == CleanupFailure::EndpointShutdownFailed && error.chain().any(|cause|
+                cause.to_string() == "network transport shutdown exceeded 5 seconds") {
+                kind = CleanupFailure::EndpointShutdownTimeout;
+            }
+            update(status, |s| s.node.cleanup_failures.push(kind));
+            failures.push(format!("{error:#}"));
+        }
+    }
+    if failures.is_empty() { Ok(()) } else { bail!(failures.join("; ")) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wait_for(app: &Runtime, predicate: impl Fn(&Status) -> bool) -> Status {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let status = app.status();
+            if predicate(&status) { return status; }
+            assert!(Instant::now() < deadline, "timed out: {status:?}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn cancellation_keeps_first_reason_and_every_cleanup_failure_after_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("endpoint.lock");
+        let owner = lease(&path).unwrap();
+        let status = Arc::new(Mutex::new(Status::default()));
+        let state = status.clone();
+        let (stop, mut cancelled) = watch::channel(None);
+        let worker = thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async { cancelled.changed().await.unwrap(); });
+            let result = session_result(Err(anyhow::anyhow!("drive failed")), [
+                (CleanupFailure::EndpointShutdownFailed,
+                    Err(anyhow::anyhow!("network transport shutdown exceeded 5 seconds"))
+                        .context("stop owned native endpoint")),
+                (CleanupFailure::StoreCloseFailed, Err(anyhow::anyhow!("close failed"))),
+            ], &state);
+            drop(owner);
+            result
+        });
+        let task = Task { stop, worker };
+        let reason = crate::resource_guard::check(48 * 1024 * 1024 * 1024, 100)
+            .unwrap_err().to_string();
+        task.cancel(reason.clone(), &status);
+        task.cancel("application is shutting down".into(), &status);
+        join_task(task, &status);
+        let state = status.lock().unwrap();
+        assert_eq!(state.node.services, ServiceState::Stopped);
+        assert_eq!(state.node.stop_reason.as_deref(), Some(reason.as_str()));
+        let failure = state.node.problem.as_ref().unwrap();
+        for expected in ["drive failed", "stop owned native endpoint", "close failed"] {
+            assert!(failure.contains(expected), "{failure}");
+        }
+        assert_eq!(state.node.cleanup_failures, [
+            CleanupFailure::EndpointShutdownTimeout, CleanupFailure::StoreCloseFailed,
+        ]);
+        assert!(lease(&path).is_ok(), "joined owner released the endpoint lease");
+    }
+
+    #[test]
+    fn failed_retry_startup_preserves_prior_cause_and_reports_its_own_stop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path().join("data"));
+        std::fs::create_dir(&layout.dir).unwrap();
+        let signer = init::prepare(&layout.bootstrap()).unwrap();
+        let mut node = NodeStore::open(&layout.default_pile(), signer).unwrap();
+        let view = node.config().unwrap();
+        node.put_settings(&view, &NodeSettings { mcp_port: 0,
+            sync_enabled: true, maintenance_enabled: false, peers: vec![] }).unwrap();
+        node.close().unwrap();
+        let mode = Arc::new(AtomicUsize::new(0));
+        let guard = {
+            let mode = mode.clone();
+            Arc::new(move || match mode.load(Ordering::SeqCst) {
+                0 => crate::resource_guard::check(48 * 1024 * 1024 * 1024, 100),
+                1 if thread::current().name() == Some("erlkonig-node") => {
+                    crate::resource_guard::check(0, 19)
+                }
+                3 => bail!("service resource guard cannot sample process memory"),
+                _ => Ok(()),
+            })
+        };
+        let mut app = Runtime::start_with_guard(&layout, guard).unwrap();
+        let stopped = wait_for(&app, |s| s.node.services == ServiceState::Stopped);
+        let original = stopped.node.stop_reason.unwrap();
+        assert!(original.contains("48 GiB"));
+        mode.store(1, Ordering::SeqCst);
+        assert!(app.retry_services().unwrap());
+        let failed = wait_for(&app, |s| s.node.services == ServiceState::Stopped
+            && !s.node.retry_pending && s.node.problem.is_some());
+        assert_eq!(failed.node.stop_reason.as_deref(), Some(original.as_str()));
+        assert!(failed.node.retry_stop_reason.unwrap().contains("headroom below 20%"));
+        assert_eq!(failed.node.sessions_started, 0);
+        mode.store(2, Ordering::SeqCst);
+        app.retry_services().unwrap();
+        let running = wait_for(&app, |s| s.node.services == ServiceState::Running);
+        assert!(running.node.stop_reason.is_none());
+        assert!(running.node.retry_stop_reason.is_none());
+        mode.store(3, Ordering::SeqCst);
+        let stopped = wait_for(&app, |s| s.node.services == ServiceState::Stopped);
+        assert!(stopped.node.stop_reason.unwrap().contains("cannot sample process memory"));
+        // Quit wins over a request queued while the controller awaits config.
+        let node = app.node.lock().unwrap();
+        mode.store(2, Ordering::SeqCst);
+        app.retry_services().unwrap();
+        app.begin_shutdown();
+        drop(node);
+        app.finish().unwrap();
+        assert_eq!(app.status().node.sessions_started, 1);
+        assert!(!app.status().node.retry_pending);
+    }
+
+    #[test]
+    fn guarded_retry_reaps_owners_and_never_changes_settings_or_retries_itself() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path().join("data"));
+        std::fs::create_dir(&layout.dir).unwrap();
+        let signer = init::prepare(&layout.bootstrap()).unwrap();
+        let mut node = NodeStore::open(&layout.default_pile(), signer).unwrap();
+        let view = node.config().unwrap();
+        node.put_settings(&view, &NodeSettings { mcp_port: 0,
+            sync_enabled: true, maintenance_enabled: false, peers: vec![] }).unwrap();
+        node.close().unwrap();
+        let pressure = Arc::new(AtomicBool::new(false));
+        let samples = Arc::new(AtomicUsize::new(0));
+        let guard = {
+            let pressure = pressure.clone();
+            let samples = samples.clone();
+            Arc::new(move || {
+                samples.fetch_add(1, Ordering::SeqCst);
+                crate::resource_guard::check(0, if pressure.load(Ordering::SeqCst) { 19 } else { 100 })
+            })
+        };
+        let mut app = Runtime::start_with_guard(&layout, guard).unwrap();
+        wait_for(&app, |s| s.node.services == ServiceState::Running);
+        assert!(!app.retry_services().unwrap(), "running retry is an idempotent no-op");
+        let observation = app.config().unwrap().observation().unwrap();
+        pressure.store(true, Ordering::SeqCst);
+        let stopped = wait_for(&app, |s| s.node.services == ServiceState::Stopped);
+        assert!(!stopped.node.sync_running);
+        assert!(stopped.node.bound_sockets.is_empty());
+        assert_eq!(stopped.node.sessions_started, 1);
+        assert!(stopped.node.stop_reason.unwrap().contains("headroom below 20%"));
+        assert!(app.status().mcp_url.is_some());
+        let before = samples.load(Ordering::SeqCst);
+        assert!(app.retry_services().unwrap());
+        wait_for(&app, |s| !s.node.retry_pending && samples.load(Ordering::SeqCst) > before);
+        assert_eq!(app.status().node.sessions_started, 1, "pressure blocks retry");
+        pressure.store(false, Ordering::SeqCst);
+        let view = app.config().unwrap();
+        let generation = app.status().config_generation;
+        app.create_workspace(&view, "unrelated workspace edit").unwrap();
+        wait_for(&app, |s| s.config_generation > generation);
+        assert_eq!(app.status().node.services, ServiceState::Stopped);
+        assert_eq!(app.status().node.sessions_started, 1);
+        assert_ne!(app.config().unwrap().observation().unwrap(), observation);
+        let observation = app.config().unwrap().observation().unwrap();
+        assert!(app.retry_services().unwrap());
+        // Repeated queued requests coalesce; they cannot replace a live owner.
+        let _ = app.retry_services().unwrap();
+        let restarted = wait_for(&app, |s| s.node.services == ServiceState::Running);
+        assert_eq!(restarted.node.sessions_started, 2);
+        assert!(restarted.node.stop_reason.is_none());
+        assert_eq!(app.config().unwrap().observation().unwrap(), observation);
+        assert!(Runtime::start(&layout).is_err());
+        pressure.store(true, Ordering::SeqCst);
+        wait_for(&app, |s| s.node.services == ServiceState::Stopped);
+        // Admit a retry and a settings stop under the same node lock. The
+        // controller must use the new settings, not the old stopped task's.
+        let mut node = app.node.lock().unwrap();
+        pressure.store(false, Ordering::SeqCst);
+        assert!(app.retry_services().unwrap());
+        let node_store = node.as_mut().unwrap();
+        let view = node_store.config().unwrap();
+        let mut settings = view.settings().unwrap();
+        settings.sync_enabled = false;
+        node_store.put_settings(&view, &settings).unwrap();
+        drop(node);
+        let disabled = wait_for(&app, |s| s.node.services == ServiceState::Disabled && !s.node.retry_pending);
+        assert_eq!(disabled.node.sessions_started, 2);
+        app.begin_shutdown();
+        assert!(app.retry_services().is_err());
+        app.finish().unwrap();
+        assert!(app.is_finished());
+        assert_eq!(triblespace::core::collection::held::held_walker_threads(), 0);
+        let mut next = Runtime::start(&layout).unwrap();
+        let view = next.config().unwrap();
+        let mut settings = view.settings().unwrap();
+        settings.sync_enabled = true;
+        next.put_settings(&view, &settings).unwrap();
+        wait_for(&next, |s| s.node.services == ServiceState::Running);
+        next.finish().unwrap();
+    }
 
     #[test]
     fn maintenance_boundaries_release_only_their_own_work() {
@@ -867,7 +1235,7 @@ mod tests {
                 ..NodeSettings::default()
             };
             let status = Arc::new(Mutex::new(Status::default()));
-            let (cancel, stop) = watch::channel(false);
+            let (cancel, stop) = watch::channel(None);
             let (metrics, _reports) = mpsc::channel();
             let activity = ActiveWork::default();
 
@@ -877,8 +1245,8 @@ mod tests {
             let reason = crate::resource_guard::check(48 * 1024 * 1024 * 1024, 100)
                 .unwrap_err()
                 .to_string();
-            cancel.send_replace(true);
-            update(&status, |s| s.node.problem = Some(reason.clone()));
+            cancel.send_replace(Some(reason.clone()));
+            update(&status, |s| s.node.stop_reason = Some(reason.clone()));
             node_session(
                 &binding,
                 &signer,
@@ -895,11 +1263,11 @@ mod tests {
             let state = status.lock().unwrap();
             assert_eq!(state.node.sessions_started, 1);
             assert_eq!(
-                state.node.problem.as_deref(),
+                state.node.stop_reason.as_deref(),
                 Some(reason.as_str()),
                 "startup must retain the guard explanation (sync={sync_enabled})"
             );
-            assert!(*cancel.borrow(), "startup must not undo cancellation");
+            assert!(cancel.borrow().is_some(), "startup must not undo cancellation");
             assert_eq!(activity.count(), 0, "stopped sessions never start a pass");
             drop(state);
             assert_eq!(
