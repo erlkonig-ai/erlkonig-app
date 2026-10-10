@@ -64,6 +64,9 @@ An existing legacy app pile/key requires an explicit settings migration and
 holds only the private `mcp.token`, process lock and optional `node.json`
 locator (pile/key paths plus expected public signer). Settings remain in the
 pile. A validated binding is captured once at startup; workspaces cannot change it.
+**Show storage folder** in the crown menu opens that running node's storage
+directory in Finder (the bound pile's parent directory). It does not select,
+move or change storage, and is unavailable before node startup or during Quit.
 App configuration is typed facts in the node pile's private Faculty `config`
 collection; measured metrics live in a separate private collection in that
 same pile. There is no parallel mutable workspace database, and raw credentials

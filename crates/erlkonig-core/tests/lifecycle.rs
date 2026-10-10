@@ -42,6 +42,45 @@ fn initialize() -> Value {
 }
 
 #[test]
+fn storage_folder_uses_the_frozen_runtime_binding() {
+    let (dir, fixture) = fixture();
+    let storage = dir.path().join("alternative storage");
+    fs::create_dir(&storage).unwrap();
+    let pile = storage.join("archive.pile");
+    fs::rename(fixture.default_pile(), &pile).unwrap();
+    let layout = Layout::application(dir.path().join("app metadata")).unwrap();
+    fs::create_dir(&layout.dir).unwrap();
+    let key = fixture.default_key();
+    let public = hex::encode(
+        triblespace::core::signing_key_file::load_existing(&key)
+            .unwrap()
+            .verifying_key()
+            .to_bytes(),
+    );
+    let mut locator = erlkonig_core::config::NodeLocator {
+        pile,
+        key,
+        expected_signer: public,
+    };
+    fs::write(
+        layout.dir.join("node.json"),
+        serde_json::to_vec(&locator).unwrap(),
+    )
+    .unwrap();
+    let mut app = Runtime::start(&layout).unwrap();
+    assert_eq!(app.binding().storage_folder(), Some(storage.as_path()));
+    // A later locator edit cannot redirect a menu action in this owner.
+    locator.pile = dir.path().join("not-the-running-store/other.pile");
+    fs::write(
+        layout.dir.join("node.json"),
+        serde_json::to_vec(&locator).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(app.binding().storage_folder(), Some(storage.as_path()));
+    app.finish().unwrap();
+}
+
+#[test]
 fn authenticated_native_mcp_quit_and_restart() {
     let (_dir, layout) = fixture();
     let mut app = Runtime::start(&layout).unwrap();

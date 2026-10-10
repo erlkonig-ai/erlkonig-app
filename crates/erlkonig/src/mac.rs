@@ -37,6 +37,7 @@ struct Items {
     refresh_plugins: MenuItem,
     login: CheckMenuItem,
     pause_sync: MenuItem,
+    storage_folder: MenuItem,
     quit: MenuItem,
 }
 
@@ -179,6 +180,12 @@ impl App {
                 .unwrap_or_else(|| "Not running".into())
         });
         self.items.status.set_text(text);
+        self.items.storage_folder.set_enabled(
+            self.runtime
+                .as_ref()
+                .and_then(|runtime| runtime.binding().storage_folder())
+                .is_some(),
+        );
         self.items
             .pause_sync
             .set_enabled(status.as_ref().is_some_and(|s| s.config_problem.is_none()));
@@ -226,6 +233,7 @@ impl App {
             &self.items.openai_manual,
             &self.items.cowork,
             &self.items.refresh_plugins,
+            &self.items.storage_folder,
             &self.items.quit,
         ] {
             item.set_enabled(false);
@@ -645,6 +653,29 @@ impl App {
         }
     }
 
+    fn show_storage_folder(&self) {
+        if self.quitting.is_some() {
+            return;
+        }
+        let Some(folder) = self
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.binding().storage_folder())
+        else {
+            return;
+        };
+        if !NSWorkspace::sharedWorkspace().selectFile_inFileViewerRootedAtPath(
+            None,
+            &NSString::from_str(&folder.to_string_lossy()),
+        ) {
+            self.alert(
+                "Storage folder unavailable",
+                "Finder could not open the active storage folder.",
+                &["OK"],
+            );
+        }
+    }
+
     fn on_menu(&mut self, event: MenuEvent, event_loop: &ActiveEventLoop) {
         let id = event.id();
         if id == self.items.quit.id() {
@@ -664,6 +695,8 @@ impl App {
             }
         } else if id == self.items.pause_sync.id() {
             self.toggle_sync();
+        } else if id == self.items.storage_folder.id() {
+            self.show_storage_folder();
         } else if id == self.items.chatgpt.id() {
             self.plugin_action(install::Host::OpenAi);
         } else if id == self.items.openai_manual.id() {
@@ -779,6 +812,7 @@ pub fn main() {
         refresh_plugins: MenuItem::new("Refresh plugin status…", false, None),
         login: CheckMenuItem::new("Open at login", true, false, None),
         pause_sync: MenuItem::new("Pause sync", false, None),
+        storage_folder: MenuItem::new("Show storage folder", false, None),
         quit: MenuItem::new("Quit Erlkönig", true, None),
     };
     items
@@ -792,6 +826,7 @@ pub fn main() {
         &items.pause_sync,
         &PredefinedMenuItem::separator(),
         &items.integrations,
+        &items.storage_folder,
         &PredefinedMenuItem::separator(),
         &items.login,
         &items.quit,

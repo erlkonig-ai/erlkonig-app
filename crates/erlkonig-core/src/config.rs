@@ -19,6 +19,14 @@ pub struct NodeBinding {
     pub signer: [u8; 32],
 }
 
+impl NodeBinding {
+    /// The active storage folder, not the app's configuration or key directory.
+    /// The current single-Pile store lives in its containing directory.
+    pub fn storage_folder(&self) -> Option<&Path> {
+        self.pile.parent()
+    }
+}
+
 /// The only external node document: bootstrap location and expected public
 /// identity. Application settings and workspace facts remain in the pile.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -97,5 +105,23 @@ mod tests {
         assert_eq!(b.pile, Path::new("/d/self.pile"));
         assert_eq!(b.key, Path::new("/d/self.key"));
         assert!(parse_handle("wiki").is_err());
+    }
+
+    #[test]
+    fn storage_folder_follows_the_bound_pile_not_the_key_or_default_location() {
+        let binding = NodeBinding {
+            pile: PathBuf::from("/Volumes/Alternative storage/node/archive.pile"),
+            key: PathBuf::from("/separate/identity/node.key"),
+            signer: [0; 32],
+        };
+        assert_eq!(
+            binding.storage_folder(),
+            Some(Path::new("/Volumes/Alternative storage/node"))
+        );
+        assert_eq!(
+            binding.pile,
+            Path::new("/Volumes/Alternative storage/node/archive.pile")
+        );
+        assert_eq!(binding.key, Path::new("/separate/identity/node.key"));
     }
 }

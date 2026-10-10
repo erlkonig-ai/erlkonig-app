@@ -13,12 +13,17 @@ These are pending interactive checks, not an already-passed checklist:
    or resident helper backend should appear. A client can separately start the
    same executable's connection-scoped `mcp-stdio` forwarding mode.
 2. Open the crown menu. It should have status, integrations, pause/resume sync,
-   animation preview, login and Quit, with no manual configuration wizard or
+   animation preview, Show storage folder, login and Quit, with no manual configuration wizard or
    node-identity copy action. Backend identity inspection remains available
    through `config_inspect`; confirm its public node identity,
    then Quit, reopen and confirm the same identity. Quit must remove the crown
    and local MCP listener, not leave a resident sync service. Force Quit must
    remove app-owned native threads/listeners as well.
+   **Show storage folder** opens the running node's pile directory in Finder,
+   not the application-support or key directory. Check a disposable node bound
+   to an alternative pile location (including spaces); no storage chooser or
+   configuration change should occur. The action is disabled before successful
+   node startup and while quitting.
 3. Enable Open at Login only when requested. This registers the main app, not
    an agent. Check logout/login separately; ad-hoc signing can require approval
    after a new build changes the code identity.
