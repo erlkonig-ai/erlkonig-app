@@ -92,8 +92,8 @@ session/cleanup errors; the local MCP stays available. After recovery, choose
 one fresh resource-guarded attempt with unchanged settings, after the previous
 owner has fully joined; it does not restart a live owner or retry automatically.
 `config_inspect.runtime` reports starting/running/stopping/stopped/disabled,
-the stop reason and whether a session failed. Full errors remain local because
-they can contain paths or capability handles. A queued retry is not a running
+the stop reason and whether a session failed, not raw errors that can contain
+paths or capability handles. A queued retry is not a running
 service: inspect again for the outcome. Ordinary workspace edits do not restart
 stopped services, and Quit rejects retries while draining owned work.
 Healthy operation has no status row in the crown menu. An error adds a short
@@ -235,7 +235,9 @@ Service failures append and flush separate typed events in that existing
 cleanup failure share an attempt ID allocated before startup. Their phase and
 safe code are queryable facts, never reparsed diagnostic text. Successful
 settings changes and Quit are quiet; failed cleanup retains their initiating
-cause. Detailed errors stay local. Failure to persist an event remains visible
+cause. These typed service events contain only allowlisted codes/descriptions;
+existing detailed session samples retain the metrics collection's access/sync policy.
+Failure to persist an event remains visible
 independently of later successful counter writes, without recursive logging.
 
 The crown is static at rest and with macOS Reduce Motion. It moves during

@@ -1045,7 +1045,7 @@ mod tests {
         drop(state);
         let node = node.lock().unwrap().take().unwrap();
         node.close().unwrap();
-        let node = NodeStore::open(&bootstrap.pile, signer).unwrap();
+        let mut node = NodeStore::open(&bootstrap.pile, signer).unwrap();
         let snapshot = node.pile.snapshot().unwrap();
         let observed = snapshot.collection_acquiring(node.metrics).unwrap();
         let facts: TribleSet = observed.view().unwrap();
