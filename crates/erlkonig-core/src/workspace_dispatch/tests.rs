@@ -101,6 +101,49 @@ fn selection(workspace: &Workspace) -> Value {
     json!({"workspace": format!("{:X}", workspace.id)})
 }
 
+#[test]
+fn discord_auth_uses_only_the_explicit_workspace_secret_route() {
+    let f = Fixture::new();
+    let mut workspace = f.workspace("Bot fixture");
+    let storage = Storage::shared_local(
+        f.dispatch.node.pile.clone(),
+        Some(f.dispatch.node.key.clone()),
+    )
+    .with_collections(workspace.routes.clone());
+    let secret = faculties::secrets::Secrets::with_storage(storage.clone())
+        .add("fixture bot", b"synthetic-workspace-bot-token")
+        .unwrap();
+    storage.close().unwrap();
+
+    let mut args = selection(&workspace);
+    args["secret_version"] = json!(format!("{secret:X}"));
+    let bound = f.call("discord_auth_set", args.clone()).unwrap();
+    assert!(bound.contains(&format!("{secret:X}")));
+    assert!(!bound.contains("synthetic-workspace-bot-token"));
+    let status = f
+        .call("discord_auth_status", selection(&workspace))
+        .unwrap();
+    assert!(status.contains("settled"));
+    assert!(status.contains(&format!("{secret:X}")));
+    assert!(!status.contains("synthetic-workspace-bot-token"));
+
+    // Omission is unavailable, not a fallback to a signer-private Secrets
+    // collection containing the same version elsewhere in the physical pile.
+    workspace
+        .routes
+        .remove(&faculties::secrets::DEFAULT_SCOPE_ID);
+    f.configure(&mut workspace);
+    args["workspace"] = json!(format!("{:X}", workspace.id));
+    let error = f.call("discord_auth_set", args).unwrap_err();
+    assert!(!format!("{error:#}").contains("synthetic-workspace-bot-token"));
+    assert!(format!("{error:#}").contains("is unconfigured"), "{error:#}");
+    // Metadata-only status remains available without opening Secrets.
+    assert!(f
+        .call("discord_auth_status", selection(&workspace))
+        .unwrap()
+        .contains("settled"));
+}
+
 fn session(dispatch: &WorkspaceDispatch) -> mcp::Server<'_> {
     let mut server = mcp::Server::new(&[dispatch]).unwrap();
     let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{

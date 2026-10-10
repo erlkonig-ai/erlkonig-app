@@ -129,6 +129,14 @@ and writing workspace B are separate explicit operations, not an automatic
 copy, union or cross-workspace transaction. Existing collection admission
 still applies.
 
+Discord authentication is resolved by the native faculty, not by a token in
+the app's environment. Include both the Discord and Secrets roles in the
+chosen workspace, provision the encrypted credential through Secrets, and bind
+its exact version with `discord_auth_set`. `discord_auth_status` reports only
+revision/version references. Concurrent auth revisions require explicit
+reconciliation; adding a newer same-named secret does not silently rotate the
+bot. Credential plaintext is never an MCP argument or response.
+
 The controller retains native config observations and task ownership.
 Metrics writes do not invalidate the config observation. Node configuration
 changes cancel and join the old service session before replacement; malformed

@@ -46,7 +46,7 @@ lto = "thin"
 codegen-units = 4
 
 [patch.crates-io]
-# Exact deployed-031 source closure; dependency patch tables are not inherited.
+# Sibling source closure; dependency patch tables are not inherited.
 anybytes = { path = "../anybytes" }
 netwatch = { git = "https://github.com/erlkonig-ai/net-tools.git", rev = "10ab7b328809103be74f6ca24258249715fae52b" }
 triblespace-core = { path = "../triblespace-rs/triblespace-core" }

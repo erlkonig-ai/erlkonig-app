@@ -2023,7 +2023,7 @@ checksum = "250ea0f9a0eb0e71b9040133a84777ddfd97a3c57689c249acb5917e1d869cb8"
 
 [[package]]
 name = "faculties"
-version = "0.20.2"
+version = "0.21.0"
 dependencies = [
  "anybytes",
  "anyhow",
@@ -2036,8 +2036,8 @@ dependencies = [
  "ctrlc",
  "dirs 5.0.1",
  "ed25519-dalek 2.2.0",
+ "faculties-framed-stream",
  "faculties-secrets",
- "framed-stream",
  "futures-util",
  "git2",
  "hex",
@@ -2085,6 +2085,13 @@ dependencies = [
  "zeroize",
  "zip",
  "zmij",
+]
+
+[[package]]
+name = "faculties-framed-stream"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]
@@ -2276,13 +2283,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "framed-stream"
-version = "0.1.0"
-dependencies = [
- "anyhow",
 ]
 
 [[package]]
@@ -7938,7 +7938,7 @@ dependencies = [
 
 [[package]]
 name = "triblespace"
-version = "0.47.0"
+version = "0.47.1"
 dependencies = [
  "triblespace-core",
  "triblespace-gpu",
@@ -7947,7 +7947,7 @@ dependencies = [
 
 [[package]]
 name = "triblespace-core"
-version = "0.47.0"
+version = "0.47.1"
 dependencies = [
  "ahash",
  "anybytes",
@@ -8071,7 +8071,7 @@ dependencies = [
 
 [[package]]
 name = "triblespace-net"
-version = "0.47.0"
+version = "0.47.1"
 dependencies = [
  "anybytes",
  "anyhow",
