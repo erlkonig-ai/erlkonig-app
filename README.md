@@ -239,6 +239,11 @@ cause. These typed service events contain only allowlisted codes/descriptions;
 existing detailed session samples retain the metrics collection's access/sync policy.
 Failure to persist an event remains visible
 independently of later successful counter writes, without recursive logging.
+An explicitly routed Orient owner can present these saved occurrences to the
+model using the shared safe vocabulary and its existing Presented receipts;
+this does not install a restart policy. **Retry services** appears only while
+services are stopped with valid configuration; a requested retry is disabled
+and labelled **Retry requested…** until the existing attempt progresses.
 
 The crown is static at rest and with macOS Reduce Motion. It moves during
 app-owned reconciliation passes (including waiting for a peer), actual index

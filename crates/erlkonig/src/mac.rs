@@ -49,6 +49,7 @@ struct App {
     items: Items,
     menu: Menu,
     status_visible: bool,
+    retry_visible: bool,
     tray: Option<TrayIcon>,
     origin: Instant,
     activity: Option<WorkActivity>,
@@ -188,11 +189,26 @@ impl App {
             self.menu.remove(&self.items.status).expect("remove attention item");
             self.status_visible = false;
         }
-        self.items.retry_services.set_enabled(status.as_ref().is_some_and(|s| {
+        let retry_visible = status.as_ref().is_some_and(|s| {
             s.config_problem.is_none()
-                && !s.node.retry_pending
                 && s.node.services == erlkonig_core::status::ServiceState::Stopped
-        }));
+        });
+        let retry_pending = status.as_ref().is_some_and(|s| s.node.retry_pending);
+        self.items.retry_services.set_text(if retry_pending {
+            "Retry requested…"
+        } else {
+            "Retry services"
+        });
+        self.items.retry_services.set_enabled(retry_visible && !retry_pending);
+        if retry_visible && !self.retry_visible {
+            self.menu
+                .insert(&self.items.retry_services, 1 + usize::from(self.status_visible))
+                .expect("insert retry item");
+            self.retry_visible = true;
+        } else if !retry_visible && self.retry_visible {
+            self.menu.remove(&self.items.retry_services).expect("remove retry item");
+            self.retry_visible = false;
+        }
         self.items.storage_folder.set_enabled(
             self.runtime
                 .as_ref()
@@ -247,6 +263,10 @@ impl App {
         self.items.status.set_enabled(false);
         self.items.pause_sync.set_enabled(false);
         self.items.retry_services.set_enabled(false);
+        if self.retry_visible {
+            self.menu.remove(&self.items.retry_services).expect("remove retry item");
+            self.retry_visible = false;
+        }
         self.items.integrations.set_enabled(false);
         if let Some(runtime) = &self.runtime {
             runtime.begin_shutdown();
@@ -819,7 +839,6 @@ pub fn main() {
     let menu = Menu::new();
     menu.append_items(&[
         &items.pause_sync,
-        &items.retry_services,
         &PredefinedMenuItem::separator(),
         &items.integrations,
         &items.storage_folder,
@@ -837,6 +856,7 @@ pub fn main() {
         items,
         menu,
         status_visible: false,
+        retry_visible: false,
         tray: None,
         origin: Instant::now(),
         activity: None,
