@@ -1450,7 +1450,7 @@ pub fn main() {
     let items = Items {
         status: MenuItem::new("Starting…", true, None),
         preview: CheckMenuItem::new("Preview sync animation", true, false, None),
-        copy_id: MenuItem::new("Copy this Mac's public ID", true, None),
+        copy_id: MenuItem::new("Copy node ID", false, None),
         integrations: Submenu::new("Integrations", true),
         no_clients: MenuItem::new("Checking clients…", false, None),
         chatgpt: CheckMenuItem::new("OpenAI local plugin · checking…", false, false, None),
@@ -1472,10 +1472,11 @@ pub fn main() {
     let menu = Menu::new();
     items
         .advanced
-        .append_items(&[&items.settings, &items.copy_id])
+        .append_items(&[&items.settings])
         .expect("advanced menu");
     menu.append_items(&[
         &items.status,
+        &items.copy_id,
         &items.preview,
         &items.workspaces,
         &PredefinedMenuItem::separator(),

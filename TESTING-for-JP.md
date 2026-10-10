@@ -12,10 +12,16 @@ These are pending interactive checks, not an already-passed checklist:
    maintenance of supported attached collections. No background-node approval
    or resident helper backend should appear. A client can separately start the
    same executable's connection-scoped `mcp-stdio` forwarding mode.
-2. Use Advanced → Copy this Mac's public ID, quit, reopen and confirm the same
-   identity. Quit must remove the
-   crown and local MCP listener, not leave a resident sync service. Force Quit
-   must remove app-owned native threads/listeners as well.
+2. Open the crown menu. Copy node ID must appear directly below the status
+   line, without opening a submenu; Advanced must not contain a second copy.
+   When the node ID is available, use Copy node ID and verify the clipboard
+   contains the full public node ID (64 lowercase hex characters), without a
+   label, extra whitespace, workspace ID or key path.
+   In a disposable fixture with no available node ID, the item must be disabled;
+   it must also become disabled during Quit. Quit, reopen and confirm the same
+   identity. Quit must remove the crown and local MCP listener, not leave a
+   resident sync service. Force Quit must remove app-owned native threads/listeners
+   as well.
 3. Enable Open at Login only when requested. This registers the main app, not
    an agent. Check logout/login separately; ad-hoc signing can require approval
    after a new build changes the code identity.
