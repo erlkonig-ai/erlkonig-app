@@ -7,7 +7,7 @@ use erlkonig_core::{
     paths::{self, Layout},
     runtime::Runtime,
 };
-use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2::MainThreadMarker;
 use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSApplication, NSWorkspace};
 use objc2_foundation::{NSBundle, NSString, NSURL};
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
