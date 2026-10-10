@@ -13,6 +13,7 @@ struct CrownIvars {
     button: Retained<NSStatusBarButton>,
     origin: Instant,
     activity: Cell<Option<WorkActivity>>,
+    needs_attention: Cell<bool>,
     animating: Cell<bool>,
     reduced: Cell<bool>,
 }
@@ -48,6 +49,7 @@ impl CrownTarget {
             state.origin.elapsed(),
             state.activity.get(),
             reduced,
+            state.needs_attention.get(),
         )
     }
 
@@ -56,14 +58,16 @@ impl CrownTarget {
         self.ivars().button.setImage(Some(&frame.template_image()));
     }
 
-    fn reconcile(&self, link: &CADisplayLink) {
+    fn reconcile(&self, link: &CADisplayLink, attention_changed: bool) {
         let previous_reduced = self.ivars().reduced.get();
         let frame = self.frame();
-        // Reconcile only starts/stops presentation. While active, only native
-        // display callbacks install images; image-caused wakes cannot redraw.
+        // Reconcile starts/stops presentation and redraws changed static state.
+        // While active, native callbacks present attention changes too;
+        // image-caused wakes cannot redraw.
         if (frame.animating && link.isPaused())
             || (!frame.animating && self.ivars().animating.get())
             || previous_reduced != self.ivars().reduced.get()
+            || (attention_changed && !frame.animating)
         {
             self.install(&frame);
         }
@@ -88,6 +92,7 @@ impl DisplayCrown {
             button: button.clone(),
             origin,
             activity: Cell::new(None),
+            needs_attention: Cell::new(false),
             animating: Cell::new(false),
             reduced: Cell::new(false),
         });
@@ -106,9 +111,11 @@ impl DisplayCrown {
         Self { link, target }
     }
 
-    pub fn update_activity(&self, activity: Option<WorkActivity>) {
+    pub fn update(&self, activity: Option<WorkActivity>, needs_attention: bool) {
         self.target.ivars().activity.set(activity);
-        self.target.reconcile(&self.link);
+        let attention_changed = self.target.ivars().needs_attention.replace(needs_attention)
+            != needs_attention;
+        self.target.reconcile(&self.link, attention_changed);
     }
 
 }

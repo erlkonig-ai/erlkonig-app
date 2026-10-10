@@ -46,28 +46,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let destination = Path::new(&destination);
     std::fs::create_dir_all(destination)?;
     let cases = [
-        ("idle", 0, None, false),
-        ("attack", 80, Some(80), false),
-        ("working", 1000, Some(1000), false),
-        ("landing", 3599, Some(1000), false),
-        ("settled", 3600, Some(1000), false),
-        ("reduced", 1000, Some(1000), true),
+        ("idle", 0, None, false, false),
+        ("attack", 80, Some(80), false, false),
+        ("working", 1000, Some(1000), false, false),
+        ("landing", 3599, Some(1000), false, false),
+        ("settled", 3600, Some(1000), false, false),
+        ("reduced", 1000, Some(1000), true, false),
+        ("attention", 0, None, false, true),
+        ("attention-working", 1000, Some(1000), false, true),
+        ("attention-settled", 3600, Some(1000), false, true),
+        ("attention-reduced", 1000, Some(1000), true, true),
     ];
-    let mut svg = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1320\" height=\"380\"><rect width=\"1320\" height=\"380\" fill=\"white\"/><style>text{font:14px system-ui,sans-serif}</style><text x=\"20\" y=\"25\">Production AppKit vector · 24 pt silhouette in 26 × 18 pt image · fixed original crest/floor envelope</text>");
+    let mut svg = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1320\" height=\"730\"><rect width=\"1320\" height=\"730\" fill=\"white\"/><style>text{font:14px system-ui,sans-serif}</style><text x=\"20\" y=\"25\">Production AppKit vector · 24 pt silhouette in 26 × 18 pt image · fixed original crest/floor envelope</text>");
     let mut idle_pixels = Vec::new();
-    for (column, (label, now, last, reduced)) in cases.iter().enumerate() {
+    let mut attention_pixels = Vec::new();
+    for (case, (label, now, last, reduced, attention)) in cases.iter().enumerate() {
         let activity = last.map(|last| crown::WorkActivity {
             began_at: Duration::ZERO,
             ended_at: Some(Duration::from_millis(last)),
         });
-        let image = crown::frame(Duration::from_millis(*now), activity, *reduced).template_image();
+        let frame = crown::frame(Duration::from_millis(*now), activity, *reduced, *attention);
+        if *attention && (*reduced || last.is_none() || *label == "attention-settled") {
+            assert!(!frame.animating);
+        }
+        let image = frame.template_image();
         assert!(image.isTemplate());
         assert_eq!(image.size(), NSSize::new(crown::WIDTH, crown::HEIGHT));
         let reps = image.representations();
         assert_eq!(reps.len(), 1);
         assert!(reps.objectAtIndex(0).downcast_ref::<NSCustomImageRep>().is_some());
-        let x = 20 + column * 215;
-        writeln!(svg, "<text x=\"{x}\" y=\"55\">{label} · template=true</text>")?;
+        let x = 20 + (case % 6) * 215;
+        let row = (case / 6) * 350;
+        writeln!(svg, "<text x=\"{x}\" y=\"{}\">{label}</text>", row + 55)?;
         for scale in [1, 2] {
             let bitmap = render(&image, scale);
             let width = bitmap.pixelsWide() as usize;
@@ -91,6 +101,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if *label == "idle" { idle_pixels = pixels.to_vec(); }
                 if *label == "settled" || *label == "reduced" { assert_eq!(pixels, idle_pixels); }
                 if *label == "working" { assert_ne!(pixels, idle_pixels); }
+                if *label == "attention" {
+                    assert_ne!(pixels, idle_pixels);
+                    attention_pixels = pixels.to_vec();
+                }
+                if *label == "attention-settled" || *label == "attention-reduced" {
+                    assert_eq!(pixels, attention_pixels);
+                }
+                if *label == "attention-working" { assert_ne!(pixels, attention_pixels); }
             }
             // Empty property dictionary carries no untyped option values.
             let png = unsafe {
@@ -100,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }.expect("PNG representation");
             std::fs::write(destination.join(format!("{label}-{scale}x.png")), png.to_vec())?;
             println!("{label} {scale}x: {width}×{height}, {solid} opaque pixels, {partial} antialiased pixels, custom vector rep, template=true");
-            let top = if scale == 1 { 70 } else { 220 };
+            let top = row + if scale == 1 { 70 } else { 220 };
             let zoom = if scale == 1 { 7 } else { 3 };
             writeln!(svg, "<g transform=\"translate({x} {top}) scale({zoom})\" fill=\"black\">")?;
             for (i, pixel) in pixels.chunks_exact(4).enumerate().filter(|(_, p)| p[3] != 0) {
@@ -121,7 +139,7 @@ fn ripple_phases(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let now = Duration::from_millis(millis);
         let frame = crown::frame(now, Some(crown::WorkActivity {
             began_at: Duration::ZERO, ended_at: None,
-        }), false);
+        }), false, false);
         let image = frame.template_image();
         assert!(image.isTemplate());
         for scale in [1, 2] {

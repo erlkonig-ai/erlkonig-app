@@ -1,6 +1,7 @@
-//! Bounded-cadence native measurements stored in the node pile, never in a
-//! managed data pile. Counter meanings and rate/freshness logic are shared
-//! with `triblespace_net::telemetry`; absent measurements stay absent.
+//! Native measurements and service failure observations in the node pile,
+//! never in a managed data pile. Counter meanings and rate/freshness logic
+//! are shared with `triblespace_net::telemetry`; absent measurements stay absent.
+//! Service events are separate facts, not counter samples or a second log store.
 
 use std::time::Duration;
 
@@ -14,6 +15,129 @@ use triblespace::prelude::*;
 use triblespace_net::{health_record, telemetry};
 
 use crate::{node_schema, node_store::NodeStore};
+
+/// An observed service failure or its initiating stop cause. Events remain in
+/// the existing metrics collection under its existing policy and selection.
+/// Minted verbatim with installed `trible genid` on 2026-10-10:
+/// `C512D8EEC43C457F7C8D58786F59C26A`.
+pub const KIND_SERVICE_EVENT: Id = triblespace::macros::id_hex!("C512D8EEC43C457F7C8D58786F59C26A");
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServicePhase {
+    Stop,
+    Startup,
+    Session,
+    Cleanup,
+}
+
+impl ServicePhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Startup => "startup",
+            Self::Session => "session",
+            Self::Cleanup => "cleanup",
+        }
+    }
+}
+
+/// An allowlisted failure or cause, never a formatted local error chain.
+/// Unknown errors retain their phase without copying paths, capability handles,
+/// credentials or other private context into telemetry attachments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceCode {
+    ResourceLimit,
+    ResourceRssLimit,
+    ResourceHeadroomLimit,
+    ResourceObservationFailed,
+    ConfigurationUnavailable,
+    SettingsChanged,
+    ApplicationShutdown,
+    StartupFailed,
+    SessionFailed,
+    WorkerPanicked,
+    EndpointShutdownFailed,
+    EndpointShutdownTimeout,
+    StoreCloseFailed,
+}
+
+impl ServiceCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResourceLimit => "resource_limit",
+            Self::ResourceRssLimit => "resource_rss_limit",
+            Self::ResourceHeadroomLimit => "resource_headroom_limit",
+            Self::ResourceObservationFailed => "resource_observation_failed",
+            Self::ConfigurationUnavailable => "configuration_unavailable",
+            Self::SettingsChanged => "settings_changed",
+            Self::ApplicationShutdown => "application_shutdown",
+            Self::StartupFailed => "startup_failed",
+            Self::SessionFailed => "session_failed",
+            Self::WorkerPanicked => "worker_panicked",
+            Self::EndpointShutdownFailed => "endpoint_shutdown_failed",
+            Self::EndpointShutdownTimeout => "endpoint_shutdown_timeout",
+            Self::StoreCloseFailed => "store_close_failed",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::ResourceLimit => "The service resource guard refused continued operation.",
+            Self::ResourceRssLimit => "Process RSS reached the 48 GiB service limit.",
+            Self::ResourceHeadroomLimit => "Kernel memory headroom fell below 20%.",
+            Self::ResourceObservationFailed => {
+                "The service resource guard could not obtain a valid memory observation."
+            }
+            Self::ConfigurationUnavailable => "Node configuration became unavailable.",
+            Self::SettingsChanged => "Service settings changed.",
+            Self::ApplicationShutdown => "The application requested service shutdown.",
+            Self::StartupFailed => "Node services failed before readiness.",
+            Self::SessionFailed => "The node service session failed.",
+            Self::WorkerPanicked => "The node service worker panicked.",
+            Self::EndpointShutdownFailed => "The owned native endpoint failed to shut down.",
+            Self::EndpointShutdownTimeout => {
+                "The owned native endpoint exceeded its five-second shutdown deadline."
+            }
+            Self::StoreCloseFailed => "The owned node store handle failed to close.",
+        }
+    }
+}
+
+/// One occurrence supplied at the actual transition, not reconstructed from
+/// status frames. The caller owns an attempt ID created before startup, so its
+/// initiating cause and independent cleanup failures can name the same attempt.
+/// Clone an existing event if retrying publication; do not regenerate its time.
+#[derive(Clone, Debug)]
+pub struct ServiceEvent {
+    endpoint: VerifyingKey,
+    attempt: Id,
+    observed_at: Inline<inlineencodings::NsTAIInterval>,
+    elapsed_ns: u128,
+    phase: ServicePhase,
+    code: ServiceCode,
+}
+
+impl ServiceEvent {
+    pub fn now(
+        endpoint: VerifyingKey,
+        attempt: Id,
+        elapsed: Duration,
+        phase: ServicePhase,
+        code: ServiceCode,
+    ) -> Result<Self> {
+        let now = Epoch::now().context("read service event wall clock")?;
+        Ok(Self {
+            endpoint,
+            attempt,
+            observed_at: (now, now)
+                .try_to_inline()
+                .map_err(|error| anyhow::anyhow!("service event time: {error:?}"))?,
+            elapsed_ns: elapsed.as_nanos(),
+            phase,
+            code,
+        })
+    }
+}
 
 /// Runtime aggregates one worker scope over a session, then batches these at
 /// a bounded cadence (not UI frames). Counts are cumulative for that session.
@@ -90,6 +214,55 @@ pub fn now_tai_ns() -> Result<i128> {
 }
 
 impl NodeStore {
+    /// Publish a transition's immutable events directly, without the periodic
+    /// sample coalescer. Success means native commit and flush both succeeded.
+    /// Failure remains a caller-visible persistence problem, never a new event
+    /// recursively published here. This does not change collection permissions
+    /// or replication selection and does not claim crash durability on error.
+    pub fn append_service_events(&mut self, events: &[ServiceEvent]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut batch = Fragment::empty();
+        for event in events {
+            let collector = entity! {
+                health_record::attrs::endpoint: self.signer.verifying_key(),
+            };
+            let collector_id = collector.root().expect("collector has a root");
+            let subject = entity! {
+                health_record::attrs::endpoint: event.endpoint,
+                health_record::attrs::node: collector_id,
+                telemetry::attrs::worker: "native",
+                telemetry::attrs::role: "services",
+                telemetry::attrs::stage: event.phase.as_str(),
+            };
+            let subject_id = subject.root().expect("service event subject has a root");
+            let occurrence = entity! {
+                metadata::tag: KIND_SERVICE_EVENT,
+                telemetry::attrs::subject: subject_id,
+                health_record::attrs::session: event.attempt,
+                metadata::created_at: event.observed_at,
+                telemetry::attrs::elapsed_ns: event.elapsed_ns,
+                metadata::name: event.code.as_str(),
+            };
+            // Wording annotates the occurrence; it is not part of its identity.
+            let occurrence_id = occurrence.root().expect("service event has a root");
+            batch += entity! { ExclusiveId::force_ref(&occurrence_id) @
+                metadata::description: event.code.description(),
+            };
+            batch += collector;
+            batch += subject;
+            batch += occurrence;
+        }
+        self.pile
+            .commit(self.metrics, &self.signer, batch)
+            .context("append service events to node metrics")?;
+        self.pile
+            .flush()
+            .context("flush service events to node metrics")?;
+        Ok(())
+    }
+
     /// One native commit for the whole batch. Callers own cadence and must not
     /// submit zero-filled substitutes for failed or unavailable observations.
     pub fn append_metrics(&mut self, samples: &[Sample]) -> Result<()> {
@@ -194,3 +367,6 @@ impl NodeStore {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests;

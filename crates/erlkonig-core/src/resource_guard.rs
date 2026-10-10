@@ -2,19 +2,28 @@
 //! No external watchdog, subprocess or owner is started.
 use anyhow::{Result, bail};
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Failure { RssLimit, HeadroomLimit }
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RssLimit => "service resource guard: process RSS reached 48 GiB; services stopped. After recovery, use Retry services.",
+            Self::HeadroomLimit => "service resource guard: kernel memory headroom below 20%; services stopped. After recovery, use Retry services.",
+        })
+    }
+}
+impl std::error::Error for Failure {}
+
 pub fn check(rss: u64, headroom: u32) -> Result<()> {
     if rss >= 48 * 1024 * 1024 * 1024 {
-        bail!(
-            "service resource guard: process RSS reached 48 GiB; services stopped. After recovery, use Retry services."
-        );
+        return Err(Failure::RssLimit.into());
     }
     if headroom > 100 {
         bail!("service resource guard: kernel memory headroom is outside its expected 0–100 range");
     }
     if headroom < 20 {
-        bail!(
-            "service resource guard: kernel memory headroom below 20%; services stopped. After recovery, use Retry services."
-        );
+        return Err(Failure::HeadroomLimit.into());
     }
     Ok(())
 }

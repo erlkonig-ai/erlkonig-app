@@ -47,7 +47,8 @@ struct App {
     runtime: Option<Runtime>,
     problem: Option<String>,
     items: Items,
-    menu: Option<Menu>,
+    menu: Menu,
+    status_visible: bool,
     tray: Option<TrayIcon>,
     origin: Instant,
     activity: Option<WorkActivity>,
@@ -138,11 +139,11 @@ impl App {
                 std::process::exit(1);
             }
             self.items
-                .status
+                .quit
                 .set_text(if since.elapsed() < Duration::from_secs(5) {
                     "Shutting down…"
                 } else {
-                    "Finishing admitted work… app exits after 15 seconds"
+                    "Finishing work…"
                 });
             if self.runtime.as_ref().is_none_or(Runtime::is_finished)
                 && self
@@ -172,13 +173,21 @@ impl App {
         }
         self.finish_plugin_task();
         let status = self.runtime.as_ref().map(Runtime::status);
-        let text = self.problem.clone().unwrap_or_else(|| {
-            status
-                .as_ref()
-                .map(|s| s.summary())
-                .unwrap_or_else(|| "Not running".into())
-        });
-        self.items.status.set_text(text);
+        let attention = if self.problem.is_some() {
+            Some("Attention needed")
+        } else {
+            status.as_ref().and_then(|s| s.attention_label())
+        };
+        if let Some(label) = attention {
+            self.items.status.set_text(label);
+            if !self.status_visible {
+                self.menu.insert(&self.items.status, 0).expect("insert attention item");
+                self.status_visible = true;
+            }
+        } else if self.status_visible {
+            self.menu.remove(&self.items.status).expect("remove attention item");
+            self.status_visible = false;
+        }
         self.items.retry_services.set_enabled(status.as_ref().is_some_and(|s| {
             s.config_problem.is_none()
                 && !s.node.retry_pending
@@ -212,7 +221,7 @@ impl App {
             now,
         );
         if let Some(crown) = &self.crown {
-            crown.update_activity(self.activity);
+            crown.update(self.activity, attention.is_some());
         }
         self.next_refresh = Instant::now() + Duration::from_millis(250);
     }
@@ -235,6 +244,7 @@ impl App {
             item.set_enabled(false);
         }
         self.items.login.set_enabled(false);
+        self.items.status.set_enabled(false);
         self.items.pause_sync.set_enabled(false);
         self.items.retry_services.set_enabled(false);
         self.items.integrations.set_enabled(false);
@@ -709,11 +719,10 @@ impl App {
                     .map(|r| {
                         let s = r.status();
                         format!(
-                            "{}\n{}\n{}\n{}",
+                            "{}\n{}\n{}",
                             s.summary(),
                             s.mcp_url.unwrap_or_default(),
-                            s.warnings.join("\n"),
-                            s.metrics_problem.unwrap_or_default()
+                            s.warnings.join("\n")
                         )
                     })
                     .unwrap_or_default()
@@ -729,7 +738,7 @@ impl ApplicationHandler<MenuEvent> for App {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         if cause == StartCause::Init {
             match TrayIconBuilder::new()
-                .with_menu(Box::new(self.menu.take().unwrap()))
+                .with_menu(Box::new(self.menu.clone()))
                 .with_autosave_name("ai.erlkonig.app.status")
                 .build()
             {
@@ -789,7 +798,7 @@ pub fn main() {
         signal_hook::flag::register(signal, terminate.clone()).expect("shutdown signal");
     }
     let items = Items {
-        status: MenuItem::new("Starting…", true, None),
+        status: MenuItem::new("Attention needed", true, None),
         integrations: Submenu::new("Integrations", true),
         no_clients: MenuItem::new("Checking clients…", false, None),
         chatgpt: CheckMenuItem::new("OpenAI local plugin · checking…", false, false, None),
@@ -809,7 +818,6 @@ pub fn main() {
         .expect("integrations menu");
     let menu = Menu::new();
     menu.append_items(&[
-        &items.status,
         &items.pause_sync,
         &items.retry_services,
         &PredefinedMenuItem::separator(),
@@ -827,7 +835,8 @@ pub fn main() {
         runtime: None,
         problem: None,
         items,
-        menu: Some(menu),
+        menu,
+        status_visible: false,
         tray: None,
         origin: Instant::now(),
         activity: None,

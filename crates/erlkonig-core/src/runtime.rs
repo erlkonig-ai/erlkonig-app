@@ -5,7 +5,7 @@ use crate::{
     config::NodeBinding,
     config_mcp::ConfigMcp,
     credentials, init,
-    node_metrics::Sample,
+    node_metrics::{Sample, ServiceCode, ServiceEvent, ServicePhase},
     node_store::{ConfigView, NodeSettings, NodeStore},
     paths::{Layout, ensure_private_dir},
     status::{CleanupFailure, NodeStatus, ServiceState, Status},
@@ -349,8 +349,52 @@ fn lease(path: &Path) -> Result<File> {
 }
 
 struct Task {
-    stop: watch::Sender<Option<String>>,
+    stop: watch::Sender<Option<StopCause>>,
     worker: JoinHandle<Result<()>>,
+    attempt: Attempt,
+}
+
+/// One actual start attempt, including preflight refusals and early failures.
+#[derive(Clone, Copy)]
+struct Attempt {
+    id: Id,
+    started: Instant,
+    endpoint: ed25519_dalek::VerifyingKey,
+}
+
+impl Attempt {
+    fn new(endpoint: ed25519_dalek::VerifyingKey) -> Self {
+        Self { id: genid().id, started: Instant::now(), endpoint }
+    }
+
+    fn event(&self, node: &SharedNode, status: &Arc<Mutex<Status>>,
+        phase: ServicePhase, code: ServiceCode) {
+        let result = ServiceEvent::now(self.endpoint, self.id, self.started.elapsed(), phase, code)
+            .and_then(|event| with_node(node, |node| node.append_service_events(&[event])));
+        if let Err(error) = result {
+            // No recursive event, retry queue, or success-shaped placeholder.
+            // Keep this independent of successful periodic counter writes.
+            update(status, |s| s.service_events_problem = Some(format!("{error:#}")));
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StopCause { reason: String, code: ServiceCode }
+
+impl StopCause {
+    fn new(reason: &str, code: ServiceCode) -> Self { Self { reason: reason.into(), code } }
+    fn guard(error: &anyhow::Error) -> Self {
+        let code = match error.downcast_ref::<crate::resource_guard::Failure>() {
+            Some(crate::resource_guard::Failure::RssLimit) => ServiceCode::ResourceRssLimit,
+            Some(crate::resource_guard::Failure::HeadroomLimit) => ServiceCode::ResourceHeadroomLimit,
+            None => ServiceCode::ResourceObservationFailed,
+        };
+        Self { reason: format!("{error:#}"), code }
+    }
+    fn expected(&self) -> bool {
+        matches!(self.code, ServiceCode::SettingsChanged | ServiceCode::ApplicationShutdown)
+    }
 }
 
 fn record_stop(status: &mut NodeStatus, reason: String) {
@@ -362,36 +406,42 @@ fn record_stop(status: &mut NodeStatus, reason: String) {
 }
 
 impl Task {
-    fn cancel(&self, reason: String, status: &Arc<Mutex<Status>>) {
+    fn cancel(&self, cause: StopCause, status: &Arc<Mutex<Status>>, node: &SharedNode) {
         // First cancellation owns the explanation, even if shutdown or a later
         // guard sample arrives while the endpoint is draining.
-        self.stop.send_if_modified(|value| {
+        let first = self.stop.send_if_modified(|value| {
             if value.is_some() { return false; }
-            *value = Some(reason.clone());
+            *value = Some(cause.clone());
             true
         });
+        if first && !cause.expected() {
+            self.attempt.event(node, status, ServicePhase::Stop, cause.code);
+        }
         update(status, |s| {
             s.node.services = ServiceState::Stopping;
-            if let Some(reason) = self.stop.borrow().clone() {
-                record_stop(&mut s.node, reason);
+            if let Some(cause) = self.stop.borrow().clone() {
+                record_stop(&mut s.node, cause.reason);
             }
         });
     }
 }
 
-fn join_task(task: Task, status: &Arc<Mutex<Status>>) {
+fn join_task(task: Task, status: &Arc<Mutex<Status>>, node: &SharedNode) {
     let error = match task.worker.join() {
         Ok(Ok(())) => None,
         Ok(Err(error)) => Some(format!("{error:#}")),
-        Err(_) => Some("node worker panicked".into()),
+        Err(_) => {
+            task.attempt.event(node, status, ServicePhase::Session, ServiceCode::WorkerPanicked);
+            Some("node worker panicked".into())
+        }
     };
     update(status, |s| {
         s.node.sync_running = false;
         s.node.maintenance_running = false;
         s.node.bound_sockets.clear();
         s.node.services = ServiceState::Stopped;
-        if let Some(reason) = task.stop.borrow().clone() {
-            record_stop(&mut s.node, reason);
+        if let Some(cause) = task.stop.borrow().clone() {
+            record_stop(&mut s.node, cause.reason);
         }
         if error.is_some() {
             s.node.problem = error;
@@ -422,12 +472,12 @@ fn controller(
     let mut last_guard = Instant::now() - Duration::from_secs(1);
     while !*stop.borrow() {
         if task.as_ref().is_some_and(|task| task.worker.is_finished()) {
-            join_task(task.take().unwrap(), &status);
+            join_task(task.take().unwrap(), &status, &node);
         }
         if last_guard.elapsed() >= Duration::from_secs(1) {
             if let Err(error) = guard() {
                 if let Some(task) = &task {
-                    task.cancel(format!("{error:#}"), &status);
+                    task.cancel(StopCause::guard(&error), &status, &node);
                 }
             }
             last_guard = Instant::now();
@@ -446,8 +496,8 @@ fn controller(
                 });
                 if !unchanged {
                     if let Some(old) = task.take() {
-                        old.cancel("service settings changed".into(), &status);
-                        join_task(old, &status);
+                        old.cancel(StopCause::new("service settings changed", ServiceCode::SettingsChanged), &status, &node);
+                        join_task(old, &status, &node);
                     }
                     start = true;
                 }
@@ -467,8 +517,11 @@ fn controller(
             Ok(None) => {}
             Err(error) => {
                 if let Some(old) = task.take() {
-                    old.cancel("node configuration is unavailable".into(), &status);
-                    join_task(old, &status);
+                    old.cancel(StopCause::new("node configuration is unavailable", ServiceCode::ConfigurationUnavailable), &status, &node);
+                    join_task(old, &status, &node);
+                } else if status.lock().unwrap_or_else(|e| e.into_inner()).config_problem.is_none() {
+                    Attempt::new(signer.verifying_key()).event(&node, &status,
+                        ServicePhase::Startup, ServiceCode::ConfigurationUnavailable);
                 }
                 settings = None;
                 update(&status, |s| {
@@ -482,12 +535,15 @@ fn controller(
         start |= retry && task.is_none();
         if start && !*stop.borrow() {
             if let Some(settings) = settings.as_ref() {
+                let attempt = Attempt::new(signer.verifying_key());
                 if !settings.sync_enabled && !settings.maintenance_enabled {
                     update(&status, |s| s.node.services = ServiceState::Disabled);
                 } else if let Err(error) = guard() {
+                    let cause = StopCause::guard(&error);
+                    attempt.event(&node, &status, ServicePhase::Stop, cause.code);
                     update(&status, |s| {
                         s.node.services = ServiceState::Stopped;
-                        record_stop(&mut s.node, format!("{error:#}"));
+                        record_stop(&mut s.node, cause.reason);
                     });
                 } else if task.is_none() {
                     // Retain diagnostics until the replacement really starts.
@@ -510,13 +566,18 @@ fn controller(
                         thread::Builder::new()
                             .name("erlkonig-node".into())
                             .spawn(move || {
+                                let mut entered = false;
+                                let mut guard_failed = false;
                                 let result = (|| {
                                     if let Err(error) = check() {
+                                        let cause = StopCause::guard(&error);
                                         worker_cancel.send_if_modified(|reason| {
                                             if reason.is_some() { return false; }
-                                            *reason = Some(format!("{error:#}"));
+                                            *reason = Some(cause.clone());
                                             true
                                         });
+                                        attempt.event(&shared, &state, ServicePhase::Startup, cause.code);
+                                        guard_failed = true;
                                         return Err(error);
                                     }
                                     let pool = rayon::ThreadPoolBuilder::new()
@@ -529,14 +590,19 @@ fn controller(
                                             &worker_signer,
                                             &worker_settings,
                                             &lock,
-                                            shared,
+                                            shared.clone(),
                                             cancel_rx,
                                             &state,
                                             &work,
                                             &metrics,
+                                            attempt,
+                                            &mut entered,
                                         )
                                     })
                                 })();
+                                if result.is_err() && !entered && !guard_failed {
+                                    attempt.event(&shared, &state, ServicePhase::Startup, ServiceCode::StartupFailed);
+                                }
                                 update(&state, |s| {
                                     s.node.sync_running = false;
                                     s.node.maintenance_running = false;
@@ -544,18 +610,22 @@ fn controller(
                                     // Only the controller can mark Stopped,
                                     // after joining this thread and its owners.
                                     s.node.services = ServiceState::Stopping;
-                                    if let Some(reason) = reason.borrow().clone() {
-                                        record_stop(&mut s.node, reason);
+                                    if let Some(cause) = reason.borrow().clone() {
+                                        record_stop(&mut s.node, cause.reason);
                                     }
                                     if let Err(error) = &result {
                                         s.node.problem = Some(format!("{error:#}"));
                                     }
                                 });
                                 result
+                            }).map_err(|error| {
+                                attempt.event(&node, &status, ServicePhase::Startup, ServiceCode::StartupFailed);
+                                error
                             })?;
                     task = Some(Task {
                         stop: cancel,
                         worker,
+                        attempt,
                     });
                 }
             }
@@ -583,8 +653,8 @@ fn controller(
         thread::sleep(Duration::from_millis(200));
     }
     if let Some(old) = task.take() {
-        old.cancel("application is shutting down".into(), &status);
-        join_task(old, &status);
+        old.cancel(StopCause::new("application is shutting down", ServiceCode::ApplicationShutdown), &status, &node);
+        join_task(old, &status, &node);
     }
     update(&status, |s| s.node.retry_pending = false);
     for sample in receiver.try_iter() {
@@ -672,10 +742,12 @@ fn node_session(
     settings: &NodeSettings,
     identity_lock: &Path,
     node: SharedNode,
-    stop: watch::Receiver<Option<String>>,
+    stop: watch::Receiver<Option<StopCause>>,
     status: &Arc<Mutex<Status>>,
     activity: &ActiveWork,
     metrics: &mpsc::Sender<Sample>,
+    attempt: Attempt,
+    entered: &mut bool,
 ) -> Result<()> {
     // This lock guards endpoint identity, NEVER exclusive access to the pile.
     // Other native appenders and readers are legitimate concurrent users.
@@ -688,8 +760,8 @@ fn node_session(
     if current.verifying_key().to_bytes() != binding.signer {
         bail!("node identity changed");
     }
-    let session = genid().id;
-    let started = Instant::now();
+    let session = attempt.id;
+    let started = attempt.started;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -719,6 +791,7 @@ fn node_session(
             },
         )
         .context("cannot start native node endpoint")?;
+        *entered = true;
         let mut driver = None;
         let mut selection = AllAccessible::default();
         let mut previous_snapshot = None;
@@ -798,12 +871,13 @@ fn node_session(
         session_result(driven, [
             (CleanupFailure::EndpointShutdownFailed, stopped),
             (CleanupFailure::StoreCloseFailed, closed),
-        ], status)
+        ], status, &node, attempt, stop.borrow().as_ref())
     } else {
         let mut store = store;
         let mut driver = None;
         let mut selection = AllAccessible::default();
         let mut previous_snapshot = None;
+        *entered = true;
         update(status, |s| {
             s.node.services = if stop.borrow().is_some() {
                 ServiceState::Stopping
@@ -847,7 +921,7 @@ fn node_session(
         drop(driver);
         drop(previous_snapshot);
         session_result(driven, [(CleanupFailure::StoreCloseFailed,
-            store.close().context("close local maintenance handle"))], status)
+            store.close().context("close local maintenance handle"))], status, &node, attempt, stop.borrow().as_ref())
     };
     if let Some(mut value) = sample(
         signer.verifying_key(),
@@ -862,7 +936,7 @@ fn node_session(
     result
 }
 
-async fn session_stopping(mut stop: watch::Receiver<Option<String>>) {
+async fn session_stopping(mut stop: watch::Receiver<Option<StopCause>>) {
     if stop.borrow().is_none() {
         let _ = stop.changed().await;
     }
@@ -872,8 +946,15 @@ fn session_result(
     driven: Result<()>,
     cleanup: impl IntoIterator<Item = (CleanupFailure, Result<()>)>,
     status: &Arc<Mutex<Status>>,
+    node: &SharedNode,
+    attempt: Attempt,
+    cause: Option<&StopCause>,
 ) -> Result<()> {
+    if driven.is_err() {
+        attempt.event(node, status, ServicePhase::Session, ServiceCode::SessionFailed);
+    }
     let mut failures: Vec<_> = driven.err().map(|error| format!("{error:#}")).into_iter().collect();
+    let mut failed_cleanup = false;
     for (mut kind, result) in cleanup {
         if let Err(error) = result {
             // This dependency currently exposes an untyped timeout. Recognize
@@ -883,8 +964,20 @@ fn session_result(
                 kind = CleanupFailure::EndpointShutdownTimeout;
             }
             update(status, |s| s.node.cleanup_failures.push(kind));
+            let code = match kind {
+                CleanupFailure::EndpointShutdownFailed => ServiceCode::EndpointShutdownFailed,
+                CleanupFailure::EndpointShutdownTimeout => ServiceCode::EndpointShutdownTimeout,
+                CleanupFailure::StoreCloseFailed => ServiceCode::StoreCloseFailed,
+            };
+            attempt.event(node, status, ServicePhase::Cleanup, code);
+            failed_cleanup = true;
             failures.push(format!("{error:#}"));
         }
+    }
+    if failed_cleanup && let Some(cause) = cause.filter(|cause| cause.expected()) {
+        // Normal Settings/Quit cancellation is not an error by itself. Retain
+        // its cause only when a cleanup failure makes this stop diagnostic.
+        attempt.event(node, status, ServicePhase::Stop, cause.code);
     }
     if failures.is_empty() { Ok(()) } else { bail!(failures.join("; ")) }
 }
@@ -905,7 +998,15 @@ mod tests {
 
     #[test]
     fn cancellation_keeps_first_reason_and_every_cleanup_failure_after_join() {
+        use triblespace::core::{collection::CollectionSnapshotExt, metadata, repo::BlobStoreGet};
+        use triblespace::prelude::*;
+        use triblespace_net::{health_record, telemetry};
         let dir = tempfile::tempdir().unwrap();
+        let bootstrap = crate::config::Bootstrap::new(dir.path());
+        let signer = init::prepare(&bootstrap).unwrap();
+        let node = Arc::new(Mutex::new(Some(NodeStore::open(&bootstrap.pile, signer.clone()).unwrap())));
+        let shared = node.clone();
+        let attempt = Attempt::new(signer.verifying_key());
         let path = dir.path().join("endpoint.lock");
         let owner = lease(&path).unwrap();
         let status = Arc::new(Mutex::new(Status::default()));
@@ -919,16 +1020,17 @@ mod tests {
                     Err(anyhow::anyhow!("network transport shutdown exceeded 5 seconds"))
                         .context("stop owned native endpoint")),
                 (CleanupFailure::StoreCloseFailed, Err(anyhow::anyhow!("close failed"))),
-            ], &state);
+            ], &state, &shared, attempt, cancelled.borrow().as_ref());
             drop(owner);
             result
         });
-        let task = Task { stop, worker };
-        let reason = crate::resource_guard::check(48 * 1024 * 1024 * 1024, 100)
-            .unwrap_err().to_string();
-        task.cancel(reason.clone(), &status);
-        task.cancel("application is shutting down".into(), &status);
-        join_task(task, &status);
+        let task = Task { stop, worker, attempt };
+        let cause = StopCause::guard(&crate::resource_guard::check(48 * 1024 * 1024 * 1024, 100)
+            .unwrap_err());
+        let reason = cause.reason.clone();
+        task.cancel(cause, &status, &node);
+        task.cancel(StopCause::new("application is shutting down", ServiceCode::ApplicationShutdown), &status, &node);
+        join_task(task, &status, &node);
         let state = status.lock().unwrap();
         assert_eq!(state.node.services, ServiceState::Stopped);
         assert_eq!(state.node.stop_reason.as_deref(), Some(reason.as_str()));
@@ -940,6 +1042,143 @@ mod tests {
             CleanupFailure::EndpointShutdownTimeout, CleanupFailure::StoreCloseFailed,
         ]);
         assert!(lease(&path).is_ok(), "joined owner released the endpoint lease");
+        drop(state);
+        let node = node.lock().unwrap().take().unwrap();
+        node.close().unwrap();
+        let node = NodeStore::open(&bootstrap.pile, signer).unwrap();
+        let snapshot = node.pile.snapshot().unwrap();
+        let observed = snapshot.collection_acquiring(node.metrics).unwrap();
+        let facts: TribleSet = observed.view().unwrap();
+        let mut events = find!((phase: String, code: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
+            pattern!(&facts, [
+                { metadata::tag: crate::node_metrics::KIND_SERVICE_EVENT,
+                    health_record::attrs::session: attempt.id,
+                    metadata::name: ?code, telemetry::attrs::subject: _?subject },
+                { _?subject @ telemetry::attrs::stage: ?phase },
+            ]))
+            .map(|(phase, code)| {
+                let text: View<str> = snapshot.get(code).unwrap();
+                (phase, text.to_string())
+            })
+            .collect::<Vec<_>>();
+        events.sort_unstable();
+        assert_eq!(events, vec![
+            ("cleanup".into(), "endpoint_shutdown_timeout".into()),
+            ("cleanup".into(), "store_close_failed".into()),
+            ("session".into(), "session_failed".into()),
+            ("stop".into(), "resource_rss_limit".into()),
+        ]);
+        drop(observed);
+        drop(snapshot);
+        node.close().unwrap();
+    }
+
+    #[test]
+    fn expected_stops_are_only_persisted_when_cleanup_fails() {
+        use triblespace::core::{collection::CollectionSnapshotExt, metadata, repo::BlobStoreGet};
+        use triblespace::prelude::*;
+        use triblespace_net::health_record;
+        let dir = tempfile::tempdir().unwrap();
+        let bootstrap = crate::config::Bootstrap::new(dir.path());
+        let signer = init::prepare(&bootstrap).unwrap();
+        let node = Arc::new(Mutex::new(Some(NodeStore::open(&bootstrap.pile, signer.clone()).unwrap())));
+        let status = Arc::new(Mutex::new(Status::default()));
+        for code in [ServiceCode::SettingsChanged, ServiceCode::ApplicationShutdown] {
+            for failed in [false, true] {
+                let attempt = Attempt::new(signer.verifying_key());
+                let cause = StopCause::new(code.description(), code);
+                let cleanup = if failed { Err(anyhow::anyhow!("private path must remain local")) } else { Ok(()) };
+                assert_eq!(session_result(Ok(()), [(CleanupFailure::StoreCloseFailed, cleanup)],
+                    &status, &node, attempt, Some(&cause)).is_err(), failed);
+                with_node(&node, |node| {
+                    let snapshot = node.pile.snapshot()?;
+                    let observed = snapshot.collection_acquiring(node.metrics)?;
+                    let facts: TribleSet = observed.view()?;
+                    let mut codes = find!(value: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+                        pattern!(&facts, [{ metadata::tag: crate::node_metrics::KIND_SERVICE_EVENT,
+                            health_record::attrs::session: attempt.id, metadata::name: ?value }]))
+                        .map(|value| {
+                            let text: View<str> = snapshot.get(value).unwrap();
+                            text.to_string()
+                        }).collect::<Vec<_>>();
+                    codes.sort_unstable();
+                    let mut expected = if failed { vec![code.as_str().to_string(), "store_close_failed".into()] } else { vec![] };
+                    expected.sort_unstable();
+                    assert_eq!(codes, expected);
+                    Ok(())
+                }).unwrap();
+            }
+        }
+        node.lock().unwrap().take().unwrap().close().unwrap();
+    }
+
+    #[test]
+    fn telemetry_write_failure_is_independent_visible_and_not_recursive() {
+        let status = Arc::new(Mutex::new(Status::default()));
+        let closed = Arc::new(Mutex::new(None));
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[89; 32]);
+        Attempt::new(signer.verifying_key()).event(&closed, &status,
+            ServicePhase::Startup, ServiceCode::StartupFailed);
+        // This is the exact successful-counter update; it must not claim that
+        // the failed service event was saved or silently retry it.
+        update(&status, |s| s.metrics_problem = None);
+        let status = status.lock().unwrap();
+        assert_eq!(status.attention_label(), Some("Attention needed"));
+        assert!(status.service_events_problem.as_ref().unwrap().contains("node store is closed"));
+        assert!(status.summary().contains("service diagnostics could not be saved"));
+        assert!(status.node.problem.is_none());
+    }
+
+    #[test]
+    fn early_startup_failure_is_persisted_before_any_session_is_ready() {
+        use triblespace::core::{collection::CollectionSnapshotExt, metadata, repo::BlobStoreGet};
+        use triblespace::prelude::*;
+        use triblespace_net::{health_record, telemetry};
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path().join("data"));
+        std::fs::create_dir(&layout.dir).unwrap();
+        let signer = init::prepare(&layout.bootstrap()).unwrap();
+        let mut node = NodeStore::open(&layout.default_pile(), signer.clone()).unwrap();
+        let view = node.config().unwrap();
+        node.put_settings(&view, &NodeSettings { mcp_port: 0,
+            sync_enabled: true, maintenance_enabled: false, peers: vec![] }).unwrap();
+        node.close().unwrap();
+        let identity = std::env::temp_dir().join(format!("erlkonig-endpoint-{}.lock", hex::encode(signer.verifying_key().as_bytes())));
+        let competing = lease(&identity).unwrap();
+        let mut app = Runtime::start_with_guard(&layout, Arc::new(|| Ok(()))).unwrap();
+        let stopped = wait_for(&app, |s| s.node.services == ServiceState::Stopped);
+        assert_eq!(stopped.node.sessions_started, 0);
+        assert!(stopped.node.problem.is_some());
+        let attempt = with_node(&app.node, |node| {
+            let snapshot = node.pile.snapshot()?;
+            let observed = snapshot.collection_acquiring(node.metrics)?;
+            let facts: TribleSet = observed.view()?;
+            let mut events = find!((attempt: Id, code: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
+                pattern!(&facts, [
+                    { metadata::tag: crate::node_metrics::KIND_SERVICE_EVENT,
+                        health_record::attrs::session: ?attempt,
+                        metadata::name: ?code, telemetry::attrs::subject: _?subject },
+                    { _?subject @ telemetry::attrs::stage: "startup" },
+                ]))
+                .map(|(attempt, code)| {
+                    let text: View<str> = snapshot.get(code).unwrap();
+                    (attempt, text.to_string())
+                }).collect::<Vec<_>>();
+            assert_eq!(events.len(), 1);
+            let (attempt, code) = events.pop().unwrap();
+            assert_eq!(code, "startup_failed");
+            Ok(attempt)
+        }).unwrap();
+        drop(competing);
+        app.retry_services().unwrap();
+        wait_for(&app, |s| s.node.services == ServiceState::Running);
+        app.finish().unwrap();
+        // A fresh successful attempt has its own session identity; it cannot
+        // overwrite or be mistaken for the preceding startup failure.
+        let mut node = NodeStore::open(&layout.default_pile(), signer).unwrap();
+        let reports = node.metrics(crate::node_metrics::now_tai_ns().unwrap(), Duration::from_secs(60)).unwrap();
+        assert!(reports.iter().any(|report| report.report.session != attempt));
+        node.close().unwrap();
     }
 
     #[test]
@@ -1245,7 +1484,7 @@ mod tests {
             let reason = crate::resource_guard::check(48 * 1024 * 1024 * 1024, 100)
                 .unwrap_err()
                 .to_string();
-            cancel.send_replace(Some(reason.clone()));
+            cancel.send_replace(Some(StopCause::new(&reason, ServiceCode::ResourceRssLimit)));
             update(&status, |s| s.node.stop_reason = Some(reason.clone()));
             node_session(
                 &binding,
@@ -1257,6 +1496,8 @@ mod tests {
                 &status,
                 &activity,
                 &metrics,
+                Attempt::new(signer.verifying_key()),
+                &mut false,
             )
             .unwrap();
 

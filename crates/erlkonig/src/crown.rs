@@ -2,7 +2,9 @@
 //!
 //! The canonical website's Gabor/Morlet crown fixes the outer geometry and
 //! reference band. Rest and motion share a softer, smooth-centred inner wave;
-//! walls, tips and base stay put. No clock, timer, worker or network lives here.
+//! walls, tips and base stay put. Attention adds steady, sharper inner crests,
+//! independently of work or Reduce Motion. No clock, timer, worker or network
+//! lives here.
 //!
 //! The caller owns a monotonic origin and samples actual app-owned work, not
 //! enabled services or payload throughput. Retain `began_at` throughout a burst
@@ -21,9 +23,11 @@ const ATTACK: f64 = 0.160;
 const WAVE_STEPS: usize = 140;
 const SCALE: f64 = 0.060; // 400 canonical units → 24 points, with 1 pt side padding
 const WAVE_PERIOD: Duration = Duration::from_millis(3600);
-// One gain against the ORIGINAL canonical band, for both rest and motion.
+// Normal rest and motion share one gain against the ORIGINAL canonical band.
 const RIPPLE_AMPLITUDE: f64 = 0.75;
 const CENTRE_RADIUS: f64 = 0.2;
+const ATTENTION_AMPLITUDE: f64 = 0.95;
+const ATTENTION_STATIC_WEIGHT: f64 = 0.70;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkActivity {
@@ -68,7 +72,7 @@ pub struct Frame {
     /// Coordinates are top-down, as on the canonical website.
     pub points: Vec<Point>,
     /// True during attack/work/landing; false means no further frames are needed
-    /// until owned work or the reduced-motion preference changes.
+    /// until owned work, attention or the reduced-motion preference changes.
     pub animating: bool,
 }
 
@@ -137,6 +141,12 @@ fn radial_carrier(radius: f64, phase: f64) -> f64 {
     (TAU * radial_phase(radius) - phase).cos()
 }
 
+// A bounded triangular wave gives the same crown a few crisp bristles, not a
+// warning glyph. Its phase never advances: attention itself is not activity.
+fn attention_carrier(radius: f64) -> f64 {
+    1.0 - 4.0 * (radius - radius.round()).abs()
+}
+
 fn canonical_points() -> Vec<Point> {
     let mut catch = 0.75;
     let mut steepest = f64::INFINITY;
@@ -164,11 +174,17 @@ fn canonical_points() -> Vec<Point> {
     points
 }
 
-/// Pure monotonic time + observed activity → vector frame.
+/// Pure monotonic time + observed activity + attention → vector frame.
 ///
-/// Rest is the same softened wave at phase zero. Reduced motion, idle, invalid
-/// and fully settled inputs all produce bit-identical resting points.
-pub fn frame(now: Duration, activity: Option<WorkActivity>, reduced_motion: bool) -> Frame {
+/// Normal rest is the same softened wave at phase zero. Attention changes only
+/// the shape, never the activity envelope. For either shape, reduced motion,
+/// idle, invalid and fully settled inputs produce bit-identical resting points.
+pub fn frame(
+    now: Duration,
+    activity: Option<WorkActivity>,
+    reduced_motion: bool,
+    needs_attention: bool,
+) -> Frame {
     let (amount, animating) = envelope(now, activity, reduced_motion);
     let mut points = canonical_points();
     let (ceiling, floor) = wave_bounds(&points);
@@ -196,8 +212,20 @@ pub fn frame(now: Duration, activity: Option<WorkActivity>, reduced_motion: bool
         let radius = ((point.x - WIDTH / 2.0) / (225.0 * SCALE * 0.25)).abs();
         let rest = radial_carrier(radius, 0.0);
         let carrier = rest + amount * (radial_carrier(radius, phase) - rest);
+        let (amplitude, carrier) = if needs_attention {
+            // A convex mix keeps the canonical bounds without clipping. The
+            // steady bristles remain readable while actual work can ripple
+            // underneath; neither fault onset nor persistence starts motion.
+            (
+                ATTENTION_AMPLITUDE,
+                ATTENTION_STATIC_WEIGHT * attention_carrier(radius)
+                    + (1.0 - ATTENTION_STATIC_WEIGHT) * carrier,
+            )
+        } else {
+            (RIPPLE_AMPLITUDE, carrier)
+        };
         let target = middle
-            - RIPPLE_AMPLITUDE * half * (-0.32 * radius * radius).exp() * carrier;
+            - amplitude * half * (-0.32 * radius * radius).exp() * carrier;
         // One endpoint/tangent taper, one canonical reference. Neither the
         // softened rest nor motion is scaled twice; no clipping or blur.
         point.y += taper * (target - point.y);
@@ -245,6 +273,15 @@ impl Frame {
 mod tests {
     use super::*;
 
+    // Keep the established normal-crown tests independent of fault inputs.
+    fn frame(now: Duration, activity: Option<WorkActivity>, reduced_motion: bool) -> Frame {
+        super::frame(now, activity, reduced_motion, false)
+    }
+
+    fn attention_frame(now: Duration, activity: Option<WorkActivity>, reduced_motion: bool) -> Frame {
+        super::frame(now, activity, reduced_motion, true)
+    }
+
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
     }
@@ -273,6 +310,114 @@ mod tests {
         for now in [0, 80, 160, 1000, 10_000] {
             assert_eq!(idle, frame(ms(now), burst(0, now), true));
         }
+    }
+
+    #[test]
+    fn normal_shape_remains_the_original_softened_wave_at_every_phase() {
+        let activity = Some(WorkActivity { began_at: ms(0), ended_at: None });
+        for tick in 0..720 {
+            let now = ms(tick * 5);
+            let actual = frame(now, activity, false);
+            let mut original = canonical_points();
+            let (ceiling, floor) = wave_bounds(&original);
+            let middle = (ceiling + floor) * 0.5;
+            let half = (floor - ceiling) * 0.5;
+            let (amount, animating) = envelope(now, activity, false);
+            let phase = TAU * (now.as_nanos() % WAVE_PERIOD.as_nanos()) as f64
+                / WAVE_PERIOD.as_nanos() as f64;
+            for (i, point) in original[2..WAVE_STEPS + 3].iter_mut().enumerate() {
+                let u = i as f64 / WAVE_STEPS as f64;
+                let pinned = 1.0 / WAVE_STEPS as f64;
+                let taper = smooth((u.min(1.0 - u) - pinned) / (0.10 - pinned));
+                let radius = ((point.x - WIDTH / 2.0) / (225.0 * SCALE * 0.25)).abs();
+                let rest = radial_carrier(radius, 0.0);
+                let carrier = rest + amount * (radial_carrier(radius, phase) - rest);
+                let target = middle
+                    - RIPPLE_AMPLITUDE * half * (-0.32 * radius * radius).exp() * carrier;
+                point.y += taper * (target - point.y);
+            }
+            assert_eq!(actual, Frame { points: original, animating });
+        }
+    }
+
+    #[test]
+    fn attention_is_static_without_work_and_survives_reduced_motion() {
+        let idle = frame(ms(0), None, false);
+        let attention = attention_frame(ms(0), None, false);
+        assert_ne!(attention.points, idle.points);
+        assert!(!attention.animating);
+        for now in [ms(0), ms(80), ms(1000), ms(10_000), Duration::MAX] {
+            assert_eq!(attention, attention_frame(now, None, false));
+            assert_eq!(attention, attention_frame(now, None, true));
+            let active = Some(WorkActivity { began_at: ms(0), ended_at: None });
+            assert_eq!(attention, attention_frame(now, active, true));
+        }
+        assert_eq!(attention, attention_frame(ms(3600), burst(0, 1000), false));
+        assert_eq!(attention, attention_frame(Duration::MAX, burst(0, 1000), false));
+        assert_eq!(attention, attention_frame(ms(1000), burst(1001, 1001), false));
+        assert_eq!(attention, attention_frame(ms(1000), burst(900, 800), false));
+    }
+
+    #[test]
+    fn attention_is_noticeably_sharper_but_preserves_the_crown() {
+        let idle = frame(ms(0), None, false);
+        let attention = attention_frame(ms(0), None, false);
+        let centre = 2 + WAVE_STEPS / 2;
+        assert!(idle.points[centre].y - attention.points[centre].y > 0.75);
+        let normal_rise = idle.points[centre + 1].y - idle.points[centre].y;
+        let sharp_rise = attention.points[centre + 1].y - attention.points[centre].y;
+        assert!(sharp_rise > 0.35 && sharp_rise > 10.0 * normal_rise);
+        assert!(idle.points.iter().zip(&attention.points)
+            .filter(|(a, b)| (a.y - b.y).abs() > 0.5).count() > 30);
+        for radius in [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5] {
+            assert!(attention_carrier(radius).abs() <= 1.0);
+        }
+    }
+
+    #[test]
+    fn attention_keeps_finite_bounds_symmetry_and_pinned_endpoints_during_work() {
+        let canonical = canonical_points();
+        let (ceiling, floor) = wave_bounds(&canonical);
+        for tick in 0..1200 {
+            let now = ms(tick * 10);
+            let active = Some(WorkActivity { began_at: ms(0), ended_at: None });
+            let normal = frame(now, active, false);
+            let attention = attention_frame(now, active, false);
+            assert_eq!(attention.animating, normal.animating);
+            assert_eq!(attention.points.first(), attention.points.last());
+            for (i, p) in attention.points.iter().enumerate() {
+                assert!(p.x.is_finite() && p.y.is_finite());
+                assert!((1.0..=25.0).contains(&p.x));
+                assert!((2.0..=15.0).contains(&p.y));
+                assert_eq!(p.x, canonical[i].x);
+                if (2..WAVE_STEPS + 3).contains(&i) {
+                    assert!(p.y >= ceiling - 1e-12 && p.y <= floor + 1e-12);
+                    assert!((p.y - attention.points[WAVE_STEPS + 4 - i].y).abs() < 1e-12);
+                }
+            }
+            for i in [0, 1, 2, 3, 141, 142, 143, 144, 145] {
+                assert_eq!(attention.points[i], canonical[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn actual_work_can_ripple_under_attention_and_lands_on_the_same_static_shape() {
+        let attention = attention_frame(ms(0), None, false);
+        let activity = Some(WorkActivity { began_at: ms(0), ended_at: None });
+        let first = attention_frame(ms(0), activity, false);
+        assert!(first.animating);
+        assert_eq!(first.points, attention.points);
+        assert_ne!(attention_frame(ms(900), activity, false).points, attention.points);
+        assert_ne!(attention_frame(ms(900), activity, false).points,
+            attention_frame(ms(1800), activity, false).points);
+        assert_eq!(attention_frame(ms(3600), activity, false).points, attention.points);
+        let stopped = burst(0, 1000);
+        let almost = attention_frame(ms(3599), stopped, false);
+        assert!(almost.animating);
+        assert!(almost.points.iter().zip(&attention.points)
+            .all(|(a, b)| (a.y - b.y).abs() < 0.02));
+        assert_eq!(attention_frame(ms(3600), stopped, false), attention);
     }
 
     #[test]

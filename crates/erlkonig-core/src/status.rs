@@ -67,9 +67,34 @@ pub struct Status {
     pub config_generation: u64,
     pub config_problem: Option<String>,
     pub metrics_problem: Option<String>,
+    /// Service-event persistence is separate from periodic counter samples.
+    /// A successful sample must not erase a lost failure diagnostic.
+    pub service_events_problem: Option<String>,
 }
 
 impl Status {
+    /// Menu width must never depend on diagnostic text. Normal operation and
+    /// deliberately disabled services do not need a status row at all.
+    pub fn attention_label(&self) -> Option<&'static str> {
+        if self.node.services == ServiceState::Stopped
+            && (self.node.sync_enabled || self.node.maintenance_enabled)
+        {
+            return Some(if self.node.sync_enabled && !self.node.maintenance_enabled {
+                "Sync paused"
+            } else {
+                "Services paused"
+            });
+        }
+        if self.problem.is_some() || self.config_problem.is_some()
+            || self.metrics_problem.is_some() || self.service_events_problem.is_some()
+            || self.node.problem.is_some()
+        {
+            Some("Attention needed")
+        } else {
+            None
+        }
+    }
+
     pub fn summary(&self) -> String {
         let sync = if self.node.services == ServiceState::Stopped {
             "services stopped · Retry services to recover"
@@ -108,6 +133,9 @@ impl Status {
         if let Some(problem) = &self.metrics_problem {
             text.push_str(&format!(" · metrics could not be saved: {problem}"));
         }
+        if let Some(problem) = &self.service_events_problem {
+            text.push_str(&format!(" · service diagnostics could not be saved: {problem}"));
+        }
         text
     }
 }
@@ -115,6 +143,30 @@ impl Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_attention_is_short_and_absent_during_normal_operation() {
+        let mut status = Status::default();
+        for services in [ServiceState::Disabled, ServiceState::Starting, ServiceState::Running] {
+            status.node.services = services;
+            assert_eq!(status.attention_label(), None);
+        }
+        status.node.services = ServiceState::Stopped;
+        assert_eq!(status.attention_label(), None, "disabled is not an error");
+        status.node.sync_enabled = true;
+        status.node.problem = Some("a very long diagnostic that must not be a menu title".into());
+        assert_eq!(status.attention_label(), Some("Sync paused"));
+        status.node.maintenance_enabled = true;
+        assert_eq!(status.attention_label(), Some("Services paused"));
+        status.node.services = ServiceState::Running;
+        assert_eq!(status.attention_label(), Some("Attention needed"));
+        status.node.problem = None;
+        status.metrics_problem = Some("metrics failed".into());
+        assert_eq!(status.attention_label(), Some("Attention needed"));
+        status.metrics_problem = None;
+        status.config_problem = Some("configuration failed".into());
+        assert_eq!(status.attention_label(), Some("Attention needed"));
+    }
 
     #[test]
     fn concurrent_failures_do_not_hide_stopped_service_diagnostics() {

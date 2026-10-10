@@ -96,6 +96,11 @@ the stop reason and whether a session failed. Full errors remain local because
 they can contain paths or capability handles. A queued retry is not a running
 service: inspect again for the outcome. Ordinary workspace edits do not restart
 stopped services, and Quit rejects retries while draining owned work.
+Healthy operation has no status row in the crown menu. An error adds a short
+**Sync paused**, **Services paused** or **Attention needed** action; click it
+for the full local diagnostics. Diagnostic text never becomes the menu title.
+The same attention condition gives the crown a mildly sharper static outline;
+it remains distinct with Reduce Motion, without inventing activity.
 
 Passive operator commands never start transport:
 
@@ -225,6 +230,13 @@ absent counters remain unknown. Measurements are coalesced at a ten-second
 cadence, with observed failures and shutdown flushed sooner. Local-only
 maintenance does not claim a live network listener. Failed metrics
 appends are visible in the menu and are never reported as persisted success.
+Service failures append and flush separate typed events in that existing
+`erlkonig-metrics` collection: initiating cause, startup/session failure and each
+cleanup failure share an attempt ID allocated before startup. Their phase and
+safe code are queryable facts, never reparsed diagnostic text. Successful
+settings changes and Quit are quiet; failed cleanup retains their initiating
+cause. Detailed errors stay local. Failure to persist an event remains visible
+independently of later successful counter writes, without recursive logging.
 
 The crown is static at rest and with macOS Reduce Motion. It moves during
 app-owned reconciliation passes (including waiting for a peer), actual index
