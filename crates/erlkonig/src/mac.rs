@@ -33,7 +33,6 @@ use winit::window::WindowId;
 struct Items {
     status: MenuItem,
     preview: CheckMenuItem,
-    copy_id: MenuItem,
     integrations: Submenu,
     no_clients: MenuItem,
     chatgpt: CheckMenuItem,
@@ -304,9 +303,6 @@ impl App {
             }
         }
         self.update_plugin_items();
-        self.items
-            .copy_id
-            .set_enabled(status.as_ref().is_some_and(|s| s.node_id.is_some()));
         self.items.login.set_checked(matches!(
             unsafe { login().status() },
             SMAppServiceStatus::Enabled | SMAppServiceStatus::RequiresApproval
@@ -343,7 +339,6 @@ impl App {
             &self.items.openai_manual,
             &self.items.cowork,
             &self.items.refresh_plugins,
-            &self.items.copy_id,
             &self.items.quit,
         ] {
             item.set_enabled(false);
@@ -1334,16 +1329,6 @@ impl App {
             .map(|(_, action)| (workspace.id.clone(), action))
         }) {
             self.workspace_action(&entry, action);
-        } else if id == self.items.copy_id.id() {
-            if let Some(id) = self.runtime.as_ref().and_then(|r| r.status().node_id) {
-                let pb = NSPasteboard::generalPasteboard();
-                pb.clearContents();
-                if !unsafe {
-                    pb.setString_forType(&NSString::from_str(&id), NSPasteboardTypeString)
-                } {
-                    self.alert("Copy my ID", "The clipboard could not be updated.", &["OK"]);
-                }
-            }
         } else if id == self.items.chatgpt.id() {
             self.plugin_action(install::Host::OpenAi);
         } else if id == self.items.openai_manual.id() {
@@ -1450,7 +1435,6 @@ pub fn main() {
     let items = Items {
         status: MenuItem::new("Starting…", true, None),
         preview: CheckMenuItem::new("Preview sync animation", true, false, None),
-        copy_id: MenuItem::new("Copy node ID", false, None),
         integrations: Submenu::new("Integrations", true),
         no_clients: MenuItem::new("Checking clients…", false, None),
         chatgpt: CheckMenuItem::new("OpenAI local plugin · checking…", false, false, None),
@@ -1476,7 +1460,6 @@ pub fn main() {
         .expect("advanced menu");
     menu.append_items(&[
         &items.status,
-        &items.copy_id,
         &items.preview,
         &items.workspaces,
         &PredefinedMenuItem::separator(),
