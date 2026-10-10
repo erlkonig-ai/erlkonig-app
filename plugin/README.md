@@ -36,3 +36,10 @@ inventory failure remains visible, disabled, and says “status unavailable,”
 retaining the last observed check. Not detecting any supported client leaves
 a small “No supported clients detected” entry and the refresh action. Detection
 never removes an integration or changes client settings.
+
+Node-scoped `config_*` tools share the same authenticated local endpoint and
+remain available with zero workspaces. They inspect the public identity and
+typed settings, discover local collection choices, and create/edit/remove
+bundles. Ordinary faculties still require an exact workspace on each call.
+Configuration grants no sharing authority and exposes no private key, token
+or arbitrary path editor. The app must be open; this is not remote admin.

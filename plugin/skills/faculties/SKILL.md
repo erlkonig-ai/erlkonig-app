@@ -1,6 +1,6 @@
 ---
 name: faculties
-description: Use the Erlkonig faculties tools to keep durable memory across conversations. Use when the user asks to remember, track or look up goals, decisions, notes, papers, people, files or messages, when they ask what was decided or done before, or when work should outlive this conversation.
+description: Use Erlkonig faculties for durable goals, notes, memories, files and messages, or to configure Erlkonig workspaces and node services through its local integration.
 ---
 
 # Faculties
@@ -11,6 +11,29 @@ is a named bundle of collections for the tools, not another pile or key.
 Collection capabilities determine access. Faculty tool names include
 `compass_add` and `wiki_search`.
 
+## Agent-led setup
+
+For requested setup, call `config_inspect`: it needs no workspace and returns
+the public node ID, typed settings, workspace revisions and an opaque
+observation. These node-scoped tools use the existing authenticated local
+integration while Erlkonig is open, even with zero workspaces.
+
+Use `config_create_workspace` with a friendly label for a fresh private bundle.
+To organize existing data, use `config_list_collections`, then supply explicit
+role/root choices. Explain ambiguous choices in ordinary language; use returned
+IDs yourself. `config_edit_workspace` preserves omitted routes; supplied routes
+replace the entire bundle. `config_remove_workspace` withdraws one exact
+revision without deleting its collections or choosing a concurrent winner.
+`config_set_settings` takes complete typed port, sync, maintenance and public
+peer-ID settings. A port change requires app restart and integration refresh.
+
+Pass the inspected observation on each edit. If stale, inspect again and
+reconsider the intended change; do not blindly replay it. Conflicted settings
+need an explicit complete reconciliation. Configure only what the user asked
+to change. Configuration does not grant collection access, change identity or
+choose a workspace for another call. Never paste secrets into these tools or
+send a public identity to another person without a request to do so.
+
 ## Choose the data workspace
 
 Call `list_workspaces` first. It reads app configuration only and returns
@@ -18,13 +41,14 @@ available workspaces with human labels, opaque revision IDs and configured
 collection routes, plus unavailable entries with reasons. Choose
 the workspace appropriate to the user's request; ask when the destination is
 ambiguous. Do not guess from a label alone. Use the returned identifiers
-yourself; do not ask the person to transcribe hexadecimal IDs. The native
-Workspaces menu is for creating or editing named bundles.
+yourself; do not ask the person to transcribe hexadecimal IDs. Use the Config
+tools above for requested bundle creation or editing.
 
-Pass its exact returned ID as `workspace` on **every faculty tool call**.
+Pass its exact returned ID as `workspace` on **every ordinary faculty call**.
+Only node-scoped Config tools and `list_workspaces` omit that argument.
 There is no default, node-pile fallback or connection-global selection.
 Do not supply arbitrary pile paths, signing-key paths or replacement roots.
-The app resolves and freezes the binding for that call. Normal UI edits
+The app resolves and freezes the binding for that call. Normal Config edits
 supersede the old request ID; re-list after a binding changes or becomes
 unavailable. IDs are opaque selectors, not immutable manifests: native facts
 can change the value resolved under an existing ID on later calls.
@@ -37,8 +61,8 @@ settings or start a second service. Node synchronization includes permitted
 collections independently of the current request's workspace.
 
 If access is missing, explain that the collection owner must invite or grant
-the existing node identity the required read/write capability. The native
-editor does not yet send access requests or import invitations. Do not invent
+the existing node identity the required read/write capability. Config tools
+do not send access requests or import invitations. Do not invent
 that flow, ask for a secret key, or create another identity as a workaround.
 
 Reading workspace A and writing workspace B require separate explicit calls

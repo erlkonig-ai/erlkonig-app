@@ -151,6 +151,24 @@ fn authenticated_native_mcp_quit_and_restart() {
     let workspaces: Value =
         serde_json::from_str(listed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(workspaces["workspaces"], json!([]));
+    // Node administration stays reachable before any workspace exists, on
+    // exactly the same authenticated local transport as ordinary tools.
+    let inspect = json!({"name":"config_inspect","arguments":{}});
+    assert_eq!(client.post(&url).json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":inspect})).send().unwrap().status(),401);
+    assert_eq!(client.post(&url).bearer_auth(&token).header("Origin","https://untrusted.invalid")
+        .json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":inspect})).send().unwrap().status(),403);
+    let inspected: Value = request("tools/call",inspect).json().unwrap();
+    let inspected: Value = serde_json::from_str(inspected["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(inspected["workspaces"],json!([]));
+    assert_eq!(inspected["node_id"],first.node_id.clone().unwrap());
+    assert!(!inspected.to_string().contains(&token));
+    let created: Value = request("tools/call",json!({"name":"config_create_workspace","arguments":{
+        "observation":inspected["observation"],"label":"First through MCP"}})).json().unwrap();
+    let created: Value = serde_json::from_str(created["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let usable: Value = request("tools/call",json!({"name":"compass_list","arguments":{
+        "workspace":created["workspace"]}})).json().unwrap();
+    assert!(usable.get("error").is_none(),"{usable}");
+    assert_ne!(usable["result"]["isError"],true,"{usable}");
     let before = Instant::now();
     app.begin_shutdown();
     while !app.is_finished() && before.elapsed() < Duration::from_secs(5) {

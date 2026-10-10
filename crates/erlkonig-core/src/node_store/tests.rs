@@ -298,6 +298,30 @@ fn missing_text_remains_pending_and_arrival_invalidates_observation() {
 }
 
 #[test]
+fn recovery_endpoint_uses_only_an_agreed_port_not_a_settings_fork() {
+    let (_dir, _path, _signer, mut node) = scratch();
+    assert_eq!(node.config().unwrap().mcp_port().unwrap(),41773);
+    for sync in [true,false] {
+        node.pile.commit(node.config,&node.signer,entity! {
+            config::anchor:attrs::NODE_SETTINGS,attrs::mcp_port:0_u16,
+            attrs::sync_enabled:sync,attrs::maintenance_enabled:false,
+        }).unwrap();
+    }
+    let view = node.config().unwrap();
+    assert!(view.settings().is_err());
+    assert_eq!(view.mcp_port().unwrap(),0);
+    node.pile.commit(node.config,&node.signer,entity! {
+        config::anchor:attrs::NODE_SETTINGS,attrs::mcp_port:12123_u16,
+    }).unwrap();
+    let view = node.config().unwrap();
+    assert!(view.settings().is_err());
+    assert_eq!(view.mcp_port().unwrap(),41773);
+    node.put_settings(&view,&NodeSettings {mcp_port:12123,..NodeSettings::default()}).unwrap();
+    assert_eq!(node.config().unwrap().mcp_port().unwrap(),12123);
+    node.close().unwrap();
+}
+
+#[test]
 fn metrics_use_node_identity_without_invalidating_config() {
     let (_dir, path, signer, mut node) = scratch();
     let before = node.config().unwrap();

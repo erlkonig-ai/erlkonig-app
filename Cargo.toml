@@ -19,6 +19,7 @@ signal-hook = "0.4"
 anyhow = "1"
 getrandom = "0.4"
 hex = "0.4"
+blake3 = "1"
 hifitime = "4.3"
 rayon = "1.12"
 tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros", "io-util"] }

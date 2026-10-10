@@ -6,15 +6,10 @@ use erlkonig_core::{
     install,
     paths::{self, Layout},
     runtime::Runtime,
-    workspace::{self, Discovery, RootChoice, Workspace},
 };
 use objc2::{MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSButton, NSControlStateValueOn,
-    NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScrollView, NSTextField, NSTextView,
-    NSView, NSWorkspace,
-};
-use objc2_foundation::{NSBundle, NSPoint, NSRect, NSSize, NSString, NSURL};
+use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSApplication, NSWorkspace};
+use objc2_foundation::{NSBundle, NSString, NSURL};
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
 use std::path::PathBuf;
 use std::sync::{
@@ -41,20 +36,8 @@ struct Items {
     cowork: MenuItem,
     refresh_plugins: MenuItem,
     login: CheckMenuItem,
-    settings: MenuItem,
-    advanced: Submenu,
-    workspaces: Submenu,
-    add_workspace: MenuItem,
+    pause_sync: MenuItem,
     quit: MenuItem,
-}
-
-struct WorkspaceItems {
-    id: String,
-    usage: MenuItem,
-    edit: MenuItem,
-    details: MenuItem,
-    copy_id: MenuItem,
-    remove: MenuItem,
 }
 
 struct App {
@@ -72,8 +55,6 @@ struct App {
     next_refresh: Instant,
     quitting: Option<Instant>,
     terminate: Arc<AtomicBool>,
-    workspace_items: Vec<WorkspaceItems>,
-    config_generation: u64,
     plugin_states: [Option<Result<install::Inventory, String>>; 2],
     clients: Option<install::ClientAvailability>,
     plugin_task: Option<PluginTask>,
@@ -91,104 +72,6 @@ enum PluginResult {
 struct PluginTask {
     cancel: Arc<AtomicBool>,
     thread: std::thread::JoinHandle<PluginResult>,
-}
-
-fn access_label(root: &RootChoice) -> &'static str {
-    match (root.read, root.write) {
-        (true, true) => "read and write",
-        (true, false) => "read only",
-        (false, true) => "write only",
-        (false, false) => "access needed",
-    }
-}
-
-/// Ordinals distinguish equal display names without pretending the names are
-/// identities. They belong only to this frozen menu/dialog, never to storage.
-fn distinguish_names(names: &[String]) -> Vec<String> {
-    names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| {
-            let total = names.iter().filter(|other| *other == name).count();
-            if total > 1 {
-                let ordinal = names[..=index]
-                    .iter()
-                    .filter(|other| *other == name)
-                    .count();
-                format!("{name} · choice {ordinal} of {total}")
-            } else {
-                name.clone()
-            }
-        })
-        .collect()
-}
-
-fn collection_labels(roots: &[RootChoice]) -> Vec<String> {
-    distinguish_names(
-        &roots
-            .iter()
-            .map(|root| root.name.clone())
-            .collect::<Vec<_>>(),
-    )
-    .into_iter()
-    .zip(roots)
-    .map(|(name, root)| format!("{name} · {}", access_label(root)))
-    .collect()
-}
-
-fn sole_named_choice(roots: &[RootChoice], name: &str) -> Option<usize> {
-    let mut candidates = roots
-        .iter()
-        .enumerate()
-        .filter(|(_, root)| root.name == name && (root.read || root.write));
-    let first = candidates.next()?.0;
-    candidates.next().is_none().then_some(first)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum CollectionSelection {
-    Omit,
-    Choose(usize),
-    PreserveUnavailable,
-}
-
-fn collection_selection(index: isize, available: usize) -> CollectionSelection {
-    match usize::try_from(index).ok() {
-        Some(0) => CollectionSelection::Omit,
-        Some(index) if index <= available => CollectionSelection::Choose(index - 1),
-        _ => CollectionSelection::PreserveUnavailable,
-    }
-}
-
-fn common_role(name: &str) -> bool {
-    matches!(
-        name,
-        "wiki" | "compass" | "files" | "memory-journal" | "relations" | "message"
-    )
-}
-
-fn role_label(name: &str) -> String {
-    match name {
-        "wiki" => "Notes & knowledge".into(),
-        "compass" => "Goals & tasks".into(),
-        "files" => "Files & documents".into(),
-        "memory-journal" => "Journal".into(),
-        "memory-comb" => "Journal context".into(),
-        "relations" => "People & groups".into(),
-        "message" => "Messages".into(),
-        "config" => "Tool settings".into(),
-        "decide" => "Decisions".into(),
-        "secrets" => "Tool credentials".into(),
-        "teams" => "Teams & access".into(),
-        other => {
-            let label = other.replace('-', " ");
-            let mut chars = label.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => label,
-            }
-        }
-    }
 }
 
 fn host_index(host: install::Host) -> usize {
@@ -296,12 +179,16 @@ impl App {
                 .unwrap_or_else(|| "Not running".into())
         });
         self.items.status.set_text(text);
-        if let Some(status) = &status {
-            if status.config_generation != self.config_generation {
-                self.config_generation = status.config_generation;
-                self.rebuild_workspaces();
-            }
-        }
+        self.items
+            .pause_sync
+            .set_enabled(status.as_ref().is_some_and(|s| s.config_problem.is_none()));
+        self.items
+            .pause_sync
+            .set_text(if status.as_ref().is_some_and(|s| s.node.sync_enabled) {
+                "Pause sync"
+            } else {
+                "Resume sync"
+            });
         self.update_plugin_items();
         self.items.login.set_checked(matches!(
             unsafe { login().status() },
@@ -345,8 +232,7 @@ impl App {
         }
         self.items.login.set_enabled(false);
         self.items.preview.set_enabled(false);
-        self.items.advanced.set_enabled(false);
-        self.items.workspaces.set_enabled(false);
+        self.items.pause_sync.set_enabled(false);
         self.items.integrations.set_enabled(false);
         if let Some(runtime) = &self.runtime {
             runtime.begin_shutdown();
@@ -741,557 +627,21 @@ impl App {
         }
     }
 
-    fn settings(&self) {
+    fn toggle_sync(&self) {
         let Some(runtime) = &self.runtime else {
             return;
         };
         let result = (|| {
-            let expected = runtime.config().map_err(|e| format!("{e:#}"))?;
-            let mut settings = expected.settings().map_err(|e| format!("{e:#}"))?;
-            let binding = runtime.binding();
-            #[allow(deprecated)]
-            NSApplication::sharedApplication(self.mtm).activateIgnoringOtherApps(true);
-            let alert = NSAlert::new(self.mtm);
-            alert.setMessageText(&NSString::from_str("Erlkönig Settings"));
-            alert.setInformativeText(&NSString::from_str(
-                "One identity, one local store, every workspace.\n\nSync includes all collections this identity is permitted to share. Local maintenance keeps supported attached collections ready. Workspace choices never change your identity, storage or these settings."
-            ));
-            alert.addButtonWithTitle(&NSString::from_str("Save"));
-            alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-            let view = NSView::initWithFrame(
-                NSView::alloc(self.mtm),
-                NSRect::new(NSPoint::ZERO, NSSize::new(640.0, 236.0)),
-            );
-            for (y, label, value) in [
-                (210.0, "Local store", binding.pile.display().to_string()),
-                (
-                    158.0,
-                    "Identity key — configured once",
-                    binding.key.display().to_string(),
-                ),
-            ] {
-                let title = NSTextField::labelWithString(&NSString::from_str(label), self.mtm);
-                title.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(640.0, 20.0)));
-                view.addSubview(&title);
-                let field = NSTextField::textFieldWithString(&NSString::from_str(&value), self.mtm);
-                field.setEditable(false);
-                field.setFrame(NSRect::new(
-                    NSPoint::new(0.0, y - 27.0),
-                    NSSize::new(640.0, 24.0),
-                ));
-                view.addSubview(&field);
-            }
-            // No target/action: these controls edit only this unsaved dialog.
-            let sync = unsafe {
-                NSButton::checkboxWithTitle_target_action(
-                    &NSString::from_str("Sync all permitted collections"),
-                    None,
-                    None,
-                    self.mtm,
-                )
-            };
-            sync.setState(if settings.sync_enabled {
-                NSControlStateValueOn
-            } else {
-                0
-            });
-            sync.setFrame(NSRect::new(
-                NSPoint::new(0.0, 80.0),
-                NSSize::new(640.0, 24.0),
-            ));
-            view.addSubview(&sync);
-            let maintenance = unsafe {
-                NSButton::checkboxWithTitle_target_action(
-                    &NSString::from_str("Maintain supported attached collections"),
-                    None,
-                    None,
-                    self.mtm,
-                )
-            };
-            maintenance.setState(if settings.maintenance_enabled {
-                NSControlStateValueOn
-            } else {
-                0
-            });
-            maintenance.setFrame(NSRect::new(
-                NSPoint::new(0.0, 46.0),
-                NSSize::new(640.0, 24.0),
-            ));
-            view.addSubview(&maintenance);
-            let note = NSTextField::labelWithString(
-                &NSString::from_str(
-                    "Identity and storage stay fixed for this app session. No keys are copied.",
-                ),
-                self.mtm,
-            );
-            note.setFrame(NSRect::new(NSPoint::ZERO, NSSize::new(640.0, 22.0)));
-            view.addSubview(&note);
-            alert.setAccessoryView(Some(&view));
-            if alert.runModal() != NSAlertFirstButtonReturn {
-                return Ok(());
-            }
-            settings.sync_enabled = sync.state() == NSControlStateValueOn;
-            settings.maintenance_enabled = maintenance.state() == NSControlStateValueOn;
+            let expected = runtime.config().map_err(|error| error.to_string())?;
+            let mut settings = expected.settings().map_err(|error| error.to_string())?;
+            settings.sync_enabled = !settings.sync_enabled;
             runtime
                 .put_settings(&expected, &settings)
-                .map_err(|e| format!("{e:#}"))
-        })();
-        if let Err(error) = result {
-            self.alert("Settings not saved", &error, &["OK"]);
-        }
-    }
-
-    fn rebuild_workspaces(&mut self) {
-        while self.items.workspaces.remove_at(0).is_some() {}
-        self.workspace_items.clear();
-        let _ = self.items.workspaces.append(&self.items.add_workspace);
-        let _ = self.items.workspaces.append(&MenuItem::new(
-            "Named collection bundles · one shared local store",
-            false,
-            None,
-        ));
-        let _ = self
-            .items
-            .workspaces
-            .append(&PredefinedMenuItem::separator());
-        let result = (|| {
-            let runtime = self.runtime.as_ref().ok_or("Not running".to_owned())?;
-            let config = runtime.config().map_err(|e| format!("{e:#}"))?;
-            let ids = config.workspace_ids().map_err(|e| format!("{e:#}"))?;
-            let entries = ids
-                .into_iter()
-                .map(|id| {
-                    let (label, editable) = match config.workspace_revision(id) {
-                        Ok(Some(workspace)) => (workspace.label, true),
-                        _ => ("Unavailable workspace".to_owned(), false),
-                    };
-                    (id, label, editable)
-                })
-                .collect::<Vec<_>>();
-            let labels = distinguish_names(
-                &entries
-                    .iter()
-                    .map(|(_, label, _)| label.clone())
-                    .collect::<Vec<_>>(),
-            );
-            for ((id, _, editable), label) in entries.into_iter().zip(labels) {
-                let submenu = Submenu::new(label, true);
-                let items = WorkspaceItems {
-                    id: format!("{id:X}"),
-                    usage: MenuItem::new("Use with your assistant…", editable, None),
-                    edit: MenuItem::new("Edit collections…", editable, None),
-                    details: MenuItem::new("Details and diagnostics…", true, None),
-                    copy_id: MenuItem::new("Copy tool request ID (advanced)", true, None),
-                    remove: MenuItem::new("Remove workspace…", true, None),
-                };
-                let _ = submenu.append_items(&[
-                    &items.usage,
-                    &items.edit,
-                    &items.details,
-                    &items.copy_id,
-                    &items.remove,
-                ]);
-                let _ = self.items.workspaces.append(&submenu);
-                self.workspace_items.push(items);
-            }
-            if self.workspace_items.is_empty() {
-                let _ = self.items.workspaces.append(&MenuItem::new(
-                    "Create a workspace to choose collections for your tools",
-                    false,
-                    None,
-                ));
-            }
+                .map_err(|error| error.to_string())?;
             Ok::<(), String>(())
         })();
         if let Err(error) = result {
-            let _ = self.items.workspaces.append(&MenuItem::new(
-                format!("Unavailable: {error}"),
-                false,
-                None,
-            ));
-        }
-    }
-
-    fn access_help(&self) {
-        self.alert(
-            "Need access to a collection?",
-            "Ask the collection owner for an invitation or access for this Mac's existing identity. Read and write access are separate permissions.\n\nErlkönig does not yet import invitations or send access requests from this dialog. Have the owner or your administrator arrange access and make the collection available locally, then reopen the editor. Do not create another identity or paste a secret key into chat.",
-            &["OK"],
-        );
-    }
-
-    fn collection_diagnostics(&self, roots: &[RootChoice], unavailable: &[String]) {
-        let labels = collection_labels(roots);
-        let mut text = roots
-            .iter()
-            .zip(labels)
-            .map(|(root, label)| {
-                format!(
-                    "{label}\nCollection: blake3:{}",
-                    hex::encode(root.handle.raw)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        if !unavailable.is_empty() {
-            text.push_str("\n\nUnavailable locally:\n");
-            text.push_str(&unavailable.join("\n"));
-        }
-        if text.is_empty() {
-            text = "No named collections are available locally yet.".into();
-        }
-        self.diagnostics("Collection diagnostics", "Read-only collection details. These identifiers are for troubleshooting; normal workspace setup never requires typing them.", &text);
-    }
-
-    fn diagnostics(&self, title: &str, explanation: &str, text: &str) {
-        let alert = NSAlert::new(self.mtm);
-        alert.setMessageText(&NSString::from_str(title));
-        alert.setInformativeText(&NSString::from_str(explanation));
-        alert.addButtonWithTitle(&NSString::from_str("OK"));
-        let scroll = NSScrollView::initWithFrame(
-            NSScrollView::alloc(self.mtm),
-            NSRect::new(NSPoint::ZERO, NSSize::new(680.0, 360.0)),
-        );
-        scroll.setHasVerticalScroller(true);
-        scroll.setAutohidesScrollers(true);
-        let content = NSTextView::initWithFrame(
-            NSTextView::alloc(self.mtm),
-            NSRect::new(NSPoint::ZERO, NSSize::new(656.0, 360.0)),
-        );
-        content.setEditable(false);
-        content.setSelectable(true);
-        content.setHorizontallyResizable(false);
-        content.setVerticallyResizable(true);
-        content.setMinSize(NSSize::new(656.0, 360.0));
-        content.setMaxSize(NSSize::new(656.0, f64::MAX));
-        content.setString(&NSString::from_str(text));
-        content.sizeToFit();
-        scroll.setDocumentView(Some(&content));
-        alert.setAccessoryView(Some(&scroll));
-        alert.runModal();
-    }
-
-    fn add_workspace(&self) {
-        let Some(runtime) = &self.runtime else {
-            return;
-        };
-        let result = (|| {
-            let expected = runtime.config().map_err(|e| format!("{e:#}"))?;
-            #[allow(deprecated)]
-            NSApplication::sharedApplication(self.mtm).activateIgnoringOtherApps(true);
-            let mut label = String::new();
-            let use_existing = loop {
-                let alert = NSAlert::new(self.mtm);
-                alert.setMessageText(&NSString::from_str("New workspace"));
-                alert.setInformativeText(&NSString::from_str(
-                    "Give your workspace a name. Create makes a private bundle for notes, goals, files, your journal and the other tools — ready to use.\n\nIt uses this Mac's existing identity and local store. Nothing is saved until Create. To organize collections you already have, choose Use existing collections instead."
-                ));
-                for title in ["Create", "Cancel", "Use existing collections…"] {
-                    alert.addButtonWithTitle(&NSString::from_str(title));
-                }
-                let name = NSTextField::textFieldWithString(&NSString::from_str(&label), self.mtm);
-                name.setPlaceholderString(Some(&NSString::from_str(
-                    "For example: Personal, Research, or Team",
-                )));
-                name.setFrame(NSRect::new(NSPoint::ZERO, NSSize::new(560.0, 28.0)));
-                alert.setAccessoryView(Some(&name));
-                let action = alert.runModal() - NSAlertFirstButtonReturn;
-                if action == 1 || !(0..=2).contains(&action) {
-                    return Ok(());
-                }
-                label = name.stringValue().to_string().trim().to_owned();
-                if action == 2 {
-                    break true;
-                }
-                if label.is_empty() {
-                    self.alert(
-                        "Name required",
-                        "Give this workspace a name before creating it.",
-                        &["OK"],
-                    );
-                    continue;
-                }
-                runtime
-                    .create_workspace(&expected, &label)
-                    .map_err(|e| format!("{e:#}"))?;
-                break false;
-            };
-            if !use_existing {
-                return Ok(());
-            }
-            let discovery = Discovery::open(runtime.binding()).map_err(|e| format!("{e:#}"))?;
-            let mut workspace = Workspace::new(label);
-            let (roots, _) = discovery.roots().map_err(|e| format!("{e:#}"))?;
-            for (role, name) in workspace::roles() {
-                if let Some(index) = sole_named_choice(&roots, name) {
-                    workspace.routes.insert(role, roots[index].handle);
-                }
-            }
-            if self.edit_workspace(&mut workspace, &discovery)? {
-                runtime
-                    .put_workspace(&expected, &workspace)
-                    .map_err(|e| format!("{e:#}"))?;
-            }
-            Ok::<(), String>(())
-        })();
-        if let Err(error) = result {
-            self.alert("Workspace not saved", &error, &["OK"]);
-        }
-    }
-
-    /// Popup indices refer to the exact objects captured by this dialog.
-    /// A label is presentation only; neither its text nor its position is saved.
-    fn edit_workspace(
-        &self,
-        workspace: &mut Workspace,
-        discovery: &Discovery,
-    ) -> Result<bool, String> {
-        #[allow(deprecated)]
-        NSApplication::sharedApplication(self.mtm).activateIgnoringOtherApps(true);
-        let (mut roots, unavailable) = discovery.roots().map_err(|e| format!("{e:#}"))?;
-        // Retain already selected descriptor-only collections without requiring
-        // a person to paste their handles. An unavailable selection is preserved
-        // visibly below, never changed to "Not included" by opening the editor.
-        for handle in workspace.routes.values() {
-            if !roots.iter().any(|root| root.handle == *handle) {
-                if let Ok(root) = discovery.probe(*handle) {
-                    roots.push(root);
-                }
-            }
-        }
-        roots.sort_by(|a, b| a.name.cmp(&b.name).then(a.handle.cmp(&b.handle)));
-        let labels = collection_labels(&roots);
-        let roles = workspace::roles();
-        let mut draft = workspace.clone();
-        let mut advanced = false;
-        loop {
-            let visible_roles = roles
-                .iter()
-                .filter(|(_, name)| advanced || common_role(name))
-                .collect::<Vec<_>>();
-            let alert = NSAlert::new(self.mtm);
-            alert.setMessageText(&NSString::from_str("Workspace"));
-            let additional = roles
-                .iter()
-                .filter(|(role, name)| !common_role(name) && draft.routes.contains_key(role))
-                .count();
-            alert.setInformativeText(&NSString::from_str(&format!(
-                "A workspace brings together collections for your assistant. Review the choices below; unused areas can stay Not included. All workspaces share this Mac's identity and local store.\n\n{} tool areas included; {} additional areas are under More collection settings. Nothing changes until Save. Numbered choices are different collections — ask the owner if you cannot identify one.",
-                draft.routes.len(), additional,
-            )));
-            for title in [
-                "Save",
-                "Cancel",
-                if advanced {
-                    "Collection diagnostics…"
-                } else {
-                    "More collection settings…"
-                },
-                "Need access?",
-            ] {
-                alert.addButtonWithTitle(&NSString::from_str(title));
-            }
-            let view = NSView::initWithFrame(
-                NSView::alloc(self.mtm),
-                NSRect::new(NSPoint::ZERO, NSSize::new(680.0, 436.0)),
-            );
-            let name_label =
-                NSTextField::labelWithString(&NSString::from_str("Workspace name"), self.mtm);
-            name_label.setFrame(NSRect::new(
-                NSPoint::new(0.0, 410.0),
-                NSSize::new(680.0, 20.0),
-            ));
-            view.addSubview(&name_label);
-            let name =
-                NSTextField::textFieldWithString(&NSString::from_str(&draft.label), self.mtm);
-            name.setPlaceholderString(Some(&NSString::from_str(
-                "For example: Personal, Research, or Team",
-            )));
-            name.setFrame(NSRect::new(
-                NSPoint::new(0.0, 380.0),
-                NSSize::new(680.0, 26.0),
-            ));
-            view.addSubview(&name);
-            let height = visible_roles.len() as f64 * 38.0;
-            let document = NSView::initWithFrame(
-                NSView::alloc(self.mtm),
-                NSRect::new(NSPoint::ZERO, NSSize::new(656.0, height)),
-            );
-            let mut popups = Vec::new();
-            for (i, (role, role_name)) in visible_roles.iter().copied().enumerate() {
-                let y = height - (i + 1) as f64 * 38.0;
-                let label = NSTextField::labelWithString(
-                    &NSString::from_str(&role_label(role_name)),
-                    self.mtm,
-                );
-                label.setFrame(NSRect::new(
-                    NSPoint::new(0.0, y + 5.0),
-                    NSSize::new(210.0, 24.0),
-                ));
-                document.addSubview(&label);
-                let popup = NSPopUpButton::initWithFrame_pullsDown(
-                    NSPopUpButton::alloc(self.mtm),
-                    NSRect::new(NSPoint::new(214.0, y), NSSize::new(438.0, 32.0)),
-                    false,
-                );
-                popup.addItemWithTitle(&NSString::from_str("Not included"));
-                for label in &labels {
-                    popup.addItemWithTitle(&NSString::from_str(label));
-                }
-                let current = draft.routes.get(role);
-                let selected =
-                    current.and_then(|handle| roots.iter().position(|root| root.handle == *handle));
-                let index = if let Some(index) = selected {
-                    index + 1
-                } else if current.is_some() {
-                    popup.addItemWithTitle(&NSString::from_str(
-                        "Previously selected collection · unavailable",
-                    ));
-                    roots.len() + 1
-                } else {
-                    0
-                };
-                popup.selectItemAtIndex(index as isize);
-                document.addSubview(&popup);
-                popups.push(popup);
-            }
-            let scroll = NSScrollView::initWithFrame(
-                NSScrollView::alloc(self.mtm),
-                NSRect::new(NSPoint::new(0.0, 8.0), NSSize::new(680.0, 358.0)),
-            );
-            scroll.setHasVerticalScroller(true);
-            scroll.setAutohidesScrollers(true);
-            scroll.setDocumentView(Some(&document));
-            // NSView's coordinates run upward: begin at the first tool area.
-            document.scrollPoint(NSPoint::new(0.0, (height - 358.0).max(0.0)));
-            view.addSubview(&scroll);
-            alert.setAccessoryView(Some(&view));
-            let action = alert.runModal() - NSAlertFirstButtonReturn;
-            if action == 1 || !(0..=3).contains(&action) {
-                return Ok(false);
-            }
-            draft.label = name.stringValue().to_string();
-            for ((role, _), popup) in visible_roles.into_iter().zip(popups) {
-                match collection_selection(popup.indexOfSelectedItem(), roots.len()) {
-                    CollectionSelection::Omit => {
-                        draft.routes.remove(role);
-                    }
-                    CollectionSelection::Choose(index) => {
-                        draft.routes.insert(*role, roots[index].handle);
-                    }
-                    CollectionSelection::PreserveUnavailable => {}
-                }
-            }
-            match action {
-                2 => {
-                    if advanced {
-                        self.collection_diagnostics(&roots, &unavailable);
-                    } else {
-                        advanced = true;
-                    }
-                    continue;
-                }
-                3 => {
-                    self.access_help();
-                    continue;
-                }
-                _ => {}
-            }
-            draft.label = draft.label.trim().to_owned();
-            if draft.label.is_empty() || draft.routes.is_empty() {
-                self.alert("Workspace not ready", "Give the workspace a name and choose at least one collection. Unused tool areas can stay Not included.", &["OK"]);
-                continue;
-            }
-            if let Some(error) = draft.routes.iter().find_map(|(role, handle)| {
-                discovery
-                    .select(*role, *handle)
-                    .err()
-                    .map(|e| format!("{e:#}"))
-            }) {
-                self.alert("Collection unavailable", &format!("{error}\n\nYour changes have not been saved. Choose another collection or use Need access? for help."), &["OK"]);
-                continue;
-            }
-            *workspace = draft;
-            return Ok(true);
-        }
-    }
-
-    fn workspace_action(&self, selected: &str, action: &str) {
-        let Some(runtime) = &self.runtime else {
-            return;
-        };
-        let result = (|| {
-            let expected = runtime.config().map_err(|e| format!("{e:#}"))?;
-            let id = expected
-                .workspace_ids()
-                .map_err(|e| format!("{e:#}"))?
-                .into_iter()
-                .find(|id| format!("{id:X}") == selected)
-                .ok_or("This workspace has changed. Reopen the Workspaces menu.")?;
-            if action == "copy" {
-                let pasteboard = NSPasteboard::generalPasteboard();
-                pasteboard.clearContents();
-                if !unsafe {
-                    pasteboard
-                        .setString_forType(&NSString::from_str(selected), NSPasteboardTypeString)
-                } {
-                    return Err("The clipboard could not be updated.".into());
-                }
-                return Ok(());
-            }
-            if action == "remove" {
-                if self.alert("Remove workspace?", "This removes the named bundle from your tools. Its collections and data remain in the shared local store, and sync and maintenance settings are unchanged.", &["Remove", "Cancel"]) == 0 {
-                    runtime.remove_workspace_revision(&expected, id).map_err(|e| format!("{e:#}"))?;
-                }
-                return Ok(());
-            }
-            let mut workspace = expected
-                .workspace_revision(id)
-                .map_err(|e| format!("{e:#}"))?
-                .ok_or("This workspace is no longer available.")?;
-            if action == "usage" {
-                self.alert("Use this workspace", &format!("Tell your assistant: Use the {} workspace.\n\nThe assistant lists available workspaces and selects this bundle on each tool request. You do not need to type or copy its internal ID. If names are ambiguous, it should ask which collection bundle you mean.\n\nThis does not switch other conversations or clients to this workspace.", workspace.label), &["OK"]);
-                return Ok(());
-            }
-            let discovery = Discovery::open(runtime.binding()).map_err(|e| format!("{e:#}"))?;
-            match action {
-                "details" => {
-                    let roles = workspace::roles();
-                    let routes = workspace
-                        .routes
-                        .iter()
-                        .map(|(role, root)| {
-                            let role = roles
-                                .iter()
-                                .find(|(id, _)| id == role)
-                                .map(|(_, name)| role_label(name))
-                                .unwrap_or_else(|| "Unknown tool area".into());
-                            let name = discovery
-                                .probe(*root)
-                                .map(|root| format!("{} · {}", root.name, access_label(&root)))
-                                .unwrap_or_else(|_| "Unavailable locally".into());
-                            format!(
-                                "{role}: {name}\nCollection: blake3:{}",
-                                hex::encode(root.raw)
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    self.diagnostics(&format!("{} — details", workspace.label), "Tell your assistant which workspace to use; it selects the bundle separately on every request. There is no global switch affecting other clients. All workspaces use this Mac's one identity and store.", &format!("Tool request ID (advanced): {id:X}\n\n{routes}"));
-                }
-                "edit" => {
-                    if self.edit_workspace(&mut workspace, &discovery)? {
-                        runtime
-                            .put_workspace(&expected, &workspace)
-                            .map_err(|e| format!("{e:#}"))?;
-                    }
-                }
-                _ => {}
-            }
-            Ok::<(), String>(())
-        })();
-        if let Err(error) = result {
-            self.alert("Workspace unavailable", &error, &["OK"]);
+            self.alert("Sync setting unchanged", &error, &["OK"]);
         }
     }
 
@@ -1312,23 +662,8 @@ impl App {
                     &["OK"],
                 );
             }
-        } else if id == self.items.settings.id() {
-            self.settings();
-        } else if id == self.items.add_workspace.id() {
-            self.add_workspace();
-        } else if let Some((entry, action)) = self.workspace_items.iter().find_map(|workspace| {
-            [
-                (workspace.usage.id(), "usage"),
-                (workspace.edit.id(), "edit"),
-                (workspace.details.id(), "details"),
-                (workspace.copy_id.id(), "copy"),
-                (workspace.remove.id(), "remove"),
-            ]
-            .into_iter()
-            .find(|(item, _)| id == *item)
-            .map(|(_, action)| (workspace.id.clone(), action))
-        }) {
-            self.workspace_action(&entry, action);
+        } else if id == self.items.pause_sync.id() {
+            self.toggle_sync();
         } else if id == self.items.chatgpt.id() {
             self.plugin_action(install::Host::OpenAi);
         } else if id == self.items.openai_manual.id() {
@@ -1443,10 +778,7 @@ pub fn main() {
         cowork: MenuItem::new("Manage Cowork plugin…", false, None),
         refresh_plugins: MenuItem::new("Refresh plugin status…", false, None),
         login: CheckMenuItem::new("Open at login", true, false, None),
-        settings: MenuItem::new("Identity, storage and services…", true, None),
-        advanced: Submenu::new("Advanced", true),
-        workspaces: Submenu::new("Workspaces", true),
-        add_workspace: MenuItem::new("New workspace…", true, None),
+        pause_sync: MenuItem::new("Pause sync", false, None),
         quit: MenuItem::new("Quit Erlkönig", true, None),
     };
     items
@@ -1454,17 +786,12 @@ pub fn main() {
         .append_items(&[&items.no_clients, &items.refresh_plugins])
         .expect("integrations menu");
     let menu = Menu::new();
-    items
-        .advanced
-        .append_items(&[&items.settings])
-        .expect("advanced menu");
     menu.append_items(&[
         &items.status,
         &items.preview,
-        &items.workspaces,
+        &items.pause_sync,
         &PredefinedMenuItem::separator(),
         &items.integrations,
-        &items.advanced,
         &PredefinedMenuItem::separator(),
         &items.login,
         &items.quit,
@@ -1472,7 +799,8 @@ pub fn main() {
     .expect("menu");
     let mut app = App {
         mtm,
-        layout: Layout::application(paths::default_data_dir().expect("data directory")).expect("node bootstrap location"),
+        layout: Layout::application(paths::default_data_dir().expect("data directory"))
+            .expect("node bootstrap location"),
         runtime: None,
         problem: None,
         items,
@@ -1485,8 +813,6 @@ pub fn main() {
         next_refresh: Instant::now(),
         quitting: None,
         terminate,
-        workspace_items: Vec::new(),
-        config_generation: u64::MAX,
         plugin_states: [None, None],
         clients: None,
         plugin_task: None,
@@ -1496,74 +822,4 @@ pub fn main() {
     }
     // Idempotent fallback for event-loop construction/execution errors.
     app.finish_termination();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn root(byte: u8, name: &str, read: bool, write: bool) -> RootChoice {
-        RootChoice {
-            handle: erlkonig_core::config::parse_handle(&hex::encode([byte; 32])).unwrap(),
-            name: name.into(),
-            read,
-            write,
-        }
-    }
-
-    #[test]
-    fn defaults_only_choose_a_sole_eligible_named_collection() {
-        let roots = vec![root(1, "wiki", true, true), root(2, "wiki", true, false)];
-        assert_eq!(sole_named_choice(&roots, "wiki"), None);
-        assert_eq!(sole_named_choice(&roots, "files"), None);
-        let roots = vec![root(1, "wiki", false, false), root(2, "wiki", true, false)];
-        assert_eq!(sole_named_choice(&roots, "wiki"), Some(1));
-        assert_eq!(sole_named_choice(&roots[..1], "wiki"), None);
-    }
-
-    #[test]
-    fn same_name_choices_stay_distinct_without_exposing_handles() {
-        let roots = vec![
-            root(1, "Notes", true, true),
-            root(2, "Notes", true, true),
-            root(3, "Files", true, false),
-        ];
-        let labels = collection_labels(&roots);
-        assert_ne!(labels[0], labels[1]);
-        assert!(labels[0].contains("choice 1 of 2"));
-        assert!(labels[1].contains("choice 2 of 2"));
-        assert_eq!(labels[2], "Files · read only");
-        for (root, label) in roots.iter().zip(labels) {
-            assert!(!label.contains(&hex::encode(root.handle.raw)));
-        }
-    }
-
-    #[test]
-    fn unavailable_selection_is_never_silently_omitted() {
-        assert_eq!(collection_selection(0, 2), CollectionSelection::Omit);
-        assert_eq!(collection_selection(1, 2), CollectionSelection::Choose(0));
-        assert_eq!(collection_selection(2, 2), CollectionSelection::Choose(1));
-        assert_eq!(
-            collection_selection(3, 2),
-            CollectionSelection::PreserveUnavailable
-        );
-        assert_eq!(
-            collection_selection(-1, 2),
-            CollectionSelection::PreserveUnavailable
-        );
-    }
-
-    #[test]
-    fn read_and_write_permissions_remain_independent() {
-        assert_eq!(
-            access_label(&root(1, "Notes", true, true)),
-            "read and write"
-        );
-        assert_eq!(access_label(&root(1, "Notes", true, false)), "read only");
-        assert_eq!(access_label(&root(1, "Notes", false, true)), "write only");
-        assert_eq!(
-            access_label(&root(1, "Notes", false, false)),
-            "access needed"
-        );
-    }
 }

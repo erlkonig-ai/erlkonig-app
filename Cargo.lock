@@ -1918,6 +1918,7 @@ name = "erlkonig-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "ed25519-dalek 2.2.0",
  "faculties",
  "getrandom 0.4.3",

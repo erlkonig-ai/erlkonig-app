@@ -2,6 +2,7 @@
 
 use crate::{
     config::NodeBinding,
+    config_mcp::ConfigMcp,
     credentials, init,
     node_metrics::Sample,
     node_store::{ConfigView, NodeSettings, NodeStore},
@@ -30,7 +31,7 @@ use triblespace::core::{
 use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
 use triblespace_net::reconcile::ReplicationMode;
 
-type SharedNode = Arc<Mutex<Option<NodeStore>>>;
+pub(crate) type SharedNode = Arc<Mutex<Option<NodeStore>>>;
 
 pub struct Runtime {
     binding: NodeBinding,
@@ -80,7 +81,8 @@ impl Runtime {
             signer: signer.verifying_key().to_bytes(),
         };
         let mut node = NodeStore::open(&binding.pile, signer.clone())?;
-        let port = node.config()?.settings()?.mcp_port;
+        let port = node.config().and_then(|view| view.mcp_port())
+            .unwrap_or_else(|_| NodeSettings::default().mcp_port);
         let token = credentials::load_or_create(&layout.dir.join("mcp.token"))
             .map_err(anyhow::Error::msg)?;
         let mut config = http::Config::new(
@@ -116,15 +118,17 @@ impl Runtime {
         let state = app.status.clone();
         let node = app.node.clone();
         let binding = app.binding.clone();
+        let mcp_url = app.status().mcp_url.context("local MCP address")?;
         app.workers.push(
             thread::Builder::new()
                 .name("erlkonig-faculties".into())
                 .spawn(move || {
                     let result = (|| {
+                        let config = ConfigMcp::new(binding.clone(), node.clone(), mcp_url, port);
                         let dispatch = WorkspaceDispatch::new(binding, move || {
                             with_node(&node, NodeStore::config)
                         })?;
-                        dispatch.finish(endpoint.serve_until(&[&dispatch], stopping(http_stop)))
+                        dispatch.finish(endpoint.serve_until(&[&dispatch, &config], stopping(http_stop)))
                     })();
                     if let Err(error) = &result {
                         update(&state, |s| {
@@ -679,6 +683,73 @@ fn node_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_settings_conflicts_leave_authenticated_recovery_available() {
+        use faculties::schemas::config::config;
+        use triblespace::core::collection::CollectionStoreExt;
+        use triblespace::prelude::*;
+        use crate::node_schema as attrs;
+        use serde_json::{Value, json};
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path().join("data"));
+        std::fs::create_dir(&layout.dir).unwrap();
+        let signer = init::prepare(&layout.bootstrap()).unwrap();
+        let mut node = NodeStore::open(&layout.default_pile(), signer).unwrap();
+        for sync in [true,false] {
+            node.pile.commit(node.config,&node.signer,entity! {
+                config::anchor:attrs::NODE_SETTINGS,attrs::mcp_port:0_u16,
+                attrs::sync_enabled:sync,attrs::maintenance_enabled:false,
+            }).unwrap();
+        }
+        node.close().unwrap();
+        let mut app = Runtime::start(&layout).unwrap();
+        let url = app.status().mcp_url.unwrap();
+        let token = credentials::load(&layout.dir.join("mcp.token")).unwrap();
+        let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+        let response = client.post(&url).bearer_auth(&token)
+            .header("Accept","application/json, text/event-stream")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"recovery-test","version":"1"}}}))
+            .send().unwrap();
+        assert!(response.status().is_success());
+        let session = response.headers()["mcp-session-id"].to_str().unwrap().to_owned();
+        assert!(client.post(&url).bearer_auth(&token)
+            .header("Accept","application/json, text/event-stream")
+            .header("mcp-session-id",&session).header("mcp-protocol-version","2025-06-18")
+            .json(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .send().unwrap().status().is_success());
+        let request = |name: &str, arguments: Value| -> Value {
+            let response: Value = client.post(&url).bearer_auth(&token)
+                .header("Accept","application/json, text/event-stream")
+                .header("mcp-session-id",&session).header("mcp-protocol-version","2025-06-18")
+                .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":arguments}}))
+                .send().unwrap().json().unwrap();
+            assert_ne!(response["result"]["isError"],true,"{response}");
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+        };
+        let inspected = request("config_inspect",json!({}));
+        assert!(inspected["settings"].is_null());
+        assert_eq!(inspected["mcp_url"],url);
+        let deadline = Instant::now()+Duration::from_secs(5);
+        while app.status().config_problem.is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let status = app.status();
+        assert!(status.config_problem.is_some());
+        assert!(!status.node.sync_running && !status.node.maintenance_running);
+        assert_eq!(status.node.sessions_started,0);
+        let saved = request("config_set_settings",json!({"observation":inspected["observation"],
+            "mcp_port":0,"sync_enabled":false,"maintenance_enabled":false,"peers":[]}));
+        assert_eq!(saved["port_restart_required"],false);
+        assert_eq!(saved["mcp_url"],url);
+        assert!(request("config_inspect",json!({}))["settings_problem"].is_null());
+        app.finish().unwrap();
+        let mut restarted = Runtime::start(&layout).unwrap();
+        assert_eq!(restarted.config().unwrap().settings().unwrap().mcp_port,0);
+        restarted.finish().unwrap();
+    }
 
     #[test]
     fn guard_cancellation_before_startup_status_keeps_its_explanation() {

@@ -1,6 +1,7 @@
 //! Native services owned by the one Erlkonig application process.
 
 pub mod config;
+mod config_mcp;
 pub mod credentials;
 pub mod init;
 pub mod install;

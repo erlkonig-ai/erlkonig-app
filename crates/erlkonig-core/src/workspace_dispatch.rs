@@ -167,7 +167,7 @@ impl Faculty for WorkspaceDispatch {
             #[serde(deny_unknown_fields)]
             struct Empty {}
             let _: Empty = mcp::decode_arguments(arguments)?;
-            let view = (self.config)()?;
+            let view = (self.config)().map_err(|_| anyhow::anyhow!("node configuration is unavailable; native data recovery is required"))?;
             self.retire(&view, None)?;
             let mut workspaces = Vec::new();
             let mut unavailable = Vec::new();
@@ -195,7 +195,7 @@ impl Faculty for WorkspaceDispatch {
                     other => unavailable.push(json!({
                         "workspace": format!("{id:X}"),
                         "reason": match other {
-                            Err(error) => format!("{error:#}"),
+                            Err(error) => error.to_string(),
                             _ => "workspace was removed or superseded".to_owned(),
                         },
                     })),
@@ -209,8 +209,9 @@ impl Faculty for WorkspaceDispatch {
             bail!("unknown workspace MCP tool {name:?}");
         }
         let selected: SelectedArguments = mcp::decode_arguments(arguments)?;
-        let view = (self.config)()?;
-        let resolved = view.workspace(selected.workspace);
+        let view = (self.config)().map_err(|_| anyhow::anyhow!("node configuration is unavailable; native data recovery is required"))?;
+        // Config text handles are bearer capabilities, not diagnostic detail.
+        let resolved = view.workspace(selected.workspace).map_err(|error| anyhow::anyhow!(error.to_string()));
         // IDs are opaque: native annotation can change the value under an
         // existing ID. Reuse only an owner for this exact observed value.
         let unchanged = matches!(&resolved, Ok(Some(binding))

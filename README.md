@@ -14,40 +14,48 @@ workspace. A workspace is a named bundle of collections, not a separate
 identity, key or physical data store. Collection capabilities define what the
 node can read, write and share.
 
-Choose **Workspaces → New workspace…**, give it a name and choose **Create**.
-This makes private collections for notes, goals, files, your journal and the
-other faculty tools, using the existing node identity. The dialog explains the
-bundle before creating it; Cancel does not enroll or create anything.
+Ask the assistant to help set up Erlkonig. The node-scoped `config_*` tools
+remain available through the authenticated local integration even when no
+workspace exists. `config_inspect` shows the public node identity, settings,
+current workspace bundles and unavailable revisions. People do not need to
+type hexadecimal IDs, select pile/key files or operate a configuration wizard.
 
-To organize collections already available on this node, choose **Use existing
-collections…** in that dialog. The editor shows familiar areas such as Notes &
-knowledge, Goals & tasks and Files & documents. **More collection settings…**
-exposes less common areas and read-only diagnostics. New existing-collection
-bundles suggest only a sole eligible collection with the corresponding name;
-ambiguous or absent choices stay **Not included**. Existing workspace edits
-preserve the selected collection, including a visibly unavailable selection.
+`config_create_workspace` creates a named private bundle for the ordinary
+faculties. Alternatively, `config_list_collections` discovers existing local
+roots and independent READ/WRITE admission; explicit role/root choices create
+a bundle over those collections. Names are labels, never authority or an
+implicit selection. Discovery does not download data, grant access or scan
+every blob; unindexed descriptor-only roots are not yet discoverable.
+`config_edit_workspace` changes a bundle and returns its successor request ID.
+`config_remove_workspace` withdraws exactly one current revision, including an
+unavailable one, without deleting collection data or choosing a concurrent winner.
 
-The collection pickers show names and separate read/write access. Same-name
-collections are separate numbered choices, never silently combined or selected
-by position. Exact handles appear only in optional diagnostics; ordinary setup
-does not require typing hexadecimal IDs or choosing pile/key files. Selection
-is from a frozen, read-only local discovery snapshot; it does not download data
-or grant permissions. Already selected descriptor-only collections are retained,
-but unindexed descriptor-only collections cannot yet be discovered by name.
+`config_set_settings` saves the complete typed port, sync, maintenance and
+peer-public-ID settings. Peer IDs are bootstrap hints, not sharing permissions.
+Port changes require an app restart and client integration refresh; service
+settings apply while running. Responses report the actual running `mcp_url`
+and whether restart is required. After restart, choose **Integrations → your
+client → Refresh package**, then reload the client (or refresh the Cowork
+archive); an old-port profile cannot reconnect. Port zero is ephemeral and
+requires refreshed integration after every restart. Conflicting service
+settings leave the configuration endpoint available on the agreed current
+port; if the port itself is missing or conflicting, the app uses local port
+41773 for recovery. This does not select or save a settings fork, and node
+services remain stopped until explicitly reconciled. A busy recovery port or
+damaged/unreadable store still requires local operator recovery.
+Fresh nodes enable sync of permitted collections
+and maintenance of supported attached collections. **Pause sync / Resume sync**
+is also available from the crown menu; it leaves maintenance settings alone.
+There is no active-workspace selector, keyring or per-workspace service mode.
 
-Missing access calls for an invitation or capability grant to this node's
-existing identity. **Need access?** explains that the owner or administrator
-must arrange this; the editor does not yet import invitations or send requests.
-Creating another identity is not an access workaround.
-
-Choose **Advanced → Identity, storage and services…** to inspect the one
-bootstrap binding or pause node sync/maintenance. Fresh-node defaults are
-**Sync all permitted collections** and **Maintain supported attached
-collections**. There is no per-workspace sync target list, managed-pile list,
-or keyring. Workspace changes do not toggle these services. Settings and
-workspace editors save through native configuration operations; Cancel only
-discards the draft, and stale observations are rejected rather than overwriting
-concurrent changes.
+Every configuration edit passes the opaque observation returned by
+`config_inspect`. The token fingerprints native Config foundations without
+exposing their blob handles. Stale edits fail; concurrent native revisions
+remain visible for explicit reconciliation. The existing typed Config
+operations publish the changes, with no separate configuration store.
+Missing access still requires the collection owner to grant the existing node
+identity the appropriate capability; configuring a bundle or peer issues no
+grant. No configuration tool accepts private keys, tokens or arbitrary paths.
 
 Fresh installations use
 `~/.local/share/triblespace/custody/self.pile` and `self.key`.
@@ -75,8 +83,9 @@ held-blob walker (four workers, 30-minute interval). The in-process resource
 guard pauses services at 48 GiB process RSS or below 20% kernel memory headroom
 (`kern.memorystatus_level` on macOS, not the separate `memory_pressure`
 estimate). The UI remains responsive; service threads use Darwin background
-priority. After recovery, turn both advanced service switches off, Save, then
-on and Save to retry. Ordinary workspace edits do not restart paused services.
+priority. After recovery, use `config_set_settings` to disable both services,
+then restore the desired settings to retry. Ordinary workspace edits do not
+restart paused services.
 
 Passive operator commands never start transport:
 
@@ -110,15 +119,16 @@ native shutdown guarantee.
 Tell your assistant the workspace to use. Clients call `list_workspaces` to
 obtain its opaque request ID; people do not need to copy or transcribe it.
 Listing returns labels and configured collection routes, alongside unavailable
-entries with reasons. Every faculty call requires an explicit `workspace` ID.
+entries with reasons. Every ordinary faculty call requires an explicit
+`workspace` ID; only node configuration and workspace listing are unscoped.
 Switching workspace means choosing another bundle for that request, not changing
 a global selection shared with other clients.
 
 The app freezes the resolved bundle for each admitted call. IDs are opaque,
 not cryptographic manifests: native additive facts can change a revision's
-interpretable value, and subsequent calls use the new value. Normal UI edits
+interpretable value, and subsequent calls use the new value. Normal Config edits
 publish a successor and reject the previous ID instead of redirecting it.
-Unavailable revisions can be removed from **Workspaces** without deleting data.
+Unavailable revisions can be removed with `config_remove_workspace` without deleting data.
 
 Each call uses the node's one signer and only the selected collection routes,
 including auxiliary faculty collections. Omitted roles are unavailable; they

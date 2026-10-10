@@ -12,9 +12,10 @@ These are pending interactive checks, not an already-passed checklist:
    maintenance of supported attached collections. No background-node approval
    or resident helper backend should appear. A client can separately start the
    same executable's connection-scoped `mcp-stdio` forwarding mode.
-2. Open the crown menu and Advanced. Neither may offer Copy node ID or a
-   renamed node-identity copy action. The existing backend identity inspection
-   remains available through `list_workspaces`; confirm its public node signer,
+2. Open the crown menu. It should have status, integrations, pause/resume sync,
+   animation preview, login and Quit, with no manual configuration wizard or
+   node-identity copy action. Backend identity inspection remains available
+   through `config_inspect`; confirm its public node identity,
    then Quit, reopen and confirm the same identity. Quit must remove the crown
    and local MCP listener, not leave a resident sync service. Force Quit must
    remove app-owned native threads/listeners as well.
@@ -36,24 +37,25 @@ These are pending interactive checks, not an already-passed checklist:
    the new absolute executable path. Test failure between remove and reinstall
    without mistaking it for rollback. Existing direct MCP settings remain
    untouched and are warned about rather than silently creating duplicate tools.
-6. In a fresh scratch HOME/store, choose Workspaces → New workspace. Enter a
-   friendly name and Cancel: no workspace or private collection enrollment
-   should appear. Repeat and Create: the bundle must immediately support the
+6. In a fresh scratch HOME/store, call `config_inspect` before a workspace
+   exists. It must return the public node identity, settings and observation.
+   Inspection alone must not create a workspace. Ask the assistant to create
+   a friendly named workspace: the returned revision must immediately support
    normal Faculty tools, without hex entry or pile/key file dialogs. Create
    a second workspace and confirm its private roots are separate while the
    public node identity, physical store and network endpoint remain the same.
    Try a duplicate name: roots must not silently merge by label. Do not use
    a personal or water pile as a fixture or take over a known standalone owner.
 
-   In Advanced → Identity, storage and services, inspect the one read-only
-   bootstrap binding. Cancel changed checkboxes and confirm no configuration
-   mutation. Save pauses independently: sync off must release its Peer while
-   local-only maintenance can continue. Reopen must retain explicit pauses.
+   Configure service settings through `config_set_settings`: sync off must
+   release its Peer while local-only maintenance can continue. Pause/resume
+   sync in the menu must preserve maintenance settings and keep local Config
+   tools reachable. Reopen must retain explicit pauses.
    No Managed Piles, keyring or per-workspace storage controls should remain.
 
 Configuration, metrics and workspace collections share one node pile. A
 malformed/unreadable control observation stops node services; a conflicting
-workspace remains unavailable. MCP requires an explicit workspace on every faculty
+workspace remains unavailable. MCP requires an explicit workspace on every ordinary faculty
 call; data is neither silently unioned nor defaulted to the node pile.
 App-private leases cannot police nonparticipating standalone daemons.
 
@@ -71,23 +73,20 @@ on all admitted work.
    listener and transport must disappear, no new pile should be opened, and no
    restart should occur. A new client attempt while the app is absent must fail
    visibly on stderr without printing a credential or bootstrapping a backend.
-9. Choose New workspace → Use existing collections in a fixture with multiple
-   locally named roots. Confirm the common areas use friendly labels, with less
-   common routes under More collection settings. A sole eligible same-name root
-   may be suggested; multiple eligible same-name roots must stay Not included.
-   Distinct numbered choices must map to distinct exact handles, never a union.
-   Show read-only, write-only and access-needed cases independently. Need access?
-   must explain invitations for the existing identity, not pretend to send a
-   request or grant permission. No secret entry or new identity is offered.
+9. Use `config_list_collections` in a fixture with multiple locally named
+   roots. Distinct choices must retain distinct exact handles, never a union.
+   READ and WRITE must be reported independently. Create or edit a bundle with
+   explicit role/root choices; missing admission must fail without adding a
+   grant. Missing access needs an invitation for the existing identity, not a
+   secret in chat or another identity.
 
-   Edit a bundle, alter its name and several choices, open diagnostics, then
-   Cancel: all persisted choices must remain unchanged. Save should publish one
-   coherent revision. An unavailable current selection must remain visible and
-   block Save until explicitly corrected, never disappear silently. A role left
-   Not included must remain unconfigured. Ordinary workspace changes must not
-   toggle node services or create another owner. Discovery leaves store bytes
-   unchanged. Inspect scrolling and keyboard focus, popup width and truncation,
-   button layout and dark/light appearance on the actual candidate.
+   Invalid and stale configuration requests must append nothing. A rename
+   preserves omitted routes; supplied routes replace the complete bundle.
+   Unconfigured roles remain unavailable. Ordinary workspace changes must not
+   toggle node services or create another owner. Discovery leaves bytes
+   unchanged. Conflicted settings stay inspectable and need an explicit
+   complete settings reconciliation. Settings tokens must expose no Config
+   payload handles, private keys, paths or local transport credentials.
 10. Call `list_workspaces` and check labels, exact IDs, public signers and
     role/root handles without key paths. Interleave explicit A and B requests
     in one client and across clients; omitted/unknown IDs must fail with no
@@ -98,7 +97,7 @@ on all admitted work.
     tools with host-path or command execution features.
 11. Edit a workspace and confirm the old ID is rejected, not redirected. A
     malformed/conflicted entry must remain visible as unavailable without
-    hiding healthy entries; Remove workspace must work even when the selected
+    hiding healthy entries; `config_remove_workspace` must work even when the selected
     bundle cannot be decoded. Other concurrent revisions stay separately visible.
     A native additive route annotation under an existing opaque revision ID
     must affect later requests equally for warm and fresh owners, while an

@@ -99,6 +99,53 @@ impl ConfigView {
             .context("read node configuration facts")
     }
 
+    /// A transport precondition, not a blob handle or an authority. Native
+    /// foundations stay private; no per-client settings cache is retained.
+    pub(crate) fn observation(&self) -> Result<String> {
+        let mut hash = blake3::Hasher::new_derive_key("Erlkonig Config observation v1");
+        let support = self.observed.support()?;
+        hash.update(&support.collection().handle().raw);
+        for member in support.members() {
+            hash.update(&member.raw);
+        }
+        // Labels are outside the Config archive. Include their readability so
+        // an observation made while a blob was missing cannot edit the newly
+        // readable workspace. Hash only; never export these bearer handles.
+        let facts = self.facts()?;
+        let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+        let names = find!((state: Id, name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>), and!(
+            pattern!(&facts, [{ ?state @ metadata::tag: attrs::WORKSPACE,
+                attrs::enrolled: true, metadata::name: ?name }]),
+            maximal(state, &order),
+        )).map(|(_, name)| name).collect::<std::collections::BTreeSet<_>>();
+        for name in names {
+            hash.update(&name.raw);
+            hash.update(&[u8::from(self.text(name).is_ok())]);
+        }
+        Ok(hash.finalize().to_hex().to_string())
+    }
+
+    /// Keep the local configuration endpoint available when other settings
+    /// conflict. Only an agreed current port is selected; an uninterpretable
+    /// port uses the well-known recovery port without choosing a settings fork.
+    pub(crate) fn mcp_port(&self) -> Result<u16> {
+        let facts = self.facts()?;
+        let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+        let mut ports = std::collections::BTreeSet::new();
+        for state in find!(state: Id, and!(
+            pattern!(&facts, [{ ?state @ config::anchor: attrs::NODE_SETTINGS }]),
+            maximal(state, &order),
+        )) {
+            let values: Vec<_> = find!(port: u16,
+                pattern!(&facts, [{ state @ attrs::mcp_port: ?port }])).collect();
+            if values.is_empty() {
+                return Ok(NodeSettings::default().mcp_port);
+            }
+            ports.extend(values);
+        }
+        Ok(if ports.len() == 1 { *ports.first().unwrap() } else { NodeSettings::default().mcp_port })
+    }
+
     pub fn settings(&self) -> Result<NodeSettings> {
         let facts = self.facts()?;
         let order = ObservationOrder::new(&facts, metadata::supersedes.id());

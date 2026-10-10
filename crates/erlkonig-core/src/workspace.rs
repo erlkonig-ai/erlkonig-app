@@ -72,6 +72,10 @@ pub struct Discovery {
 }
 
 impl Discovery {
+    pub(crate) fn from_snapshot(snapshot: PileSnapshot, signer: VerifyingKey) -> Self {
+        Self { snapshot, signer }
+    }
+
     /// Explicit picker action only. The key is loaded, never created, and the
     /// data file is opened read-only, so even a future accidental write fails.
     pub fn open(node: &NodeBinding) -> Result<Self> {
