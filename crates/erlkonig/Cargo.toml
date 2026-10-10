@@ -8,8 +8,8 @@ license.workspace = true
 publish.workspace = true
 
 [[example]]
-name = "crown-preview"
-path = "../../scripts/crown-preview.rs"
+name = "crown-render"
+path = "../../scripts/crown-render.rs"
 
 [dependencies]
 erlkonig-core.workspace = true

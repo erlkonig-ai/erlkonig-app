@@ -1,5 +1,5 @@
 //! Deterministic offscreen AppKit proof, using the production vector renderer.
-//! cargo run --release -p erlkonig --example crown-preview -- OUTPUT_DIRECTORY
+//! cargo run --release -p erlkonig --example crown-render -- OUTPUT_DIRECTORY
 //! Does not create an application, window, status item, timer or network service.
 
 #[allow(dead_code)]
@@ -39,25 +39,26 @@ fn render(image: &NSImage, scale: usize) -> Retained<NSBitmapImageRep> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let destination = std::env::args().nth(1).ok_or("usage: crown-preview OUTPUT_DIRECTORY")?;
+    let destination = std::env::args().nth(1).ok_or("usage: crown-render OUTPUT_DIRECTORY")?;
     if destination == "--ripple-phases" {
-        return ripple_phases(Path::new(&std::env::args().nth(2).ok_or("usage: crown-preview --ripple-phases OUTPUT_DIRECTORY")?));
+        return ripple_phases(Path::new(&std::env::args().nth(2).ok_or("usage: crown-render --ripple-phases OUTPUT_DIRECTORY")?));
     }
     let destination = Path::new(&destination);
     std::fs::create_dir_all(destination)?;
     let cases = [
         ("idle", 0, None, false),
         ("attack", 80, Some(80), false),
-        ("transfer", 1000, Some(1000), false),
-        ("settled", 1600, Some(1000), false),
+        ("working", 1000, Some(1000), false),
+        ("landing", 3599, Some(1000), false),
+        ("settled", 3600, Some(1000), false),
         ("reduced", 1000, Some(1000), true),
     ];
-    let mut svg = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1100\" height=\"380\"><rect width=\"1100\" height=\"380\" fill=\"white\"/><style>text{font:14px system-ui,sans-serif}</style><text x=\"20\" y=\"25\">Production AppKit vector · 24 pt silhouette in 26 × 18 pt image · fixed original crest/floor envelope</text>");
+    let mut svg = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1320\" height=\"380\"><rect width=\"1320\" height=\"380\" fill=\"white\"/><style>text{font:14px system-ui,sans-serif}</style><text x=\"20\" y=\"25\">Production AppKit vector · 24 pt silhouette in 26 × 18 pt image · fixed original crest/floor envelope</text>");
     let mut idle_pixels = Vec::new();
     for (column, (label, now, last, reduced)) in cases.iter().enumerate() {
-        let activity = last.map(|last| crown::TransferActivity {
+        let activity = last.map(|last| crown::WorkActivity {
             began_at: Duration::ZERO,
-            last_transfer_at: Duration::from_millis(last),
+            ended_at: Some(Duration::from_millis(last)),
         });
         let image = crown::frame(Duration::from_millis(*now), activity, *reduced).template_image();
         assert!(image.isTemplate());
@@ -89,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if scale == 2 {
                 if *label == "idle" { idle_pixels = pixels.to_vec(); }
                 if *label == "settled" || *label == "reduced" { assert_eq!(pixels, idle_pixels); }
-                if *label == "transfer" { assert_ne!(pixels, idle_pixels); }
+                if *label == "working" { assert_ne!(pixels, idle_pixels); }
             }
             // Empty property dictionary carries no untyped option values.
             let png = unsafe {
@@ -118,8 +119,8 @@ fn ripple_phases(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(destination)?;
     for (phase, millis) in [(0, 3600), (90, 900), (135, 1350), (180, 1800), (270, 2700)] {
         let now = Duration::from_millis(millis);
-        let frame = crown::frame(now, Some(crown::TransferActivity {
-            began_at: Duration::ZERO, last_transfer_at: now,
+        let frame = crown::frame(now, Some(crown::WorkActivity {
+            began_at: Duration::ZERO, ended_at: None,
         }), false);
         let image = frame.template_image();
         assert!(image.isTemplate());

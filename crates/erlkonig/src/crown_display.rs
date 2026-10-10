@@ -1,6 +1,6 @@
 //! One view-bound native display link; no worker, polling timer or runtime state.
 
-use crate::crown::{self, Preview, TransferActivity};
+use crate::crown::{self, WorkActivity};
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{NSCellImagePosition, NSImageScaling, NSStatusBarButton, NSWorkspace};
@@ -12,8 +12,7 @@ use std::time::Instant;
 struct CrownIvars {
     button: Retained<NSStatusBarButton>,
     origin: Instant,
-    activity: Cell<Option<TransferActivity>>,
-    preview: Cell<Preview>,
+    activity: Cell<Option<WorkActivity>>,
     animating: Cell<bool>,
     reduced: Cell<bool>,
 }
@@ -45,10 +44,9 @@ impl CrownTarget {
         let state = self.ivars();
         let reduced = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
         state.reduced.set(reduced);
-        crown::frame_with_preview(
+        crown::frame(
             state.origin.elapsed(),
             state.activity.get(),
-            state.preview.get(),
             reduced,
         )
     }
@@ -90,7 +88,6 @@ impl DisplayCrown {
             button: button.clone(),
             origin,
             activity: Cell::new(None),
-            preview: Cell::new(Preview::default()),
             animating: Cell::new(false),
             reduced: Cell::new(false),
         });
@@ -109,22 +106,11 @@ impl DisplayCrown {
         Self { link, target }
     }
 
-    pub fn update_activity(&self, activity: Option<TransferActivity>) {
+    pub fn update_activity(&self, activity: Option<WorkActivity>) {
         self.target.ivars().activity.set(activity);
         self.target.reconcile(&self.link);
     }
 
-    pub fn preview_enabled(&self) -> bool {
-        self.target.ivars().preview.get().is_enabled()
-    }
-
-    pub fn set_preview(&self, enabled: bool) {
-        let state = self.target.ivars();
-        let mut preview = state.preview.get();
-        preview.set_enabled(enabled, state.origin.elapsed());
-        state.preview.set(preview);
-        self.target.reconcile(&self.link);
-    }
 }
 
 impl Drop for DisplayCrown {

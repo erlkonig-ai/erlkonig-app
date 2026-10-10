@@ -13,7 +13,7 @@ These are pending interactive checks, not an already-passed checklist:
    or resident helper backend should appear. A client can separately start the
    same executable's connection-scoped `mcp-stdio` forwarding mode.
 2. Open the crown menu. It should have status, integrations, pause/resume sync,
-   animation preview, Show storage folder, login and Quit, with no manual configuration wizard or
+   Show storage folder, login and Quit, with no animation-preview control, manual configuration wizard or
    node-identity copy action. Backend identity inspection remains available
    through `config_inspect`; confirm its public node identity,
    then Quit, reopen and confirm the same identity. Quit must remove the crown
@@ -27,10 +27,18 @@ These are pending interactive checks, not an already-passed checklist:
 3. Enable Open at Login only when requested. This registers the main app, not
    an agent. Check logout/login separately; ad-hoc signing can require approval
    after a new build changes the code identity.
-4. Confirm the static crown and Reduce Motion. With a disposable configured
-   sync fixture, confirm real transfer activity and settling. Current receive
-   counters update after reconcile, so continuous long-transfer motion is not
-   yet established by this implementation.
+4. Confirm the static crown and Reduce Motion. In disposable fixtures, check
+   movement during a slow reconciliation pass before any bytes complete, actual
+   index maintenance, and a long native Faculty call. Overlapping work must
+   remain active until its last scope completes; success, error, cancellation
+   and shutdown must all release their own scopes. Idle service loops, no-op
+   maintenance ticks, status sampling and display frames must not sustain it.
+   Confirm that stopping completes the current ripple cycle to the neutral
+   resting outline (at most 3.6 seconds), and new work before landing continues
+   without a phase jump. Reduce Motion immediately shows exact rest.
+   This is app-owned work, not
+   throughput or unrelated CLI activity. No artificial network traffic is needed
+   to test the deterministic activity/time renderer.
 5. Client setup is a separate explicit action. Do not install/remove plugins in
    a real profile during validation. A scratch launch must isolate HOME as well
    as CODEX_HOME/CLAUDE_CONFIG_DIR. Check the two local plugin rows: installed,

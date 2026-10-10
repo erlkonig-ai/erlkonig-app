@@ -1,6 +1,7 @@
 //! One node identity, one logical store and one app-owned network endpoint.
 
 use crate::{
+    active_work::ActiveWork,
     config::NodeBinding,
     config_mcp::ConfigMcp,
     credentials, init,
@@ -36,6 +37,7 @@ pub(crate) type SharedNode = Arc<Mutex<Option<NodeStore>>>;
 pub struct Runtime {
     binding: NodeBinding,
     status: Arc<Mutex<Status>>,
+    activity: ActiveWork,
     node: SharedNode,
     stop: watch::Sender<bool>,
     workers: Vec<JoinHandle<Result<()>>>,
@@ -109,6 +111,7 @@ impl Runtime {
         let mut app = Self {
             binding,
             status,
+            activity: ActiveWork::default(),
             node,
             stop,
             workers: Vec::new(),
@@ -116,6 +119,7 @@ impl Runtime {
         };
         let http_stop = app.stop.subscribe();
         let state = app.status.clone();
+        let activity = app.activity.clone();
         let node = app.node.clone();
         let binding = app.binding.clone();
         let mcp_url = app.status().mcp_url.context("local MCP address")?;
@@ -128,7 +132,10 @@ impl Runtime {
                         let dispatch = WorkspaceDispatch::new(binding, move || {
                             with_node(&node, NodeStore::config)
                         })?;
-                        dispatch.finish(endpoint.serve_until(&[&dispatch, &config], stopping(http_stop)))
+                        dispatch.finish(endpoint.serve_until(
+                            &[&activity.faculty(&dispatch), &activity.faculty(&config)],
+                            stopping(http_stop),
+                        ))
                     })();
                     if let Err(error) = &result {
                         update(&state, |s| {
@@ -139,6 +146,7 @@ impl Runtime {
                 })?,
         );
         let state = app.status.clone();
+        let activity = app.activity.clone();
         let node = app.node.clone();
         let control_stop = app.stop.subscribe();
         let binding = app.binding.clone();
@@ -157,6 +165,7 @@ impl Runtime {
                         node,
                         control_stop,
                         state.clone(),
+                        activity,
                         port,
                     );
                     if let Err(error) = &result {
@@ -218,10 +227,13 @@ impl Runtime {
     }
 
     pub fn status(&self) -> Status {
-        self.status
+        let mut status = self
+            .status
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .clone();
+        status.active_work = self.activity.count();
+        status
     }
     pub fn begin_shutdown(&self) {
         self.stop.send_replace(true);
@@ -310,6 +322,7 @@ fn controller(
     node: SharedNode,
     stop: watch::Receiver<bool>,
     status: Arc<Mutex<Status>>,
+    activity: ActiveWork,
     initial_port: u16,
 ) -> Result<()> {
     let (reports, receiver) = mpsc::channel();
@@ -365,6 +378,7 @@ fn controller(
                     let worker_signer = signer.clone();
                     let lock = identity_lock.clone();
                     let state = status.clone();
+                    let work = activity.clone();
                     let metrics = reports.clone();
                     let shared = node.clone();
                     let worker =
@@ -386,6 +400,7 @@ fn controller(
                                             shared,
                                             cancel_rx,
                                             &state,
+                                            &work,
                                             &metrics,
                                         )
                                     })
@@ -466,12 +481,23 @@ fn maintenance_observer<'a>(
     endpoint: ed25519_dalek::VerifyingKey,
     session: Id,
     status: &'a Arc<Mutex<Status>>,
+    activity: &'a ActiveWork,
     metrics: &'a mpsc::Sender<Sample>,
 ) -> impl FnMut(Event) + Send + 'a {
     let started = Instant::now();
     let mut published = 0u128;
     let mut failed = 0u128;
+    // Driver hops are sequential, and its RAII observer emits HopCancelled
+    // when an in-flight tick is dropped. No-op ticks emit no HopStarted.
+    let mut work = None;
     move |event| {
+        match &event {
+            Event::HopStarted { .. } => work = Some(activity.enter()),
+            Event::HopFinished { .. } | Event::HopCancelled { .. } => {
+                work.take();
+            }
+            _ => {}
+        }
         let (count, error) = match event {
             Event::HopFinished {
                 publications,
@@ -515,6 +541,7 @@ fn node_session(
     node: SharedNode,
     stop: watch::Receiver<bool>,
     status: &Arc<Mutex<Status>>,
+    activity: &ActiveWork,
     metrics: &mpsc::Sender<Sample>,
 ) -> Result<()> {
     // This lock guards endpoint identity, NEVER exclusive access to the pile.
@@ -534,7 +561,7 @@ fn node_session(
         .enable_all()
         .build()?;
     let store = faculties::storage::open_pile_strict_as(&binding.pile, signer.verifying_key())?;
-    let mut observer = maintenance_observer(signer.verifying_key(), session, status, metrics);
+    let mut observer = maintenance_observer(signer.verifying_key(), session, status, activity, metrics);
     let result = if settings.sync_enabled {
         // Same startup and bounded periodic backstop as the native CLI.
         // Its RAII handle joins only this app's walker during shutdown.
@@ -600,7 +627,7 @@ fn node_session(
                             selection = next;
                         }
                         previous_snapshot = Some(snapshot);
-                        let progress = peer.reconcile().await;
+                        let progress = activity.during(peer.reconcile()).await;
                         received += progress.received_bytes as u128;
                         let sent = peer.health().blob_serving.sent_bytes;
                         let delta = progress.received_bytes.saturating_add(sent.saturating_sub(previous_sent));
@@ -683,6 +710,76 @@ fn node_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maintenance_boundaries_release_only_their_own_work() {
+        use triblespace::core::collection::CollectionHandle;
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let status = Arc::new(Mutex::new(Status::default()));
+        let work = ActiveWork::default();
+        let (metrics, _reports) = mpsc::channel();
+        let mut observer = maintenance_observer(signer.verifying_key(), genid().id, &status, &work, &metrics);
+        let collection = CollectionHandle::new([5; 32]);
+        observer(Event::Failure { reference: "fixture".into(), error: "before hop".into() });
+        assert_eq!(work.count(), 0, "no actual maintenance was entered");
+        let reconciliation = work.enter();
+        for error in [None, Some("synthetic maintenance failure".into())] {
+            observer(Event::HopStarted { collection });
+            assert_eq!(work.count(), 2);
+            observer(Event::HopFinished {
+                collection, elapsed: Duration::ZERO, census: None,
+                publications: Default::default(), error,
+            });
+            assert_eq!(work.count(), 1);
+            observer(Event::HopCancelled { collection, elapsed: Duration::ZERO });
+            assert_eq!(work.count(), 1, "a duplicate ending never double-releases");
+        }
+        observer(Event::HopStarted { collection });
+        observer(Event::HopCancelled { collection, elapsed: Duration::ZERO });
+        assert_eq!(work.count(), 1);
+        observer(Event::HopStarted { collection });
+        drop(observer);
+        assert_eq!(work.count(), 1, "observer teardown releases unfinished work");
+        drop(reconciliation);
+        assert_eq!(work.count(), 0);
+        assert_eq!(status.lock().unwrap().transfer_bytes, 0, "activity invents no payload bytes");
+    }
+
+    #[test]
+    fn real_local_maintenance_emits_work_and_idle_ticks_stay_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let bootstrap = crate::config::Bootstrap::new(dir.path());
+        let signer = init::prepare(&bootstrap).unwrap();
+        let mut node = NodeStore::open(&bootstrap.pile, signer.clone()).unwrap();
+        let mut driver = Driver::new([Target::Handle(node.config.handle())], true, SuccinctBackend::Cpu).unwrap();
+        let work = ActiveWork::default();
+        let status = Arc::new(Mutex::new(Status::default()));
+        let (metrics, _reports) = mpsc::channel();
+        let mut observer = maintenance_observer(signer.verifying_key(), genid().id, &status, &work, &metrics);
+        let mut starts = 0;
+        let mut observed = |event: Event| {
+            let started = matches!(event, Event::HopStarted { .. });
+            observer(event);
+            if started {
+                starts += 1;
+                assert_eq!(work.count(), 1);
+            } else {
+                assert_eq!(work.count(), 0);
+            }
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            assert!(driver.tick(&mut node.pile, &signer, &mut observed).await.unwrap().is_some());
+            for _ in 0..3 {
+                driver.tick(&mut node.pile, &signer, &mut observed).await.unwrap();
+            }
+            assert!(driver.tick(&mut node.pile, &signer, &mut observed).await.unwrap().is_none());
+        });
+        assert!(starts > 0);
+        assert_eq!(work.count(), 0);
+        drop(observer);
+        node.close().unwrap();
+    }
 
     #[test]
     fn persisted_settings_conflicts_leave_authenticated_recovery_available() {
@@ -772,6 +869,7 @@ mod tests {
             let status = Arc::new(Mutex::new(Status::default()));
             let (cancel, stop) = watch::channel(false);
             let (metrics, _reports) = mpsc::channel();
+            let activity = ActiveWork::default();
 
             // The controller deliberately started this task, then its guard
             // fired before synchronous setup published startup status. No
@@ -789,6 +887,7 @@ mod tests {
                 node.clone(),
                 stop,
                 &status,
+                &activity,
                 &metrics,
             )
             .unwrap();
@@ -801,6 +900,7 @@ mod tests {
                 "startup must retain the guard explanation (sync={sync_enabled})"
             );
             assert!(*cancel.borrow(), "startup must not undo cancellation");
+            assert_eq!(activity.count(), 0, "stopped sessions never start a pass");
             drop(state);
             assert_eq!(
                 triblespace::core::collection::held::held_walker_threads(),

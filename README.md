@@ -219,10 +219,15 @@ cadence, with observed failures and shutdown flushed sooner. Local-only
 maintenance does not claim a live network listener. Failed metrics
 appends are visible in the menu and are never reported as persisted success.
 
-The crown is static at rest and with macOS Reduce Motion. Animation follows
-payload-transfer counters, not connection state or QUIC keepalives. Current
-receive progress is published after a reconcile completes, so this is not yet
-a continuous in-flight byte meter. Local-only workspace reads add no network traffic.
+The crown is static at rest and with macOS Reduce Motion. It moves during
+app-owned reconciliation passes (including waiting for a peer), actual index
+maintenance and native Faculty tool execution. After work ends it completes the
+current 3.6-second ripple cycle, landing exactly on the resting outline; new work
+before that landing continues the same phase without a restart. Overlapping
+work shares one activity count; enabling services, idle waits, status sampling
+and rendering do not count. It is an activity indicator, not a bytes-per-second
+meter. Payload counters still report measured bytes, and local-only workspace
+reads add no network traffic. There is no animation-preview mode.
 
 ## Validation and packaging
 

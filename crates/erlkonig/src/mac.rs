@@ -1,6 +1,6 @@
 //! Main-thread menu and the one application-owned native lifetime.
 
-use crate::crown::{self, TransferActivity};
+use crate::crown::{self, WorkActivity};
 use crate::crown_display::DisplayCrown;
 use erlkonig_core::{
     install,
@@ -27,7 +27,6 @@ use winit::window::WindowId;
 
 struct Items {
     status: MenuItem,
-    preview: CheckMenuItem,
     integrations: Submenu,
     no_clients: MenuItem,
     chatgpt: CheckMenuItem,
@@ -50,9 +49,8 @@ struct App {
     menu: Option<Menu>,
     tray: Option<TrayIcon>,
     origin: Instant,
-    activity: Option<TransferActivity>,
+    activity: Option<WorkActivity>,
     crown: Option<DisplayCrown>,
-    transfer_bytes: u64,
     next_refresh: Instant,
     quitting: Option<Instant>,
     terminate: Arc<AtomicBool>,
@@ -202,19 +200,11 @@ impl App {
             SMAppServiceStatus::Enabled | SMAppServiceStatus::RequiresApproval
         ));
         let now = self.origin.elapsed();
-        let bytes = status.as_ref().map_or(0, |s| s.transfer_bytes);
-        let changed = bytes > self.transfer_bytes;
-        if changed {
-            let began_at = self
-                .activity
-                .filter(|a| now.saturating_sub(a.last_transfer_at) <= crown::SETTLE_AFTER)
-                .map_or(now, |a| a.began_at);
-            self.activity = Some(TransferActivity {
-                began_at,
-                last_transfer_at: now,
-            });
-        }
-        self.transfer_bytes = bytes;
+        crown::observe(
+            &mut self.activity,
+            status.as_ref().is_some_and(|s| s.active_work > 0),
+            now,
+        );
         if let Some(crown) = &self.crown {
             crown.update_activity(self.activity);
         }
@@ -239,7 +229,6 @@ impl App {
             item.set_enabled(false);
         }
         self.items.login.set_enabled(false);
-        self.items.preview.set_enabled(false);
         self.items.pause_sync.set_enabled(false);
         self.items.integrations.set_enabled(false);
         if let Some(runtime) = &self.runtime {
@@ -680,19 +669,6 @@ impl App {
         let id = event.id();
         if id == self.items.quit.id() {
             self.quit();
-        } else if id == self.items.preview.id() {
-            let enabled = self.items.preview.is_checked();
-            if let Some(crown) = &self.crown {
-                crown.set_preview(enabled);
-                self.items.preview.set_checked(crown.preview_enabled());
-            }
-            if enabled && NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion() {
-                self.alert(
-                    "Sync animation preview",
-                    "Preview is on, but Reduce Motion keeps the crown still. Uncheck Preview sync animation to stop the preview. No sync or data transfer is started.",
-                    &["OK"],
-                );
-            }
         } else if id == self.items.pause_sync.id() {
             self.toggle_sync();
         } else if id == self.items.storage_folder.id() {
@@ -751,7 +727,6 @@ impl ApplicationHandler<MenuEvent> for App {
                         self.crown = Some(DisplayCrown::new(button, self.origin, self.mtm));
                     } else {
                         self.problem = Some("Cannot create crown display".into());
-                        self.items.preview.set_enabled(false);
                     }
                     // tray-icon also fits its click-target view when setting
                     // the tooltip. Do this after installing our native image,
@@ -802,7 +777,6 @@ pub fn main() {
     }
     let items = Items {
         status: MenuItem::new("Starting…", true, None),
-        preview: CheckMenuItem::new("Preview sync animation", true, false, None),
         integrations: Submenu::new("Integrations", true),
         no_clients: MenuItem::new("Checking clients…", false, None),
         chatgpt: CheckMenuItem::new("OpenAI local plugin · checking…", false, false, None),
@@ -822,7 +796,6 @@ pub fn main() {
     let menu = Menu::new();
     menu.append_items(&[
         &items.status,
-        &items.preview,
         &items.pause_sync,
         &PredefinedMenuItem::separator(),
         &items.integrations,
@@ -844,7 +817,6 @@ pub fn main() {
         origin: Instant::now(),
         activity: None,
         crown: None,
-        transfer_bytes: 0,
         next_refresh: Instant::now(),
         quitting: None,
         terminate,

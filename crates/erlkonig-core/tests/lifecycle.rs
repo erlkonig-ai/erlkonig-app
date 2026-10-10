@@ -85,6 +85,7 @@ fn authenticated_native_mcp_quit_and_restart() {
     let (_dir, layout) = fixture();
     let mut app = Runtime::start(&layout).unwrap();
     let first = app.status();
+    assert_eq!(first.active_work, 0, "idle app services do not animate");
     let url = first.mcp_url.unwrap();
     assert_eq!(first.sync_collections, 0);
     assert!(
@@ -215,6 +216,7 @@ fn authenticated_native_mcp_quit_and_restart() {
     }
     assert!(app.is_finished(), "idle native owners must stop promptly");
     app.finish().unwrap();
+    assert_eq!(app.status().active_work, 0, "joined owners have no active work");
     assert!(
         client
             .post(&url)

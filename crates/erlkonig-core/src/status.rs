@@ -31,6 +31,9 @@ pub struct Status {
     pub warnings: Vec<String>,
     pub sync_collections: usize,
     pub maintenance_targets: usize,
+    /// App-owned reconciliation, index maintenance and executing Faculty calls.
+    /// Overlapping scopes count independently; idle service loops do not count.
+    pub active_work: usize,
     /// Actual payload bytes transferred. Connection/idle events never advance it.
     pub transfer_bytes: u64,
     pub maintenance_publications: u64,
