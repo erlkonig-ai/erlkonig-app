@@ -1,8 +1,8 @@
 {
   "name": "erlkonig",
-  "displayName": "Erlkönig",
+  "displayName": "Erlkonig",
   "version": "0.1.0",
-  "description": "Goals, wiki, journal, people, files and messages in the Erlkönig pile on this computer. Needs the Erlkönig app, which owns the pile and keeps it in sync.",
-  "author": { "name": "Erlkönig" },
+  "description": "Goals, wiki, journal, people, files and messages in the Erlkonig pile on this computer. Needs the Erlkonig app, which owns the pile and keeps it in sync.",
+  "author": { "name": "Erlkonig" },
   "keywords": ["memory", "wiki", "goals", "local-first", "triblespace"]
 }

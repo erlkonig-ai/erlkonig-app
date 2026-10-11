@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 pub const MARKETPLACE: &str = "erlkonig-local";
 pub const PLUGIN_ID: &str = "erlkonig@erlkonig-local";
 pub const COWORK_URL: &str = "https://claude.ai/customize/plugins";
-pub const COWORK_HELP: &str = "Cowork plugins are managed on your Claude account, separately from local Claude Code installs. In Customize → Plugins, use Add → Upload plugin and choose the prepared ZIP. Remove it there too. Erlkönig cannot observe or check your account installation. The package contains no secret and works on this Mac only while Erlkönig is open. This is a Cowork/Code plugin, not a standalone chat extension.";
+pub const COWORK_HELP: &str = "Cowork plugins are managed on your Claude account, separately from local Claude Code installs. In Customize → Plugins, use Add → Upload plugin and choose the prepared ZIP. Remove it there too. Erlkonig cannot observe or check your account installation. The package contains no secret and works on this Mac only while Erlkonig is open. This is a Cowork/Code plugin, not a standalone chat extension.";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 
@@ -137,10 +137,10 @@ pub fn parse_inventory(host: Host, bytes: &[u8]) -> Result<Inventory, String> {
             continue;
         }
         if host == Host::ClaudeCode && row.get("scope").and_then(Value::as_str) != Some("user") {
-            return Err("Erlkönig is installed at another Claude Code scope; manage that installation in Claude Code".into());
+            return Err("Erlkonig is installed at another Claude Code scope; manage that installation in Claude Code".into());
         }
         if inventory.installed {
-            return Err("Client reported multiple local Erlkönig installations".into());
+            return Err("Client reported multiple local Erlkonig installations".into());
         }
         let installed = match host {
             Host::OpenAi => row
@@ -322,7 +322,7 @@ pub fn inventory_with_client(
 }
 
 /// Diagnostic only: a legacy server may be user-authored. Never remove or
-/// rewrite it, even when its name or URL looks like an old Erlkönig install.
+/// rewrite it, even when its name or URL looks like an old Erlkonig install.
 pub fn legacy_config_notice(host: Host) -> Option<&'static str> {
     let home = PathBuf::from(std::env::var_os("HOME")?);
     let present = match host {
@@ -477,7 +477,7 @@ pub fn prepare(layout: &Layout, executable: &Path, url: &str) -> Result<PathBuf,
     json_file(
         &root.join(".agents/plugins/marketplace.json"),
         &json!({
-            "name":MARKETPLACE, "interface":{"displayName":"Erlkönig on this Mac"},
+            "name":MARKETPLACE, "interface":{"displayName":"Erlkonig on this Mac"},
             "plugins":[{"name":"erlkonig", "source":{"source":"local", "path":"./openai"},
                 "policy":{"installation":"AVAILABLE", "authentication":"ON_USE"}, "category":"Productivity"}]
         }),
@@ -486,7 +486,7 @@ pub fn prepare(layout: &Layout, executable: &Path, url: &str) -> Result<PathBuf,
     json_file(
         &root.join(".claude-plugin/marketplace.json"),
         &json!({
-            "name":MARKETPLACE, "owner":{"name":"Erlkönig"},
+            "name":MARKETPLACE, "owner":{"name":"Erlkonig"},
             "plugins":[{"name":"erlkonig", "source":"./claude"}]
         }),
     )?;
@@ -524,7 +524,7 @@ fn marketplace_owned(host: Host, value: &Value, root: &Path) -> Result<bool, Str
         }
         if owned {
             return Err(
-                "Client reported multiple Erlkönig marketplaces; refusing to change plugins".into(),
+                "Client reported multiple Erlkonig marketplaces; refusing to change plugins".into(),
             );
         }
         let path = match host {
@@ -792,12 +792,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let layout = Layout::new(temp.path().join("App Data"));
         fs::create_dir(&layout.dir).unwrap();
-        let exe = Path::new("/Applications/Erlkönig Test.app/Contents/MacOS/erlkonig");
+        let exe = Path::new("/Applications/Erlkonig 日本語 Test.app/Contents/MacOS/erlkonig");
         let root = prepare(&layout, exe, "http://127.0.0.1:41773/").unwrap();
         assert!(!layout.dir.join("mcp.token").exists());
         assert_eq!(
             fs::read(root.join("openai/skills/faculties/SKILL.md")).unwrap(),
             fs::read(root.join("claude/skills/faculties/SKILL.md")).unwrap()
+        );
+        assert!(
+            fs::read_to_string(root.join("openai/skills/faculties/SKILL.md"))
+                .unwrap()
+                .contains("Erlkonig app")
         );
         let a = fs::read(root.join("openai/.mcp.json")).unwrap();
         assert_eq!(a, fs::read(root.join("claude/.mcp.json")).unwrap());
@@ -810,6 +815,32 @@ mod tests {
         assert!(mcp["mcpServers"]["faculties"].get("env").is_none());
         assert!(!root.join("claude/.codex-plugin").exists());
         assert!(!root.join("openai/.claude-plugin").exists());
+        let openai: Value = serde_json::from_slice(
+            &fs::read(root.join("openai/.codex-plugin/plugin.json")).unwrap(),
+        )
+        .unwrap();
+        let claude: Value = serde_json::from_slice(
+            &fs::read(root.join("claude/.claude-plugin/plugin.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(openai["name"], "erlkonig");
+        assert_eq!(openai["interface"]["displayName"], "Erlkonig");
+        assert_eq!(openai["interface"]["developerName"], "Erlkonig");
+        assert_eq!(claude["name"], "erlkonig");
+        assert_eq!(claude["displayName"], "Erlkonig");
+        assert_eq!(claude["author"]["name"], "Erlkonig");
+        let openai_market: Value = serde_json::from_slice(
+            &fs::read(root.join(".agents/plugins/marketplace.json")).unwrap(),
+        )
+        .unwrap();
+        let claude_market: Value = serde_json::from_slice(
+            &fs::read(root.join(".claude-plugin/marketplace.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(openai_market["name"], MARKETPLACE);
+        assert_eq!(openai_market["interface"]["displayName"], "Erlkonig on this Mac");
+        assert_eq!(claude_market["name"], MARKETPLACE);
+        assert_eq!(claude_market["owner"]["name"], "Erlkonig");
     }
     #[test]
     fn staging_refuses_symlinked_package_directory() {

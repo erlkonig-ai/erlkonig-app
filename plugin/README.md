@@ -1,4 +1,4 @@
-# Erlkönig package sources
+# Erlkonig package sources
 
 This directory is source material, not an installable mixed-provider package.
 The app generates one OpenAI package and one Claude package with the same

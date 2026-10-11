@@ -135,7 +135,7 @@ impl App {
                 // cannot leave the app alive indefinitely. Like Force Quit,
                 // this fallback cannot promise to flush an unfinished write.
                 eprintln!(
-                    "Erlkönig: 15-second shutdown grace elapsed; terminating this application process"
+                    "Erlkonig: 15-second shutdown grace elapsed; terminating this application process"
                 );
                 std::process::exit(1);
             }
@@ -159,7 +159,7 @@ impl App {
                     if let Err(error) = runtime.finish() {
                         // Quit is final even when cleanup reports an error.
                         // Never put a modal dialog between joined workers and exit.
-                        eprintln!("Erlkönig shutdown: {error:#}");
+                        eprintln!("Erlkonig shutdown: {error:#}");
                     }
                 }
                 event_loop.exit();
@@ -303,13 +303,13 @@ impl App {
         if let Some(mut runtime) = self.runtime.take() {
             while !runtime.is_finished() {
                 if since.elapsed() >= Duration::from_secs(15) {
-                    eprintln!("Erlkönig: shutdown grace elapsed during application termination");
+                    eprintln!("Erlkonig: shutdown grace elapsed during application termination");
                     std::process::exit(1);
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
             if let Err(error) = runtime.finish() {
-                eprintln!("Erlkönig shutdown: {error:#}");
+                eprintln!("Erlkonig shutdown: {error:#}");
             }
         }
     }
@@ -554,7 +554,7 @@ impl App {
             }
         };
         let text = format!(
-            "{scope}\n\nKeep Erlkönig open while using its tools. After moving/updating the app, Refresh package reinstalls the current executable path; enable/reload it in the client if needed.\n\n{}",
+            "{scope}\n\nKeep Erlkonig open while using its tools. After moving/updating the app, Refresh package reinstalls the current executable path; enable/reload it in the client if needed.\n\n{}",
             install::legacy_config_notice(host)
                 .unwrap_or("No credentials are copied to the plugin or client settings.")
         );
@@ -577,7 +577,7 @@ impl App {
         let url = self.runtime.as_ref().and_then(|r| r.status().mcp_url);
         if wanted && url.is_none() {
             self.alert(
-                "Erlkönig is not running",
+                "Erlkonig is not running",
                 "Start the app's services before installing the plugin.",
                 &["OK"],
             );
@@ -721,7 +721,7 @@ impl App {
         } else if id == self.items.openai_manual.id() {
             self.alert(
                 "OpenAI plugin management unavailable",
-                "The desktop app is installed, but a supported Codex management CLI was not detected. Use the app's plugin settings, or install the Codex CLI and choose Refresh plugin status. Erlkönig has not checked or changed the app's plugin installation.",
+                "The desktop app is installed, but a supported Codex management CLI was not detected. Use the app's plugin settings, or install the Codex CLI and choose Refresh plugin status. Erlkonig has not checked or changed the app's plugin installation.",
                 &["OK"],
             );
         } else if id == self.items.claude.id() {
@@ -747,7 +747,7 @@ impl App {
                     })
                     .unwrap_or_default()
             });
-            self.alert("Erlkönig", &text, &["OK"]);
+            self.alert("Erlkonig", &text, &["OK"]);
         }
         self.next_refresh = Instant::now();
         self.refresh(event_loop);
@@ -773,13 +773,13 @@ impl ApplicationHandler<MenuEvent> for App {
                     // tray-icon also fits its click-target view when setting
                     // the tooltip. Do this after installing our native image,
                     // so its hit area includes the full, wider crown.
-                    let _ = tray.set_tooltip(Some("Erlkönig"));
+                    let _ = tray.set_tooltip(Some("Erlkonig"));
                     self.tray = Some(tray);
                 }
                 Err(error) => self.problem = Some(format!("Cannot create menu: {error}")),
             }
             if std::env::current_exe().is_ok_and(|p| paths::is_translocated(&p)) {
-                self.problem = Some("Move Erlkönig to Applications, then open it again.".into());
+                self.problem = Some("Move Erlkonig to Applications, then open it again.".into());
             } else {
                 match Runtime::start(&self.layout) {
                     Ok(runtime) => self.runtime = Some(runtime),
@@ -804,7 +804,7 @@ impl ApplicationHandler<MenuEvent> for App {
 }
 
 pub fn main() {
-    let mtm = MainThreadMarker::new().expect("Erlkönig starts on the main thread");
+    let mtm = MainThreadMarker::new().expect("Erlkonig starts on the main thread");
     let event_loop = EventLoop::<MenuEvent>::with_user_event()
         .with_activation_policy(ActivationPolicy::Accessory)
         .build()
@@ -830,7 +830,7 @@ pub fn main() {
         pause_sync: MenuItem::new("Pause sync", false, None),
         retry_services: MenuItem::new("Retry services", false, None),
         storage_folder: MenuItem::new("Show storage folder", false, None),
-        quit: MenuItem::new("Quit Erlkönig", true, None),
+        quit: MenuItem::new("Quit Erlkonig", true, None),
     };
     items
         .integrations
@@ -869,7 +869,7 @@ pub fn main() {
         plugin_task: None,
     };
     if let Err(error) = event_loop.run_app(&mut app) {
-        eprintln!("Erlkönig: {error}");
+        eprintln!("Erlkonig: {error}");
     }
     // Idempotent fallback for event-loop construction/execution errors.
     app.finish_termination();

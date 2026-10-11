@@ -1,4 +1,4 @@
-//! Erlkönig facts in the node pile's existing private `config` collection.
+//! Erlkonig facts in the node pile's existing private `config` collection.
 //! The Faculty `config::selects` attribute keeps its collection-handle meaning;
 //! workspace role selections use it only for exact collection handles.
 //!

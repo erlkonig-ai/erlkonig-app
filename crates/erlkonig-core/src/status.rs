@@ -111,7 +111,7 @@ impl Status {
             format!("Running · {sync} · {}", if self.problem.is_none() && self.mcp_url.is_some() {
                 "authenticated MCP"
             } else { "MCP unavailable" })
-        } else { "Erlkönig is stopped".into() };
+        } else { "Erlkonig is stopped".into() };
         if self.node.maintenance_running {
             text.push_str(" · maintenance running");
         }

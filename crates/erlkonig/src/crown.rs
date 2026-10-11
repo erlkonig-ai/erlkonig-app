@@ -1,4 +1,4 @@
-//! Erlkönig's wavelet crown, still at rest and gently moving during app-owned work.
+//! Erlkonig's wavelet crown, still at rest and gently moving during app-owned work.
 //!
 //! The canonical website's Gabor/Morlet crown fixes the outer geometry and
 //! reference band. Rest and motion share a softer, smooth-centred inner wave;

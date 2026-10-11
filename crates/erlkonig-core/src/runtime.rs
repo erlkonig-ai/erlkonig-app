@@ -110,7 +110,7 @@ impl Runtime {
     fn start_with_guard(layout: &Layout, guard: ResourceCheck) -> Result<Self> {
         ensure_private_dir(&layout.dir)?;
         let lock = lease(&layout.lock()).context(
-            "another Erlkönig owner is using this data directory; stop it before starting this app",
+            "another Erlkonig owner is using this data directory; stop it before starting this app",
         )?;
         let (bootstrap, expected_signer) = layout.selected_node()?;
         let signer = if let Some(expected) = expected_signer {
@@ -329,7 +329,7 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         if let Err(error) = self.finish() {
-            eprintln!("Erlkönig shutdown: {error:#}");
+            eprintln!("Erlkonig shutdown: {error:#}");
         }
     }
 }
@@ -507,7 +507,7 @@ fn controller(
                     s.node.sync_enabled = next.sync_enabled;
                     s.node.maintenance_enabled = next.maintenance_enabled;
                     s.warnings = if next.mcp_port != initial_port {
-                        vec!["Restart Erlkönig to use the changed MCP port.".into()]
+                        vec!["Restart Erlkonig to use the changed MCP port.".into()]
                     } else {
                         Vec::new()
                     };

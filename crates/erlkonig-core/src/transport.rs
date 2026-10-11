@@ -83,8 +83,8 @@ pub async fn forward(
     drop(token);
     let socket = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(address))
         .await
-        .map_err(|_| anyhow!("Erlkönig is unavailable; open the app first"))?
-        .map_err(|_| anyhow!("Erlkönig is unavailable; open the app first"))?;
+        .map_err(|_| anyhow!("Erlkonig is unavailable; open the app first"))?
+        .map_err(|_| anyhow!("Erlkonig is unavailable; open the app first"))?;
     let (sender, connection) = http1::Builder::new()
         .max_headers(32)
         .max_buf_size(32 * 1024)
@@ -118,7 +118,7 @@ pub async fn forward(
             // Give that response a bounded chance to reach stdout, but never
             // wait for another client message after the pinned owner closes.
             let _ = tokio::time::timeout(CLOSE_DRAIN, &mut relay).await;
-            bail!("Erlkönig's connection closed; an admitted operation may have completed; nothing was retried")
+            bail!("Erlkonig's connection closed; an admitted operation may have completed; nothing was retried")
         }
     }
 }
