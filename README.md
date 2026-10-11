@@ -30,6 +30,64 @@ every blob; unindexed descriptor-only roots are not yet discoverable.
 `config_remove_workspace` withdraws exactly one current revision, including an
 unavailable one, without deleting collection data or choosing a concurrent winner.
 
+For requested sharing, `config_share_workspace` takes the exact current
+workspace revision, recipient public node identity, `read_only` or `read_write`
+access and optional `delegate` (false by default). Native capability policies
+enforce grants separately for every collection. Invocation is not delegation:
+before opting in, the assistant must explain that the recipient may invite
+additional participants within the granted roots/actions without the original
+user choosing each person. Disclosed or copied data cannot be made unread.
+The grant covers only the currently resolved bundle, never old or future
+membership. Grants are additive and non-expiring; editing/removing a workspace
+does not revoke another node's authority. A narrower share does not remove
+permissions the recipient already holds.
+
+Grants are valid immediately. The returned bounded, opaque `bootstrap` is a
+one-way signed workspace-metadata handoff, not a request/approve/acknowledge protocol.
+Current native sync has no identity-wide cold grant inbox. On the recipient's
+own node, `config_probe_workspace_share` verifies the signed native manifest,
+recipient binding in memory, and reports exact descriptor names and typed
+role/root routes plus the issuer's declared access choice. It does not confirm
+native collection admission. It imports nothing and starts no repair,
+hydration or upkeep. Names are presentation, never parsed to infer roles or
+future bundle members.
+
+After choosing whether to enroll and a local alias, the recipient calls
+`config_enroll_workspace_share` with that bootstrap, label and current Config
+observation. It imports descriptor/name metadata and publishes a local
+workspace with the same roots/role routes and existing key. It copies no keys,
+creates no replacement data roots, sends no reply to the issuer and sets no
+global default. Repeat unchanged enrollment returns the same local revision;
+a later local edit or withdrawal is never overwritten. The bootstrap contains
+descriptor/name blobs and a native signed COMMIT, never capability proofs,
+definition bodies, keys or member data. It is metadata discovery, not authority
+delivery: native repair supplies proofs and ordinary acquisition supplies
+their definitions after explicit local enrollment.
+
+Enrolled known roots select Full bootstrap even while local READ evidence is
+pending. The server's resident native READ evidence admits the recipient's
+endpoint; AUTH repair then supplies proof bytes. Descriptor warmup acquires
+names and policy definitions; Full held(C) hydration acquires custom delegated
+definitions. Native evidence still governs local reads/writes and upkeep.
+The existing all-accessible runtime policy and its graph roots, Config,
+receipts and attached dependencies remain unchanged. This feature does not
+globally resource-gate arbitrary resident grants; its off-store probe creates
+no acquisition interest. A broader selection-policy migration is separate.
+
+Share/enroll responses mean **local publication**, not multi-replica sync
+completion or payload hydration. Enrollment keeps node service settings and
+peers unchanged, but selects its roots for already-enabled sync/maintenance.
+Issuer public identity is a routing hint, not authority. Discovery uses native
+descriptor authority hints, configured public peers and C-keyed providers;
+unavailable network bootstrap can leave enrollment pending. No peer setting
+is silently changed. Removing enrollment does not promise immediate native
+topic deactivation; the pinned network API has no public deactivate operation.
+Source grant preparation and recipient signature/binding checks finish in
+memory before writes; the final workspace revision is one native Config
+COMMIT. Metadata precedes it, but the append-only publication is not a
+multi-record rollback transaction: interrupted I/O may leave valid evidence
+resident. No remote-delivery or revocation receipt is implied.
+
 `config_set_settings` saves the complete typed port, sync, maintenance and
 peer-public-ID settings. Peer IDs are bootstrap hints, not sharing permissions.
 Port changes require an app restart and client integration refresh; service
@@ -43,8 +101,8 @@ port; if the port itself is missing or conflicting, the app uses local port
 41773 for recovery. This does not select or save a settings fork, and node
 services remain stopped until explicitly reconciled. A busy recovery port or
 damaged/unreadable store still requires local operator recovery.
-Fresh nodes enable sync of permitted collections
-and maintenance of supported attached collections. **Pause sync / Resume sync**
+Fresh nodes enable sync of locally selected, permitted collections
+and maintenance of their supported attached collections. **Pause sync / Resume sync**
 is also available from the crown menu; it leaves maintenance settings alone.
 There is no active-workspace selector, keyring or per-workspace service mode.
 
@@ -53,9 +111,10 @@ Every configuration edit passes the opaque observation returned by
 exposing their blob handles. Stale edits fail; concurrent native revisions
 remain visible for explicit reconciliation. The existing typed Config
 operations publish the changes, with no separate configuration store.
-Missing access still requires the collection owner to grant the existing node
-identity the appropriate capability; configuring a bundle or peer issues no
-grant. No configuration tool accepts private keys, tokens or arbitrary paths.
+Missing access requires a node with appropriate native authority to invite
+the existing node identity. Creating/editing a bundle or configuring a peer
+issues no grant; sharing uses the explicit sharing tool above. No
+configuration tool accepts private keys, tokens or arbitrary paths.
 
 Fresh installations use
 `~/.local/share/triblespace/custody/self.pile` and `self.key`.

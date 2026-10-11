@@ -40,6 +40,18 @@ never removes an integration or changes client settings.
 Node-scoped `config_*` tools share the same authenticated local endpoint and
 remain available with zero workspaces. They inspect the public identity and
 typed settings, discover local collection choices, and create/edit/remove
-bundles. Ordinary faculties still require an exact workspace on each call.
-Configuration grants no sharing authority and exposes no private key, token
-or arbitrary path editor. The app must be open; this is not remote admin.
+bundles. `config_share_workspace` grants native access immediately to an exact
+current bundle, invoke-only by default; onward delegation requires explaining
+consequences and the user's opt-in. `config_probe_workspace_share` verifies
+the bounded signed role/root/name metadata without mutation; this verifies the
+signature/recipient binding, not collection admission. No proof or definition
+payload travels in the handoff. Recipient-local
+`config_enroll_workspace_share` chooses a label and selects the same roots
+under the existing key for enabled native known-C bootstrap, with no issuer
+acknowledgement or peer-setting edit. Native repair acquires authority evidence;
+existing all-accessible runtime roots remain unchanged.
+No identity-wide cold grant discovery or sync-completion receipt is implied.
+The bundled skill describes the handoff and limits. Ordinary faculties still require an exact workspace on
+each call. Other configuration operations grant no sharing authority; no tool
+exposes a private key, token or arbitrary path editor. The app must be open;
+this is not remote admin.

@@ -827,7 +827,14 @@ fn node_session(
                         let snapshot = peer.snapshot()?;
                         if previous_snapshot.as_ref().is_none_or(|previous| snapshot.changes_since(previous) != StoreChanges::NONE) {
                             let roots = with_node(&node, NodeStore::workspace_roots)?;
-                            let next = AllAccessible::discover(&snapshot, signer.verifying_key(), roots)?;
+                            let mut next = AllAccessible::discover(&snapshot, signer.verifying_key(), roots)?;
+                            // Local enrollment is consent to known-C acquisition,
+                            // not proof issuance. A server's resident evidence
+                            // admits repair before our READ proofs/definitions
+                            // arrive. Full held(C) hydration also acquires custom
+                            // delegate definitions outside descriptor warmup.
+                            next.sync.extend(with_node(&node, NodeStore::enrolled_roots)?);
+                            next.sync.sort_unstable(); next.sync.dedup();
                             if previous_snapshot.is_none() || selection.sync != next.sync {
                                 peer.set_replication(ReplicationMode::Full, next.sync.iter().copied());
                                 peer.activate_collections(next.sync.iter().copied());

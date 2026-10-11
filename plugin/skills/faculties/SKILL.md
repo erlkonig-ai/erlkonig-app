@@ -1,6 +1,6 @@
 ---
 name: faculties
-description: Use Erlkonig faculties for durable goals, notes, memories, files and messages, or to configure Erlkonig workspaces and node services through its local integration.
+description: Use Erlkonig faculties for durable goals, notes, memories, files and messages, or to configure and share Erlkonig workspaces and node services through its local integration.
 ---
 
 # Faculties
@@ -30,9 +30,74 @@ peer-ID settings. A port change requires app restart and integration refresh.
 Pass the inspected observation on each edit. If stale, inspect again and
 reconsider the intended change; do not blindly replay it. Conflicted settings
 need an explicit complete reconciliation. Configure only what the user asked
-to change. Configuration does not grant collection access, change identity or
-choose a workspace for another call. Never paste secrets into these tools or
+to change. Bundle/settings edits do not grant collection access, change identity
+or choose a workspace for another call. Sharing uses the explicit sharing
+operations below. Never paste secrets into these tools or
 send a public identity to another person without a request to do so.
+
+## Share a workspace
+
+For a requested share, inspect the current workspace and ask the intended
+recipient to obtain their **public node identity** from their own
+`config_inspect`. No secret key, pile path or replacement identity is needed.
+Use `config_share_workspace` with the exact current workspace revision,
+recipient identity and the user's read-only or read/write choice. The native
+grant covers only the currently resolved roots and actions, not older or future
+workspace membership. A workspace edit does not expand or revoke an issued
+share. Grants are valid immediately, additive and non-expiring; removing a local workspace
+does not withdraw another node's authority. A narrower share does not
+remove permissions the recipient already holds.
+
+Leave `delegate` false unless the user explicitly opts in after you explain
+the consequence: **the recipient may invite additional participants within
+these exact roots/actions without the original user choosing each person**.
+Invocation alone never permits onward delegation. Also explain that disclosed
+or copied data cannot be made unread, whether or not delegation is enabled.
+Ask about the consequence in ordinary language, not capability jargon.
+
+Hand the opaque returned `bootstrap` unchanged to the intended recipient only
+through the user-requested channel. It contains signed role/root metadata and
+exact descriptor/name blobs, not capability proofs, definition bodies, keys or
+member payloads. Current native sync
+has no identity-wide cold grant discovery: this is a one-way bootstrap, not a
+request/approve/acknowledge protocol. Do not print its internal handles
+unnecessarily or reconstruct it.
+
+On the recipient's node, call `config_probe_workspace_share` first. This is
+read-only: it verifies the native signature and recipient binding, NOT actual
+collection admission. It reports the issuer's declared access choice and
+reports the current exact collection names/roles/roots without importing,
+activating repair, downloading bodies or starting upkeep. Explain what is
+available and the disk/network/maintenance consequences. Let the user/agent
+choose whether to enroll it and a friendly **local label**. Do not infer roles
+by parsing names or expand membership from common descriptor tags.
+
+For that chosen enrollment, inspect and call `config_enroll_workspace_share`
+with the bootstrap, local label and latest observation. It imports descriptor/
+name metadata and configures the **same roots and role routes under the existing
+node key**. Rights already existed: no acknowledgement or approval goes to the
+source. Use the returned local workspace ID on subsequent faculty calls;
+there is no global default. Repeat unchanged enrollment returns the same
+workspace, never overwriting a later edit or resurrecting a withdrawal.
+
+Enrollment selects known roots for Full bootstrap even while local READ
+evidence is pending. The server's resident native evidence admits the endpoint;
+AUTH repair supplies proofs, descriptor warmup supplies policy definitions,
+and Full held(C) hydration supplies custom delegate definitions. Native
+evidence still governs local reads/writes and upkeep. Existing all-accessible
+node selection remains unchanged: do not claim arbitrary resident unenrolled
+grants are globally resource-gated. Off-store probing selects nothing.
+
+Share/enroll responses confirm local publication, **not replica synchronization
+or payload availability**. Enrollment keeps service settings and peers unchanged
+but selects its roots for existing enabled sync/maintenance. If paused, explain
+that data may remain unavailable. Issuer identity is only a routing hint;
+native descriptor/contact/provider discovery can remain pending. Never silently
+edit peer settings. Native grant and metadata validation precede publication;
+the final Config workspace is one native commit, but the append-only metadata
+publication is not a rollback transaction. Interrupted I/O may retain metadata.
+Removing enrollment does not promise immediate native topic deactivation.
+Reinspect after an error; do not invent a key-copy, shell-grant or second-service workaround.
 
 ## Choose the data workspace
 
@@ -60,10 +125,11 @@ payloads. Workspace selection does not change the node's sync or maintenance
 settings or start a second service. Node synchronization includes permitted
 collections independently of the current request's workspace.
 
-If access is missing, explain that the collection owner must invite or grant
-the existing node identity the required read/write capability. Config tools
-do not send access requests or import invitations. Do not invent
-that flow, ask for a secret key, or create another identity as a workaround.
+If access is missing, explain that a node with the appropriate native grant
+authority must invite the existing node identity with the required access.
+Use the sharing workflow above when requested. Other Config tools and public
+peer bootstrap hints do not grant authority. Never ask for a secret key or
+create another identity as a workaround.
 
 Reading workspace A and writing workspace B require separate explicit calls
 and the user's authority for that destination. Selection does not automatically

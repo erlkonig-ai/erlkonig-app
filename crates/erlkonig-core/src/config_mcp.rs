@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use triblespace::core::collection::CollectionHandle;
 use triblespace::core::metadata;
 use triblespace::core::query::register::{ObservationOrder, maximal};
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
 use triblespace_net::health_record;
 
@@ -53,6 +54,21 @@ const TOOLS: &[Tool] = &[
         name: "config_remove_workspace",
         description: "Withdraw exactly one current workspace revision, including an unavailable or conflicted revision shown by config_inspect. Other concurrent revisions remain visible; no winner is guessed. Collections, data, sharing authority, identity and services remain unchanged. Requires the latest observation from config_inspect.",
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"workspace":{"type":"string"}},"required":["observation","workspace"],"additionalProperties":false}"#,
+    },
+    Tool {
+        name: "config_share_workspace",
+        description: "Share an exact current workspace revision's resolved collection bundle with an exact recipient public node identity. access is read_only or read_write; delegate defaults false (invoke-only). Native grants are valid immediately, without recipient approval or acknowledgement. Returns bounded signed role/root/descriptor-name metadata, never proof or definition payload. Current native sync has no identity-wide unknown-collection grant inbox; enrolled known roots acquire authority evidence through native repair. Only these roots/actions are granted: no old or future membership, settings, keys or global workspace selection. Before choosing delegate=true, explain and obtain the user's choice: the recipient may invite additional participants within these roots/actions without the original user choosing each one. Disclosed or copied data cannot be made unread. Native per-collection authority must support every requested grant; reader/writer access alone does not confer onward delegation. Requires the latest config_inspect observation.",
+        input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"workspace":{"type":"string"},"recipient":{"type":"string"},"access":{"type":"string","enum":["read_only","read_write"]},"delegate":{"type":"boolean","default":false}},"required":["observation","workspace","recipient","access"],"additionalProperties":false}"#,
+    },
+    Tool {
+        name: "config_probe_workspace_share",
+        description: "Read-only verification of bounded signed workspace metadata on its intended recipient node. Checks the native signature and recipient binding; reports source label, exact descriptor names/roles/roots and the issuer's declared access/delegation choice. Actual native collection admission is NOT confirmed by this probe; enrolled known roots acquire evidence through native repair. Does not import evidence, enroll a workspace, activate repair, download payloads or start maintenance. Explain contents and resource consequences, then let the recipient user/agent choose whether to enroll and a local label. Rights already exist; probing/enrollment is not an authorization handshake and sends no reply to the source.",
+        input_schema: r#"{"type":"object","properties":{"bootstrap":{"type":"string","maxLength":4194304}},"required":["bootstrap"],"additionalProperties":false}"#,
+    },
+    Tool {
+        name: "config_enroll_workspace_share",
+        description: "After recipient-local consent, enroll a verified one-way bootstrap under a chosen nonempty local label. Imports descriptor/name metadata and configures the SAME exact roots/role routes under the existing node key; never imports proofs, copies signing keys or creates replacement data roots. Explicit enrollment selects known roots for existing enabled Full bootstrap even while local READ evidence is pending. Native server admission gates repair; native acquired evidence gates local reads/writes and maintenance. Existing all-accessible node behavior remains unchanged; no global workspace default. Authority was already valid: no approval/request/acknowledgement goes to the source. Explain additive non-expiring rights, possible onward invitations when delegate=true, and that disclosed/copied data cannot be made unread. Repeat enrollment is idempotent but never overwrites a later edit/withdrawal. Local Config publication is one native commit; preceding metadata I/O is not a multi-record transaction. Reachability/proof/definition acquisition may remain pending; issuer public identity is only a routing hint. Removing local enrollment does not promise immediate native topic deactivation. Returns local publication only, not synchronization completion. Requires the latest config_inspect observation.",
+        input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"bootstrap":{"type":"string","maxLength":4194304},"label":{"type":"string","minLength":1}},"required":["observation","bootstrap","label"],"additionalProperties":false}"#,
     },
     Tool {
         name: "config_set_settings",
@@ -130,6 +146,31 @@ struct Settings {
     sync_enabled: bool,
     maintenance_enabled: bool,
     peers: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Share {
+    observation: String,
+    workspace: String,
+    recipient: String,
+    access: crate::workspace_sharing::Access,
+    #[serde(default)]
+    delegate: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeShare {
+    bootstrap: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollShare {
+    observation: String,
+    bootstrap: String,
+    label: String,
 }
 
 fn current(view: &ConfigView, observation: &str) -> Result<()> {
@@ -329,6 +370,57 @@ impl ConfigMcp {
                 current(&view, &args.observation)?;
                 let id = node.remove_workspace_revision(&view, revision(&args.workspace)?)?;
                 json!({"withdrawal":format!("{id:X}"), "data_retained":true})
+            }
+            "config_share_workspace" => {
+                let args: Share = mcp::decode_arguments(arguments)?;
+                current(&view, &args.observation)?;
+                let bootstrap = node.share_workspace(
+                    &view, revision(&args.workspace)?,
+                    crate::workspace_sharing::public_identity(&args.recipient)?,
+                    args.access, args.delegate,
+                )?;
+                json!({"bootstrap":bootstrap, "workspace":args.workspace,
+                    "recipient":args.recipient, "delegate":args.delegate,
+                    "issuer_routing_hint":hex::encode(node.signer.verifying_key().to_bytes()),
+                    "handoff":"signed_workspace_metadata_only", "publication":"local_native_grants", "sync_complete":false})
+            }
+            "config_probe_workspace_share" => {
+                let args: ProbeShare = mcp::decode_arguments(arguments)?;
+                let mut prepared = node.probe_workspace_share(&args.bootstrap)?;
+                let snapshot = prepared.store.snapshot()?;
+                let mut collections = Vec::new();
+                for (role, root) in &prepared.workspace.routes {
+                    let facts: TribleSet = snapshot.get(*root)?;
+                    let mut names = Vec::new();
+                    for name in find!(name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>, pattern!(&facts, [{
+                        metadata::tag: triblespace::core::collection::records::KIND_COLLECTION_DESCRIPTOR,
+                        triblespace::core::collection::records::collection_name: ?name,
+                    }])) {
+                        let name: View<str> = snapshot.get(name)?;
+                        names.push(name.to_string());
+                    }
+                    names.sort(); names.dedup();
+                    collections.push(json!({"role":faculties::collection_names::name_for(*role),
+                        "role_id":format!("{role:X}"),"root":format!("blake3:{}",hex::encode(root.raw)),"names":names}));
+                }
+                json!({"source_workspace":format!("{:X}",prepared.source),
+                    "source_label":prepared.workspace.label, "issuer":hex::encode(prepared.issuer.to_bytes()),
+                    "recipient":hex::encode(self.binding.signer), "collections":collections,
+                    "access":if prepared.write { "read_write" } else { "read_only" },
+                    "delegate":prepared.delegate, "metadata_verified":true, "recipient_bound":true,
+                    "native_admission":"not_confirmed_by_probe", "issuer_is_routing_hint_not_authority":true,
+                    "enrollment":"not_changed_by_probe", "read_only_probe":true})
+            }
+            "config_enroll_workspace_share" => {
+                let args: EnrollShare = mcp::decode_arguments(arguments)?;
+                current(&view, &args.observation)?;
+                let accepted = node.enroll_workspace_share(&view, &args.bootstrap, &args.label)?;
+                json!({"workspace":workspace_json(&accepted.workspace),
+                    "source_workspace":format!("{:X}",accepted.source),
+                    "access":if accepted.write { "read_write" } else { "read_only" },
+                    "delegate":accepted.delegate, "already_enrolled":accepted.already_enrolled,
+                    "publication":"local_workspace", "sync_complete":false, "native_admission":"requires_native_acquired_evidence",
+                    "payloads":"not transferred by enrollment; selected roots use existing enabled node sync"})
             }
             "config_set_settings" => {
                 let args: Settings = mcp::decode_arguments(arguments)?;

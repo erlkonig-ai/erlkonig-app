@@ -448,6 +448,20 @@ impl NodeStore {
         .collect())
     }
 
+    /// Current local enrollments also request native bootstrap while READ
+    /// evidence is pending. This supplements, never replaces, the existing
+    /// all-accessible acquisition policy and historical discovery seeds.
+    pub fn enrolled_roots(&mut self) -> Result<Vec<CollectionHandle>> {
+        let view = self.config()?;
+        let mut roots = std::collections::BTreeSet::new();
+        for revision in view.workspace_ids()? {
+            if let Ok(Some(workspace)) = view.workspace(revision) {
+                roots.extend(workspace.routes.values().copied());
+            }
+        }
+        Ok(roots.into_iter().collect())
+    }
+
     pub fn put_workspace(&mut self, expected: &ConfigView, value: &Workspace) -> Result<Id> {
         if self.config_changed(expected)? {
             bail!("node configuration changed since this edit was opened; reload before saving");

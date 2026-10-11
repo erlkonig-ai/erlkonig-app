@@ -41,6 +41,35 @@ fn saved_empty_bundle_roots_are_discoverable_in_another_bundle() {
 }
 
 #[test]
+fn pending_enrollment_adds_bootstrap_without_replacing_legacy_readable_roots() {
+    use triblespace::core::repo::SnapshotSource;
+    let dir = tempfile::tempdir().unwrap();
+    let bootstrap = crate::config::Bootstrap::new(dir.path());
+    let signer = crate::init::prepare(&bootstrap).unwrap();
+    let mut node = crate::node_store::NodeStore::open(&bootstrap.pile, signer.clone()).unwrap();
+    let legacy = node.pile.collection("unmapped readable graph", faculties::collection_names::private_policy(signer.verifying_key())).unwrap();
+    node.pile.commit(legacy, &signer, entity! { metadata::name: "legacy data" }).unwrap();
+    let stranger = SigningKey::from_bytes(&[74; 32]);
+    let pending = node.pile.collection("known pending root", faculties::collection_names::private_policy(stranger.verifying_key())).unwrap();
+    let mut workspace = Workspace::new("Local consent");
+    workspace.routes.insert(roles()[0].0, pending.handle());
+    let view = node.config().unwrap();
+    let revision = node.put_workspace(&view, &workspace).unwrap();
+    let seeds = node.workspace_roots().unwrap();
+    let before = AllAccessible::discover(&node.pile.snapshot().unwrap(), signer.verifying_key(), seeds).unwrap();
+    assert!(before.sync.contains(&legacy.handle()), "legacy unmapped READ behavior is preserved");
+    assert!(!before.sync.contains(&pending.handle()));
+    assert!(!before.maintenance.contains(&pending.handle()));
+    assert_eq!(node.enrolled_roots().unwrap(), [pending.handle()], "current Config selects pending bootstrap without manufacturing authority");
+    let view = node.config().unwrap();
+    node.remove_workspace_revision(&view, revision).unwrap();
+    assert!(node.enrolled_roots().unwrap().is_empty());
+    let seeds = node.workspace_roots().unwrap();
+    assert!(AllAccessible::discover(&node.pile.snapshot().unwrap(), signer.verifying_key(), seeds).unwrap().sync.contains(&legacy.handle()));
+    node.close().unwrap();
+}
+
+#[test]
 fn local_discovery_preserves_bytes_distinguishes_same_names_and_supports_exact_probe() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.pile");

@@ -328,6 +328,20 @@ fn one_store_services_ignore_workspace_edits_allow_concurrent_writers_and_close_
         )
         .unwrap();
     wait_for(&app, |s| s.sync_collections > prior);
+    // Existing automatic READ selection above is retained. Explicit consent
+    // additionally selects known C before recipient-local evidence arrives;
+    // native authority still excludes this root from Driver maintenance.
+    let stranger = ed25519_dalek::SigningKey::from_bytes(&[79; 32]);
+    let pending = external.collection("pending enrolled root", faculties::collection_names::private_policy(stranger.verifying_key())).unwrap();
+    external.flush().unwrap();
+    let before_pending = app.status();
+    let mut enrolled = erlkonig_core::workspace::Workspace::new("Chosen pending bundle");
+    enrolled.routes.insert(erlkonig_core::workspace::roles()[0].0, pending.handle());
+    let view = app.config().unwrap();
+    app.put_workspace(&view, &enrolled).unwrap();
+    wait_for(&app, |s| s.sync_collections > before_pending.sync_collections);
+    assert_eq!(app.status().maintenance_targets, before_pending.maintenance_targets);
+    assert_eq!(app.status().node.sessions_started, 1);
     app.finish().unwrap();
     external
         .commit(
