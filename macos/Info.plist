@@ -5,13 +5,15 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>Erlkönig</string>
+	<string>Erlkonig</string>
 	<key>CFBundleExecutable</key>
 	<string>erlkonig</string>
 	<key>CFBundleIdentifier</key>
 	<string>ai.erlkonig.app</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
+	<key>CFBundleIconFile</key>
+	<string>Erlkonig.icns</string>
 	<key>CFBundleName</key>
 	<string>Erlkonig</string>
 	<key>CFBundlePackageType</key>
@@ -27,8 +29,8 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>Erlkönig</string>
+	<string>Erlkonig</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Erlkönig finds your other computers on the local network so it can sync your pile with them directly.</string>
+	<string>Erlkonig finds your other computers on the local network so it can sync your pile with them directly.</string>
 </dict>
 </plist>
