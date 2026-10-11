@@ -272,6 +272,42 @@ credential is required. See the probe's own output for the precise evidence;
 mock transport results are not native binary acceptance. No validation step
 requires changing real client profiles or opening the GUI.
 
+To package an already signed candidate without rebuilding or changing it:
+
+```sh
+scripts/package-dmg.sh --app /absolute/path/Erlkonig.app --out /absolute/output/directory
+```
+
+The default output directory is `dist.noindex`; the selected directory is
+created if needed, but its parent must already exist. The filename includes the
+bundle version, build and actual architecture, for example
+`Erlkonig-0.1.0-1-macos-arm64-development.dmg`. Only arm64 is currently supported.
+Existing outputs are refused unless `--overwrite` is explicit; a failed run
+leaves the previous image intact. The command uses `ditto` to preserve the
+bundle, adds an `/Applications` link, creates a read-only compressed UDZO image,
+then mounts it read-only without opening Finder. It checks the root inventory,
+byte equality with the input bundle and its signature, and detaches before
+publishing. Temporary staging and owned mounts are cleaned up on failure.
+Nothing is launched, installed or configured. Run the narrow packaging checks
+with `scripts/accept/dmg.sh /absolute/path/Erlkonig.app`.
+
+This is **local development packaging**, not an external release gate. It
+preserves the app's existing signature, does not sign the DMG, and does not
+upload, notarize or staple anything. An ad-hoc app is not a Developer ID release;
+do not promise testers a frictionless Gatekeeper experience or bypass quarantine.
+The allowlisted bundle contains the executable, icon, source plugin templates
+and build provenance, not a pile, key, config, token or prepared personal plugin
+cache. Provenance can contain non-secret absolute build/source paths; inspect it
+before external distribution if that information matters.
+
+For an explicitly authorized direct release, follow
+[Apple's packaging guidance](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution):
+sign code inside-out with Developer ID and the appropriate runtime/timestamp
+settings, sign the outer DMG, notarize that outermost container and staple its
+ticket. Test the downloaded artifact on a clean supported Mac, including fresh
+installation and upgrade, rather than treating a local mount check as those
+tests. Signing credentials and external submission are separate release work.
+
 The adjacent native dependency repositories must be the frozen source cohort
 recorded by the validation run. See `TESTING-for-JP.md` for the remaining
 interactive checks; automated success is not a claim those checks occurred.
