@@ -386,7 +386,12 @@ impl StopCause {
     fn new(reason: &str, code: ServiceCode) -> Self { Self { reason: reason.into(), code } }
     fn guard(error: &anyhow::Error) -> Self {
         let code = match error.downcast_ref::<crate::resource_guard::Failure>() {
+            #[cfg(not(target_os = "macos"))]
             Some(crate::resource_guard::Failure::RssLimit) => ServiceCode::ResourceRssLimit,
+            // The existing generic code is truthful for footprint; the shared
+            // RSS-specific vocabulary remains reserved for actual RSS stops.
+            #[cfg(target_os = "macos")]
+            Some(crate::resource_guard::Failure::FootprintLimit) => ServiceCode::ResourceLimit,
             Some(crate::resource_guard::Failure::HeadroomLimit) => ServiceCode::ResourceHeadroomLimit,
             None => ServiceCode::ResourceObservationFailed,
         };
@@ -993,6 +998,25 @@ fn session_result(
 mod tests {
     use super::*;
 
+    #[test]
+    fn guard_stop_uses_the_platform_memory_vocabulary() {
+        let cause = StopCause::guard(&crate::resource_guard::check(48 * 1024 * 1024 * 1024, 100)
+            .unwrap_err());
+        if cfg!(target_os = "macos") {
+            assert_eq!(cause.code, ServiceCode::ResourceLimit);
+            assert!(cause.reason.contains("physical footprint reached 48 GiB"));
+            assert!(!cause.reason.contains("RSS"));
+            assert!(!cause.code.description().contains("RSS"));
+        } else {
+            assert_eq!(cause.code, ServiceCode::ResourceRssLimit);
+            assert!(cause.reason.contains("RSS reached 48 GiB"));
+        }
+        let headroom = StopCause::guard(&crate::resource_guard::check(1024, 19).unwrap_err());
+        assert_eq!(headroom.code, ServiceCode::ResourceHeadroomLimit);
+        let invalid = StopCause::guard(&crate::resource_guard::check(1024, 101).unwrap_err());
+        assert_eq!(invalid.code, ServiceCode::ResourceObservationFailed);
+    }
+
     fn wait_for(app: &Runtime, predicate: impl Fn(&Status) -> bool) -> Status {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -1073,7 +1097,11 @@ mod tests {
             ("cleanup".into(), "endpoint_shutdown_timeout".into()),
             ("cleanup".into(), "store_close_failed".into()),
             ("session".into(), "session_failed".into()),
-            ("stop".into(), "resource_rss_limit".into()),
+            ("stop".into(), if cfg!(target_os = "macos") {
+                "resource_limit".into()
+            } else {
+                "resource_rss_limit".into()
+            }),
         ]);
         drop(observed);
         drop(snapshot);
@@ -1488,10 +1516,10 @@ mod tests {
             // The controller deliberately started this task, then its guard
             // fired before synchronous setup published startup status. No
             // timing or actual memory pressure is needed to force this order.
-            let reason = crate::resource_guard::check(48 * 1024 * 1024 * 1024, 100)
-                .unwrap_err()
-                .to_string();
-            cancel.send_replace(Some(StopCause::new(&reason, ServiceCode::ResourceRssLimit)));
+            let cause = StopCause::guard(&crate::resource_guard::check(48 * 1024 * 1024 * 1024, 100)
+                .unwrap_err());
+            let reason = cause.reason.clone();
+            cancel.send_replace(Some(cause));
             update(&status, |s| s.node.stop_reason = Some(reason.clone()));
             node_session(
                 &binding,
