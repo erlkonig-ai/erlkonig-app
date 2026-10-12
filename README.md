@@ -142,7 +142,8 @@ starting acquisition peers. Native owners and safe pile handles end with the app
 Maintenance uses a dedicated four-worker CPU pool, dependency-first ordering,
 and value-change gating at a one-second cadence. Sync owns its startup/periodic
 held-blob walker (four workers, 30-minute interval). The in-process resource
-guard pauses services at 48 GiB process RSS or below 20% kernel memory headroom
+guard pauses services at 48 GiB process physical footprint on macOS (RSS elsewhere)
+or below 20% kernel memory headroom
 (`kern.memorystatus_level` on macOS, not the separate `memory_pressure`
 estimate). The UI remains responsive; service threads use Darwin background
 priority. Stopped services retain their initiating stop reason separately from
