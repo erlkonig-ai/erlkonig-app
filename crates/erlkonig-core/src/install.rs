@@ -365,10 +365,20 @@ fn read_inventory(
     cwd: &Path,
     cancel: &AtomicBool,
 ) -> Result<Inventory, String> {
-    parse_inventory(
-        host,
-        &run(program, &["plugin", "list", "--json"], cwd, cancel)?,
-    )
+    let args: &[&str] = match host {
+        // Only this local inventory request suppresses remote plugin discovery.
+        Host::OpenAi => &[
+            "--disable",
+            "remote_plugin",
+            "plugin",
+            "list",
+            "--marketplace",
+            MARKETPLACE,
+            "--json",
+        ],
+        Host::ClaudeCode => &["plugin", "list", "--json"],
+    };
+    parse_inventory(host, &run(program, args, cwd, cancel)?)
 }
 
 pub fn marketplace_root(layout: &Layout) -> PathBuf {
@@ -740,6 +750,43 @@ mod tests {
             inventory_menu_state(Some(&synced)),
             (Some(false), true, "account-managed")
         );
+    }
+
+    #[test]
+    fn inventory_argv_is_local_for_codex_and_unchanged_for_claude() {
+        for (host, response, expected) in [
+            (
+                Host::OpenAi,
+                r#"{"installed":[{"pluginId":"erlkonig@erlkonig-local","installed":true,"enabled":true}]}"#,
+                "--disable\nremote_plugin\nplugin\nlist\n--marketplace\nerlkonig-local\n--json\n",
+            ),
+            (
+                Host::ClaudeCode,
+                r#"[{"id":"erlkonig@erlkonig-local","scope":"user","enabled":true}]"#,
+                "plugin\nlist\n--json\n",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let layout = Layout::new(temp.path().to_path_buf());
+            let program = temp.path().join(host.program());
+            fs::write(
+                &program,
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > argv.txt\ncat inventory.json\n",
+            )
+            .unwrap();
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(temp.path().join("inventory.json"), response).unwrap();
+            let state =
+                inventory_with_client(host, &program, &layout, &AtomicBool::new(false)).unwrap();
+            assert_eq!(
+                fs::read_to_string(temp.path().join("argv.txt")).unwrap(),
+                expected
+            );
+            assert_eq!(
+                inventory_menu_state(Some(&Ok(state))),
+                (Some(true), true, "installed")
+            );
+        }
     }
 
     #[test]
