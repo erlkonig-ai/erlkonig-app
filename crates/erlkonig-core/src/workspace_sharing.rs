@@ -79,6 +79,8 @@ pub(crate) struct Enrolled {
     pub write: bool,
     pub delegate: bool,
     pub already_enrolled: bool,
+    /// An enrolled workspace gained routes in a new revision.
+    pub extended: bool,
 }
 
 /// Operation-local signed metadata, not native collection admission or a
@@ -440,6 +442,7 @@ impl NodeStore {
                 write: prepared.write,
                 delegate: prepared.delegate,
                 already_enrolled: true,
+                extended: false,
             });
         }
         self.publish_share_metadata(&mut prepared)?;
@@ -457,6 +460,7 @@ impl NodeStore {
             write: prepared.write,
             delegate: prepared.delegate,
             already_enrolled: false,
+            extended: false,
         })
     }
 }

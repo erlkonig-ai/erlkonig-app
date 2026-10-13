@@ -19,6 +19,16 @@
 //! references, or carry tags this module does not model. None of that is an
 //! error of the listing: what cannot be read degrades one entry, with the
 //! reason, and what is no collection is skipped and counted.
+//!
+//! Claims and admission are reported apart. What a proof's edges say they
+//! grant is a claim; whether this node is admitted under the resident
+//! descriptor is what it can do. A chain nobody's policy admits claims as
+//! loudly as a good one, so no claim is ever presented as effective.
+//!
+//! Enrollment acts on exactly the roots the listing showed. The caller hands
+//! them back; if the grant group has changed since, the call refuses and
+//! names the difference. Roots that arrive later under an enrolled anchor
+//! are shown beside the enrolled workspace and extend it with a new revision.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -37,6 +47,11 @@ use crate::node_schema as attrs;
 use crate::node_store::{ConfigView, NodeStore};
 use crate::workspace::Workspace;
 use crate::workspace_sharing::Enrolled;
+
+/// Hex of a collection handle, as the listing prints it.
+fn handle_hex(root: &CollectionHandle) -> String {
+    format!("blake3:{}", hex::encode(root.raw))
+}
 
 /// Where a collection's faculty role was read from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,10 +85,11 @@ pub(crate) struct GrantedCollection {
     pub role: Option<(Id, RoleSource)>,
     /// Keys that signed the edge naming this node, as public identities.
     pub issuers: BTreeSet<[u8; 32]>,
-    /// Actions the resident definitions of those edges grant.
-    pub read: bool,
-    pub write: bool,
-    pub delegate: bool,
+    /// Actions the resident definitions of those edges claim. A claim says
+    /// nothing about admission; `admitted` does.
+    pub claimed_read: bool,
+    pub claimed_write: bool,
+    pub claimed_delegate: bool,
     /// Edges naming this node whose definition blob is not resident.
     pub definitions_pending: usize,
     /// Native READ/WRITE admission under the resident descriptor, when it
@@ -83,15 +99,59 @@ pub(crate) struct GrantedCollection {
     pub enrolled_locally: bool,
 }
 
+/// The local workspace state for one anchor.
+#[derive(Clone, Debug)]
+pub(crate) enum LocalWorkspace {
+    /// No local revision exists.
+    None,
+    /// One current local workspace, every route of it granted; roots shown
+    /// beside it extend it.
+    Enrolled(Workspace),
+    /// A local revision exists but is withdrawn, in conflict, or routes a
+    /// root the grant does not cover; enrollment will not overwrite it.
+    ChangedOrWithdrawn,
+}
+
+impl LocalWorkspace {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Enrolled(_) => "enrolled",
+            Self::ChangedOrWithdrawn => "changed_or_withdrawn",
+        }
+    }
+}
+
 /// Granted collections sharing one issuing workspace anchor.
 #[derive(Clone, Debug)]
 pub(crate) struct PendingShare {
     pub anchor: Id,
     pub label: Option<String>,
     pub collections: Vec<GrantedCollection>,
-    /// A local workspace revision for this anchor exists (current, changed
-    /// or withdrawn); enrollment will not overwrite it.
-    pub local_revision: bool,
+    pub local: LocalWorkspace,
+}
+
+impl PendingShare {
+    /// What admission under the resident descriptors grants this node across
+    /// the group. Never derived from claims; a root whose admission could
+    /// not be evaluated counts as not admitted.
+    pub(crate) fn admitted_access(&self) -> &'static str {
+        let admitted = || self.collections.iter().map(|row| row.admitted.unwrap_or((false, false)));
+        if admitted().all(|(read, write)| read && write) {
+            "read_write"
+        } else if admitted().all(|(read, _)| read) {
+            "read_only"
+        } else if admitted().any(|(read, _)| read) {
+            "partial"
+        } else {
+            "none"
+        }
+    }
+
+    /// At least one root admits this node as a reader.
+    pub(crate) fn admitted_any(&self) -> bool {
+        self.collections.iter().any(|row| row.admitted.is_some_and(|(read, _)| read))
+    }
 }
 
 /// One listing: grouped shares, roots without a single anchor, and the
@@ -128,9 +188,30 @@ fn label_of(name: &str, role: Option<Id>) -> String {
         .to_owned()
 }
 
-/// Current and withdrawn local revisions for one anchor exist at all.
-fn has_local_revision(facts: &TribleSet, anchor: Id) -> bool {
-    exists!(pattern!(facts, [{ _?state @ metadata::tag: attrs::WORKSPACE, config::anchor: anchor }]))
+/// The local workspace state for `anchor`, given the roots granted under it.
+fn local_workspace(
+    expected: &ConfigView,
+    facts: &TribleSet,
+    anchor: Id,
+    granted: &BTreeSet<CollectionHandle>,
+) -> Result<LocalWorkspace> {
+    let order = ObservationOrder::new(facts, metadata::supersedes.id());
+    let current: Vec<Id> = find!(id: Id, and!(
+        pattern!(facts, [{ ?id @ metadata::tag: attrs::WORKSPACE, config::anchor: anchor }]),
+        maximal(id, &order),
+    ))
+    .collect();
+    if current.is_empty() {
+        return Ok(LocalWorkspace::None);
+    }
+    if let [revision] = current[..] {
+        if let Some(workspace) = expected.workspace(revision)? {
+            if workspace.routes.values().all(|root| granted.contains(root)) {
+                return Ok(LocalWorkspace::Enrolled(workspace));
+            }
+        }
+    }
+    Ok(LocalWorkspace::ChangedOrWithdrawn)
 }
 
 /// The current local workspace equal to `workspace`, when repeat enrollment
@@ -196,9 +277,9 @@ impl NodeStore {
                         anchor: None,
                         role: None,
                         issuers: BTreeSet::new(),
-                        read: false,
-                        write: false,
-                        delegate: false,
+                        claimed_read: false,
+                        claimed_write: false,
+                        claimed_delegate: false,
                         definitions_pending: 0,
                         admitted: None,
                         enrolled_locally: local_roots.contains(&root),
@@ -206,9 +287,10 @@ impl NodeStore {
                     row.issuers.insert(issuer.to_bytes());
                     if snapshot.contains_blob(capability)? {
                         let definition: TribleSet = snapshot.get(capability)?;
-                        row.read |= exists!(pattern!(&definition, [{ capability_action: ACTION_READ }]));
-                        row.write |= exists!(pattern!(&definition, [{ capability_action: ACTION_WRITE }]));
-                        row.delegate |= exists!(pattern!(&definition, [{ capability_delegate_action: _?action }]));
+                        row.claimed_read |= exists!(pattern!(&definition, [{ capability_action: ACTION_READ }]));
+                        row.claimed_write |= exists!(pattern!(&definition, [{ capability_action: ACTION_WRITE }]));
+                        row.claimed_delegate |=
+                            exists!(pattern!(&definition, [{ capability_delegate_action: _?action }]));
                     } else {
                         row.definitions_pending += 1;
                     }
@@ -294,7 +376,14 @@ impl NodeStore {
         let mut groups: BTreeMap<Id, PendingShare> = BTreeMap::new();
         let mut ungrouped = Vec::new();
         let (collections, skipped) = self.granted_collections(expected)?;
+        // Every granted root of an anchor, routed locally or not: the local
+        // workspace state is judged against the whole grant, while the
+        // listing shows only what is not routed yet.
+        let mut granted_by_anchor: BTreeMap<Id, BTreeSet<CollectionHandle>> = BTreeMap::new();
         for row in collections {
+            if let Some(anchor) = row.anchor {
+                granted_by_anchor.entry(anchor).or_default().insert(row.root);
+            }
             if row.enrolled_locally && !all {
                 continue;
             }
@@ -306,7 +395,7 @@ impl NodeStore {
                 anchor,
                 label: None,
                 collections: Vec::new(),
-                local_revision: has_local_revision(&facts, anchor),
+                local: LocalWorkspace::None,
             });
             if share.label.is_none() {
                 share.label = row
@@ -315,6 +404,10 @@ impl NodeStore {
                     .map(|name| label_of(name, row.role.map(|(role, _)| role)));
             }
             share.collections.push(row);
+        }
+        for share in groups.values_mut() {
+            let granted = &granted_by_anchor[&share.anchor];
+            share.local = local_workspace(expected, &facts, share.anchor, granted)?;
         }
         Ok(PendingListing {
             shares: groups.into_values().collect(),
@@ -326,15 +419,19 @@ impl NodeStore {
     /// Publish a local workspace over exactly the granted roots of one
     /// anchor and select them, as bootstrap enrollment does. No proof,
     /// descriptor or key is imported, copied or created.
+    ///
+    /// `roots` are the handles the listing showed for the anchor: the whole
+    /// granted set, or, beside an enrolled workspace, the roots not routed
+    /// yet. Any other set refuses and names the difference. A label is
+    /// required for a first enrollment and preserved otherwise unless given.
     pub(crate) fn enroll_pending_share(
         &mut self,
         expected: &ConfigView,
         anchor: Id,
-        label: &str,
+        roots: &BTreeSet<CollectionHandle>,
+        label: Option<&str>,
     ) -> Result<Enrolled> {
-        if label.trim().is_empty() {
-            bail!("local workspace label is required");
-        }
+        let label = label.map(str::trim).filter(|label| !label.is_empty());
         if self.config_changed(expected)? {
             bail!("node configuration changed; inspect before enrolling");
         }
@@ -344,10 +441,43 @@ impl NodeStore {
             .into_iter()
             .find(|share| share.anchor == anchor)
             .context("no resident grant names a collection with this workspace anchor; call config_list_pending_shares")?;
+        let granted: BTreeSet<CollectionHandle> = share.collections.iter().map(|row| row.root).collect();
+        let shown: BTreeSet<CollectionHandle> = share
+            .collections
+            .iter()
+            .filter(|row| !row.enrolled_locally)
+            .map(|row| row.root)
+            .collect();
+        if *roots != granted && (shown.is_empty() || *roots != shown) {
+            let listed = if shown.is_empty() { &granted } else { &shown };
+            let hexes = |roots: Vec<&CollectionHandle>| {
+                roots.into_iter().map(handle_hex).collect::<Vec<_>>().join(", ")
+            };
+            let mut difference = Vec::new();
+            let arrived: Vec<_> = listed.difference(roots).collect();
+            if !arrived.is_empty() {
+                difference.push(format!("granted now but not given: {}", hexes(arrived)));
+            }
+            let gone: Vec<_> = roots.difference(&granted).collect();
+            if !gone.is_empty() {
+                difference.push(format!("given but not granted under this anchor: {}", hexes(gone)));
+            }
+            let routed: Vec<_> = roots
+                .iter()
+                .filter(|root| granted.contains(*root) && !listed.contains(*root))
+                .collect();
+            if !routed.is_empty() {
+                difference.push(format!("given but already routed locally: {}", hexes(routed)));
+            }
+            bail!(
+                "the roots granted under this anchor differ from the roots given ({}); call config_list_pending_shares again and enroll exactly what it shows",
+                difference.join("; ")
+            );
+        }
         let mut workspace = Workspace {
             id: anchor,
             anchor,
-            label: label.trim().to_owned(),
+            label: String::new(),
             routes: BTreeMap::new(),
         };
         let mut write = true;
@@ -362,18 +492,42 @@ impl NodeStore {
             if workspace.routes.insert(role, collection.root).is_some() {
                 bail!("this share grants two collections for one faculty role; enroll it with explicit routes");
             }
-            write &= collection.write;
-            delegate &= collection.delegate;
+            write &= collection.claimed_write;
+            delegate &= collection.claimed_delegate;
         }
-        if let Some(existing) = existing_enrollment(expected, &workspace)? {
-            return Ok(Enrolled {
-                workspace: existing,
-                source: anchor,
-                write,
-                delegate,
-                already_enrolled: true,
-            });
-        }
+        let existing = match share.local {
+            LocalWorkspace::None => None,
+            LocalWorkspace::Enrolled(existing) => Some(existing),
+            LocalWorkspace::ChangedOrWithdrawn => {
+                bail!("this share's local workspace was changed or withdrawn; enrollment will not overwrite it")
+            }
+        };
+        let extended = match existing {
+            None => {
+                workspace.label = label.context("local workspace label is required")?.to_owned();
+                false
+            }
+            Some(existing) => {
+                if existing.routes == workspace.routes {
+                    if label.is_some_and(|label| label != existing.label) {
+                        bail!("this share is already enrolled under another label; enrollment will not rename it");
+                    }
+                    return Ok(Enrolled {
+                        workspace: existing,
+                        source: anchor,
+                        write,
+                        delegate,
+                        already_enrolled: true,
+                        extended: false,
+                    });
+                }
+                if !existing.routes.iter().all(|(role, root)| workspace.routes.get(role) == Some(root)) {
+                    bail!("this share's local workspace routes differ from the grant; enrollment will not overwrite it");
+                }
+                workspace.label = label.map(str::to_owned).unwrap_or(existing.label);
+                true
+            }
+        };
         workspace.id = self.put_workspace(expected, &workspace)?;
         Ok(Enrolled {
             workspace,
@@ -381,6 +535,7 @@ impl NodeStore {
             write,
             delegate,
             already_enrolled: false,
+            extended,
         })
     }
 }

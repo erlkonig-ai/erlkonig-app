@@ -2,7 +2,7 @@
 //! No workspace is needed to configure the first one. These adapters retain
 //! the resident owner, not a second settings store or a client selection.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 use faculties::mcp::{self, Bytes, Faculty, Tool};
@@ -70,13 +70,13 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "config_list_pending_shares",
-        description: "List collections that resident native grants name for this node and that no current local workspace routes, grouped by the issuing workspace anchor found in their descriptor tags, with the descriptor name, faculty role (declared on the descriptor, or read from the name's role suffix: role_source says which), issuer identities, granted READ/WRITE/delegate actions and native admission. A collection whose descriptor is not yet resident is listed by handle as descriptor pending, with nothing inferred. A resident descriptor whose name blob has not arrived, or whose tags offer no single anchor, keeps its entry and says why in reason; skipped counts resident granted resources that are no collection descriptor. sync_memory_pending lists handles the running sync daemon holds grants for in memory only. Read-only: fetches, grants, imports and selects nothing. No workspace required. Enroll a group with config_enroll_pending_share; use config_create_workspace with explicit routes for anything ungrouped.",
+        description: "List collections that resident native grants name for this node and that no current local workspace routes, grouped by the issuing workspace anchor found in their descriptor tags, with the descriptor name, faculty role (declared on the descriptor, or read from the name's role suffix: role_source says which), issuer identities, the READ/WRITE/delegate actions the proof edges claim (claimed, claimed_access, claimed_delegate) and, separately, what native admission under the resident descriptor actually grants this node (admitted per root; admitted_access and admitted_any per group, which never restate a claim: a chain no policy admits reads claimed read_write with admitted_access none). local_workspace is none, enrolled (roots shown beside an enrolled workspace extend it) or changed_or_withdrawn. A collection whose descriptor is not yet resident is listed by handle as descriptor pending, with nothing inferred. A resident descriptor whose name blob has not arrived, or whose tags offer no single anchor, keeps its entry and says why in reason; skipped counts resident granted resources that are no collection descriptor. sync_memory_pending lists handles the running sync daemon holds grants for in memory only. Read-only: fetches, grants, imports and selects nothing. No workspace required. Enroll a group with config_enroll_pending_share; use config_create_workspace with explicit routes for anything ungrouped.",
         input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
     },
     Tool {
         name: "config_enroll_pending_share",
-        description: "After recipient-local consent, publish a local workspace over exactly the resident-granted collections of one workspace anchor from config_list_pending_shares, under a chosen nonempty local label, and select those roots for native sync. No bootstrap is needed: native grant exchange delivered the proofs and sync the descriptors. Imports no proofs, copies no keys, creates no replacement roots and sends no reply to the issuer. Publication completes first; selection follows and its failure does not roll back publication: reinspect before retrying. Repeat unchanged enrollment returns the same revision; a later local edit or withdrawal is never overwritten; a different label for an enrolled anchor is refused. An anchor with no resident grant, or a collection without an understood role, is refused. Explain additive non-expiring rights and that disclosed data cannot be made unread. Returns local publication only. Requires the latest config_inspect observation.",
-        input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"anchor":{"type":"string","minLength":32,"maxLength":32},"label":{"type":"string","minLength":1}},"required":["observation","anchor","label"],"additionalProperties":false}"#,
+        description: "After recipient-local consent, publish a local workspace over exactly the collections config_list_pending_shares showed for one workspace anchor and select those roots for native sync. roots is the consent unit: pass the exact collection handles the listing printed for that anchor. If the roots granted under the anchor differ from them now (a root arrived or disappeared since the listing), the call refuses, names the difference and asks for a fresh listing; nothing is widened or narrowed silently. A first enrollment needs a nonempty local label. When a workspace with that anchor is already enrolled and the listing shows new roots beside it, passing those roots extends it with a new revision (union of routes, label preserved unless given); the identical already-routed set returns the same revision; a different label for an unchanged enrolled set is refused; a changed or withdrawn local workspace is never overwritten. No bootstrap is needed: native grant exchange delivered the proofs and sync the descriptors. Imports no proofs, copies no keys, creates no replacement roots and sends no reply to the issuer. Publication completes first; selection follows and its failure does not roll back publication: reinspect before retrying. An anchor with no resident grant, or a collection without an understood role, is refused. Explain additive non-expiring rights and that disclosed data cannot be made unread. Returns local publication only, with the claimed access, not admission. Requires the latest config_inspect observation.",
+        input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"anchor":{"type":"string","minLength":32,"maxLength":32},"roots":{"type":"array","items":{"type":"string"},"minItems":1},"label":{"type":"string","minLength":1}},"required":["observation","anchor","roots"],"additionalProperties":false}"#,
     },
     Tool {
         name: "config_set_settings",
@@ -185,7 +185,8 @@ struct EnrollShare {
 struct EnrollPending {
     observation: String,
     anchor: String,
-    label: String,
+    roots: Vec<String>,
+    label: Option<String>,
 }
 
 fn current(view: &ConfigView, observation: &str) -> Result<()> {
@@ -223,7 +224,7 @@ fn granted_json(value: &crate::workspace_grants::GrantedCollection) -> Value {
         "role_id": value.role.map(|(role, _)| format!("{role:X}")),
         "role_source": value.role.map(|(_, source)| source.as_str()),
         "issuers": value.issuers.iter().map(hex::encode).collect::<Vec<_>>(),
-        "granted": {"read": value.read, "write": value.write, "delegate": value.delegate,
+        "claimed": {"read": value.claimed_read, "write": value.claimed_write, "delegate": value.claimed_delegate,
             "definitions_pending": value.definitions_pending},
         "admitted": value.admitted.map(|(read, write)| json!({"read": read, "write": write})),
     })
@@ -233,7 +234,7 @@ fn enrolled_json(accepted: &crate::workspace_sharing::Enrolled) -> Value {
     json!({"workspace":workspace_json(&accepted.workspace),
         "source_workspace":format!("{:X}",accepted.source),
         "access":if accepted.write { "read_write" } else { "read_only" },
-        "delegate":accepted.delegate, "already_enrolled":accepted.already_enrolled,
+        "delegate":accepted.delegate, "already_enrolled":accepted.already_enrolled, "extended":accepted.extended,
         "publication":"local_workspace", "sync_complete":false, "native_admission":"requires_native_acquired_evidence",
         "payloads":"not transferred by enrollment; selected roots use existing enabled node sync"})
 }
@@ -480,13 +481,15 @@ impl ConfigMcp {
                     "shares":shares.iter().map(|share| {
                         let mut issuers = std::collections::BTreeSet::new();
                         for row in &share.collections { issuers.extend(row.issuers.iter().map(hex::encode)); }
-                        let enrollable = !share.local_revision
+                        let enrollable = !matches!(share.local, crate::workspace_grants::LocalWorkspace::ChangedOrWithdrawn)
                             && share.collections.iter().all(|row| row.role.is_some());
                         json!({"anchor":format!("{:X}", share.anchor), "label":share.label,
                             "issuers":issuers,
-                            "access":if share.collections.iter().all(|row| row.write) { "read_write" } else { "read_only" },
-                            "delegate":share.collections.iter().all(|row| row.delegate),
-                            "local_workspace":if share.local_revision { "changed_or_withdrawn" } else { "none" },
+                            "claimed_access":if share.collections.iter().all(|row| row.claimed_write) { "read_write" } else { "read_only" },
+                            "claimed_delegate":share.collections.iter().all(|row| row.claimed_delegate),
+                            "admitted_access":share.admitted_access(),
+                            "admitted_any":share.admitted_any(),
+                            "local_workspace":share.local.as_str(),
                             "enrollable":enrollable,
                             "collections":share.collections.iter().map(granted_json).collect::<Vec<_>>()})
                     }).collect::<Vec<_>>(),
@@ -498,7 +501,8 @@ impl ConfigMcp {
             "config_enroll_pending_share" => {
                 let args: EnrollPending = mcp::decode_arguments(arguments)?;
                 current(&view, &args.observation)?;
-                let accepted = node.enroll_pending_share(&view, anchor(&args.anchor)?, &args.label)?;
+                let roots = args.roots.iter().map(|root| parse_handle(root)).collect::<Result<BTreeSet<_>>>()?;
+                let accepted = node.enroll_pending_share(&view, anchor(&args.anchor)?, &roots, args.label.as_deref())?;
                 enrolled_json(&accepted)
             }
             "config_set_settings" => {
