@@ -70,7 +70,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "config_list_pending_shares",
-        description: "List collections that resident native grants name for this node and that no current local workspace routes, grouped by the issuing workspace anchor found in their descriptor tags, with the descriptor name, faculty role (declared on the descriptor, or read from the name's role suffix: role_source says which), issuer identities, granted READ/WRITE/delegate actions and native admission. A collection whose descriptor is not yet resident is listed by handle as descriptor pending, with nothing inferred. sync_memory_pending lists handles the running sync daemon holds grants for in memory only. Read-only: fetches, grants, imports and selects nothing. No workspace required. Enroll a group with config_enroll_pending_share; use config_create_workspace with explicit routes for anything ungrouped.",
+        description: "List collections that resident native grants name for this node and that no current local workspace routes, grouped by the issuing workspace anchor found in their descriptor tags, with the descriptor name, faculty role (declared on the descriptor, or read from the name's role suffix: role_source says which), issuer identities, granted READ/WRITE/delegate actions and native admission. A collection whose descriptor is not yet resident is listed by handle as descriptor pending, with nothing inferred. A resident descriptor whose name blob has not arrived, or whose tags offer no single anchor, keeps its entry and says why in reason; skipped counts resident granted resources that are no collection descriptor. sync_memory_pending lists handles the running sync daemon holds grants for in memory only. Read-only: fetches, grants, imports and selects nothing. No workspace required. Enroll a group with config_enroll_pending_share; use config_create_workspace with explicit routes for anything ungrouped.",
         input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
     },
     Tool {
@@ -218,6 +218,7 @@ fn granted_json(value: &crate::workspace_grants::GrantedCollection) -> Value {
         "root": format!("blake3:{}", hex::encode(value.root.raw)),
         "descriptor": if value.descriptor_resident { "resident" } else { "pending" },
         "name": value.name,
+        "reason": value.reason,
         "role": value.role.and_then(|(role, _)| faculties::collection_names::name_for(role)),
         "role_id": value.role.map(|(role, _)| format!("{role:X}")),
         "role_source": value.role.map(|(_, source)| source.as_str()),
@@ -464,7 +465,8 @@ impl ConfigMcp {
             }
             "config_list_pending_shares" => {
                 let _: Empty = mcp::decode_arguments(arguments)?;
-                let (shares, ungrouped) = node.pending_shares(&view, false)?;
+                let listing = node.pending_shares(&view, false)?;
+                let (shares, ungrouped) = (&listing.shares, &listing.ungrouped);
                 let listed: std::collections::BTreeSet<String> = shares.iter()
                     .flat_map(|share| share.collections.iter())
                     .chain(ungrouped.iter())
@@ -489,6 +491,7 @@ impl ConfigMcp {
                             "collections":share.collections.iter().map(granted_json).collect::<Vec<_>>()})
                     }).collect::<Vec<_>>(),
                     "ungrouped":ungrouped.iter().map(granted_json).collect::<Vec<_>>(),
+                    "skipped":listing.skipped,
                     "sync_memory_pending":sync_memory_pending,
                     "read_only":true, "fetched":"nothing", "enrollment":"not_changed_by_listing"})
             }

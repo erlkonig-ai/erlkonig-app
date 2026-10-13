@@ -13,6 +13,12 @@
 //! declare no role; for those the role is read from the `label · role`
 //! suffix of the descriptor name and reported as such, so a reader can see
 //! which derivation it is trusting.
+//!
+//! The reader is open world. A proof may name a resource that is no
+//! collection at all; a descriptor may arrive before the name blob it
+//! references, or carry tags this module does not model. None of that is an
+//! error of the listing: what cannot be read degrades one entry, with the
+//! reason, and what is no collection is skipped and counted.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -57,6 +63,8 @@ pub(crate) struct GrantedCollection {
     pub root: CollectionHandle,
     pub descriptor_resident: bool,
     pub name: Option<String>,
+    /// Why `name` or `anchor` is missing from a resident descriptor.
+    pub reason: Option<String>,
     /// The single non-kind tag of the descriptor, when there is exactly one.
     pub anchor: Option<Id>,
     pub role: Option<(Id, RoleSource)>,
@@ -84,6 +92,31 @@ pub(crate) struct PendingShare {
     /// A local workspace revision for this anchor exists (current, changed
     /// or withdrawn); enrollment will not overwrite it.
     pub local_revision: bool,
+}
+
+/// One listing: grouped shares, roots without a single anchor, and the
+/// number of granted resources that are no collection descriptor.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingListing {
+    pub shares: Vec<PendingShare>,
+    pub ungrouped: Vec<GrantedCollection>,
+    pub skipped: usize,
+}
+
+/// Kind tags a descriptor blob carries that are not a workspace anchor.
+const KNOWN_KINDS: [Id; 2] = [
+    records::KIND_COLLECTION_DESCRIPTOR,
+    records::KIND_COLLECTION_MAPPING,
+];
+
+fn note(reason: &mut Option<String>, text: String) {
+    match reason {
+        Some(existing) => {
+            existing.push_str("; ");
+            existing.push_str(&text);
+        }
+        None => *reason = Some(text),
+    }
 }
 
 /// The `label` of a `label · role` descriptor name, when `role` is known.
@@ -130,11 +163,13 @@ pub(crate) fn existing_enrollment(
 
 impl NodeStore {
     /// Every collection a resident proof grants to this node, annotated from
-    /// its resident descriptor. Reads one snapshot; fetches nothing.
+    /// its resident descriptor, and the count of granted resources that are
+    /// resident but no collection descriptor. Reads one snapshot; fetches
+    /// nothing.
     pub(crate) fn granted_collections(
         &mut self,
         expected: &ConfigView,
-    ) -> Result<Vec<GrantedCollection>> {
+    ) -> Result<(Vec<GrantedCollection>, usize)> {
         let me = self.signer.verifying_key();
         let mut local_roots = BTreeSet::new();
         for revision in expected.workspace_ids()? {
@@ -157,6 +192,7 @@ impl NodeStore {
                         root,
                         descriptor_resident: false,
                         name: None,
+                        reason: None,
                         anchor: None,
                         role: None,
                         issuers: BTreeSet::new(),
@@ -180,22 +216,44 @@ impl NodeStore {
                 issuer = delegate;
             }
         }
-        for row in rows.values_mut() {
-            if !snapshot.contains_blob(row.root)? {
+        let mut skipped = 0;
+        let mut collections = Vec::with_capacity(rows.len());
+        for (root, mut row) in rows {
+            if !snapshot.contains_blob(root)? {
+                collections.push(row);
                 continue;
             }
+            // A resident resource is a collection only when it decodes as
+            // facts holding one descriptor entity. Anything else is some
+            // other resource a proof may name; it is no share and is skipped.
+            let facts: Result<TribleSet, _> = snapshot.get(root);
+            let Ok(facts) = facts else {
+                skipped += 1;
+                continue;
+            };
+            let Ok(entity) = descriptor::entity(&facts) else {
+                skipped += 1;
+                continue;
+            };
             row.descriptor_resident = true;
-            let facts: TribleSet = snapshot.get(row.root).context("read granted descriptor")?;
-            let entity = descriptor::entity(&facts).context("granted blob is not a descriptor")?;
-            if let Some(name) = descriptor::name(&facts)? {
-                let name: View<str> = snapshot.get(name).context("read descriptor name")?;
-                row.name = Some(name.to_string());
+            match descriptor::name(&facts).ok().flatten() {
+                Some(name) if snapshot.contains_blob(name)? => {
+                    let name: Result<View<str>, _> = snapshot.get(name);
+                    match name {
+                        Ok(name) => row.name = Some(name.to_string()),
+                        Err(_) => note(&mut row.reason, "name unreadable".to_owned()),
+                    }
+                }
+                Some(_) => note(&mut row.reason, "name pending".to_owned()),
+                None => {}
             }
             let anchors: BTreeSet<Id> = find!(tag: Id, pattern!(&facts, [{ entity @ metadata::tag: ?tag }]))
-                .filter(|tag| *tag != records::KIND_COLLECTION_DESCRIPTOR)
+                .filter(|tag| !KNOWN_KINDS.contains(tag))
                 .collect();
-            if anchors.len() == 1 {
-                row.anchor = anchors.into_iter().next();
+            match anchors.len() {
+                1 => row.anchor = anchors.into_iter().next(),
+                0 => note(&mut row.reason, "descriptor carries no candidate anchor".to_owned()),
+                n => note(&mut row.reason, format!("descriptor carries {n} candidate anchors")),
             }
             let declared: BTreeSet<Id> =
                 find!(role: Id, pattern!(&facts, [{ entity @ attrs::collection_role: ?role }])).collect();
@@ -219,8 +277,9 @@ impl NodeStore {
                         collection.writer_is_admitted(&snapshot, me).ok()?,
                     ))
                 });
+            collections.push(row);
         }
-        Ok(rows.into_values().collect())
+        Ok((collections, skipped))
     }
 
     /// Granted collections grouped by their issuing workspace anchor. With
@@ -230,11 +289,12 @@ impl NodeStore {
         &mut self,
         expected: &ConfigView,
         all: bool,
-    ) -> Result<(Vec<PendingShare>, Vec<GrantedCollection>)> {
+    ) -> Result<PendingListing> {
         let facts = expected.facts()?;
         let mut groups: BTreeMap<Id, PendingShare> = BTreeMap::new();
         let mut ungrouped = Vec::new();
-        for row in self.granted_collections(expected)? {
+        let (collections, skipped) = self.granted_collections(expected)?;
+        for row in collections {
             if row.enrolled_locally && !all {
                 continue;
             }
@@ -256,7 +316,11 @@ impl NodeStore {
             }
             share.collections.push(row);
         }
-        Ok((groups.into_values().collect(), ungrouped))
+        Ok(PendingListing {
+            shares: groups.into_values().collect(),
+            ungrouped,
+            skipped,
+        })
     }
 
     /// Publish a local workspace over exactly the granted roots of one
@@ -274,8 +338,9 @@ impl NodeStore {
         if self.config_changed(expected)? {
             bail!("node configuration changed; inspect before enrolling");
         }
-        let (shares, _) = self.pending_shares(expected, true)?;
-        let share = shares
+        let share = self
+            .pending_shares(expected, true)?
+            .shares
             .into_iter()
             .find(|share| share.anchor == anchor)
             .context("no resident grant names a collection with this workspace anchor; call config_list_pending_shares")?;

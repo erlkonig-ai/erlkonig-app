@@ -74,8 +74,11 @@ among each descriptor's tags, with the descriptor name, faculty role (declared
 on descriptors created since 2026-10-13, otherwise read from the name's role
 suffix, and `role_source` says which), issuer identities, granted actions and
 native admission; a root whose descriptor is not yet resident is listed by
-handle as descriptor pending, with nothing inferred, and roots the sync daemon
-holds grants for in memory only appear under `sync_memory_pending`.
+handle as descriptor pending, with nothing inferred; a resident descriptor
+whose name blob has not arrived, or whose tags offer no single anchor, keeps
+its entry and says why in `reason`; granted resources that are resident but
+no collection descriptor are counted under `skipped`; and roots the sync
+daemon holds grants for in memory only appear under `sync_memory_pending`.
 `config_enroll_pending_share` then publishes a local workspace over exactly
 those roots under a chosen label and selects them, with the same idempotence
 and refusals as bootstrap enrollment. The bootstrap tools remain the fallback

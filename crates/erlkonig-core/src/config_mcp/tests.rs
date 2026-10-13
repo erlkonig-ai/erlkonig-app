@@ -145,6 +145,16 @@ impl Fixture {
     /// Deterministic stand-in for native descriptor acquisition: copy exactly
     /// the root descriptors and their names, as sync would, nothing else.
     fn publish_descriptors_to(&self, recipient: &Fixture, workspace: &Workspace) {
+        self.publish_descriptor_blobs_to(recipient, workspace, true);
+    }
+
+    /// The descriptors alone: sync may land a descriptor before the name
+    /// blob it references.
+    fn publish_bare_descriptors_to(&self, recipient: &Fixture, workspace: &Workspace) {
+        self.publish_descriptor_blobs_to(recipient, workspace, false);
+    }
+
+    fn publish_descriptor_blobs_to(&self, recipient: &Fixture, workspace: &Workspace, with_names: bool) {
         use triblespace::core::repo::transfer;
         let mut source = self.config.node.lock().unwrap();
         let source = source.as_mut().unwrap();
@@ -155,6 +165,9 @@ impl Fixture {
         for root in workspace.routes.values() {
             let facts: TribleSet = snapshot.get(*root).unwrap();
             handles.push(root.transmute());
+            if !with_names {
+                continue;
+            }
             if let Some(name) = triblespace::core::collection::descriptor::name(&facts).unwrap() {
                 handles.push(name.transmute());
             }
@@ -1101,4 +1114,174 @@ fn native_grants_refuse_withdrawn_anchors_and_report_name_derived_or_missing_rol
     let local = recipient.workspace(&accepted["workspace"]["workspace"]);
     assert_eq!(local.routes, legacy.routes);
     assert_eq!(recipient.list_pending()["shares"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn native_grants_list_a_descriptor_whose_name_blob_has_not_arrived() {
+    let owner = Fixture::new();
+    let recipient = Fixture::new();
+    let id = owner.create("Named later");
+    let original = owner.workspace(&id);
+    owner.share(&id, &recipient, "read_only", None).unwrap();
+    owner.repair_authority_to(&recipient, &original);
+    // Sync can land a descriptor before the name blob it references. The
+    // descriptor carries the anchor and the declared role, so the share is
+    // grouped and nothing about the name is invented.
+    owner.publish_bare_descriptors_to(&recipient, &original);
+    let pending = recipient.list_pending();
+    assert_eq!(pending["ungrouped"], json!([]));
+    assert_eq!(pending["skipped"], 0);
+    let shares = pending["shares"].as_array().unwrap();
+    assert_eq!(shares.len(), 1, "a missing name degrades the entry, never the listing");
+    let share = &shares[0];
+    assert_eq!(share["anchor"], format!("{:X}", original.anchor));
+    assert!(share["label"].is_null(), "no name, no invented label: {share}");
+    assert_eq!(share["enrollable"], true, "roles are declared on the descriptor");
+    assert_eq!(share["collections"].as_array().unwrap().len(), original.routes.len());
+    for row in share["collections"].as_array().unwrap() {
+        assert_eq!(row["descriptor"], "resident");
+        assert!(row["name"].is_null(), "{row}");
+        assert_eq!(row["reason"], "name pending");
+        assert_eq!(row["role_source"], "declared");
+        assert_eq!(row["admitted"], json!({"read":true,"write":false}));
+    }
+    owner.publish_descriptors_to(&recipient, &original);
+    let pending = recipient.list_pending();
+    let share = &pending["shares"][0];
+    assert_eq!(share["label"], "Named later");
+    for row in share["collections"].as_array().unwrap() {
+        assert_eq!(row["name"], format!("Named later · {}", row["role"].as_str().unwrap()));
+        assert!(row["reason"].is_null(), "{row}");
+    }
+    let accepted = recipient.enroll_pending(&original.anchor, "Local").unwrap();
+    assert_eq!(recipient.workspace(&accepted["workspace"]["workspace"]).routes, original.routes);
+}
+
+#[test]
+fn native_grants_skip_opaque_resources_and_keep_listing_collection_shares() {
+    use triblespace::core::capability::{CapabilityProof, CapabilityResource};
+    use triblespace::core::collection::read_capability;
+    use triblespace::core::repo::CapabilityProofStore;
+    let owner = Fixture::new();
+    let recipient = Fixture::new();
+    let id = owner.create("Beside opaque grants");
+    let original = owner.workspace(&id);
+    owner.share(&id, &recipient, "read_only", None).unwrap();
+    owner.repair_authority_to(&recipient, &original);
+    owner.publish_descriptors_to(&recipient, &original);
+    // The capability model also grants opaque resources that are no
+    // collection: a resident blob that is not a descriptor, a resident blob
+    // that does not decode as facts at all, and a resource this node holds no
+    // blob for. None of them is a share; none of them may hide the share.
+    let owner_signer = owner.config.node.lock().unwrap().as_mut().unwrap().signer.clone();
+    let absent = [0x5A; 32];
+    let (opaque, undecodable) = {
+        let mut guard = recipient.config.node.lock().unwrap();
+        let node = guard.as_mut().unwrap();
+        let me = node.signer.verifying_key();
+        let opaque = node.pile.put::<blobencodings::SimpleArchive, _>(entity! {
+            metadata::tag: genid().id, metadata::name: "Delivery resource",
+        }.facts().clone()).unwrap();
+        let undecodable = node.pile.put::<blobencodings::UTF8String, _>("not a descriptor").unwrap();
+        for resource in [opaque.raw, undecodable.raw, absent] {
+            node.pile.insert_proof(CapabilityProof::new(
+                CapabilityResource::new(resource), &owner_signer, read_capability(), me,
+            )).unwrap();
+        }
+        node.pile.flush().unwrap();
+        (opaque, undecodable)
+    };
+    let pending = recipient.list_pending();
+    let shares = pending["shares"].as_array().unwrap();
+    assert_eq!(shares.len(), 1, "the collection share is listed beside opaque grants");
+    assert_eq!(shares[0]["anchor"], format!("{:X}", original.anchor));
+    assert_eq!(shares[0]["label"], "Beside opaque grants");
+    assert_eq!(shares[0]["collections"].as_array().unwrap().len(), original.routes.len());
+    let ungrouped = pending["ungrouped"].as_array().unwrap();
+    assert_eq!(ungrouped.len(), 1, "a non-resident resource is still only a pending handle: {ungrouped:?}");
+    assert_eq!(ungrouped[0]["root"], format!("blake3:{}", hex::encode(absent)));
+    assert_eq!(ungrouped[0]["descriptor"], "pending");
+    assert!(ungrouped[0]["name"].is_null() && ungrouped[0]["role"].is_null());
+    assert_eq!(pending["skipped"], 2, "resident non-descriptors are skipped per entry");
+    let listed = serde_json::to_string(&pending).unwrap();
+    assert!(!listed.contains(&hex::encode(opaque.raw)) && !listed.contains(&hex::encode(undecodable.raw)),
+        "skipped resources are not presented as collections");
+    let accepted = recipient.enroll_pending(&original.anchor, "Local").unwrap();
+    assert_eq!(recipient.workspace(&accepted["workspace"]["workspace"]).routes, original.routes);
+}
+
+#[test]
+fn native_grants_list_descriptors_with_ambiguous_or_missing_anchor_tags_ungrouped() {
+    use triblespace::core::capability::policy;
+    use triblespace::core::collection::{Collection, records};
+    use triblespace::core::metadata::MetaDescribe;
+    let owner = Fixture::new();
+    let recipient = Fixture::new();
+    let id = owner.create("Grouped");
+    let grouped = owner.workspace(&id);
+    owner.share(&id, &recipient, "read_only", None).unwrap();
+    owner.repair_authority_to(&recipient, &grouped);
+    owner.publish_descriptors_to(&recipient, &grouped);
+    // Tags are open world. A descriptor carrying an extra tag the reader
+    // does not model offers two anchor candidates; one carrying only its
+    // kind offers none. Both are listed, ungrouped, with the reason; neither
+    // is rejected, and grouping continues for the rest.
+    let ambiguous_anchor = genid().id;
+    let extra_tag = genid().id;
+    let unanchored_anchor = genid().id;
+    let compass = workspace::roles().into_iter().find(|(_, name)| *name == "compass").unwrap().0;
+    let mut guard = owner.config.node.lock().unwrap();
+    let node = guard.as_mut().unwrap();
+    let signer = node.signer.verifying_key();
+    let mut register = |tags: Vec<Id>, name: &str| -> triblespace::core::collection::CollectionHandle {
+        let collection: Collection<blobencodings::SimpleArchive> = node.pile.register_collection(entity! {
+            metadata::tag*: tags,
+            records::collection_name: name,
+            records::collection_representation*: <blobencodings::SimpleArchive as MetaDescribe>::describe(),
+            policy::resource_policy*: faculties::collection_names::private_policy(signer).fragment(),
+        }).unwrap();
+        collection.handle()
+    };
+    let ambiguous_root = register(vec![records::KIND_COLLECTION_DESCRIPTOR, ambiguous_anchor, extra_tag], "Ambiguous · compass");
+    let unanchored_root = register(vec![records::KIND_COLLECTION_DESCRIPTOR], "Unanchored · compass");
+    let mut ambiguous = Workspace::new("Ambiguous");
+    ambiguous.anchor = ambiguous_anchor;
+    ambiguous.id = ambiguous_anchor;
+    ambiguous.routes.insert(compass, ambiguous_root);
+    let mut unanchored = Workspace::new("Unanchored");
+    unanchored.anchor = unanchored_anchor;
+    unanchored.id = unanchored_anchor;
+    unanchored.routes.insert(compass, unanchored_root);
+    let view = node.config().unwrap();
+    let ambiguous_id = node.put_workspace(&view, &ambiguous).unwrap();
+    let view = node.config().unwrap();
+    let unanchored_id = node.put_workspace(&view, &unanchored).unwrap();
+    drop(guard);
+    for (revision, workspace) in [(ambiguous_id, &ambiguous), (unanchored_id, &unanchored)] {
+        owner.share(&json!(format!("{revision:X}")), &recipient, "read_only", None).unwrap();
+        owner.repair_authority_to(&recipient, workspace);
+        owner.publish_descriptors_to(&recipient, workspace);
+    }
+    let pending = recipient.list_pending();
+    let shares = pending["shares"].as_array().unwrap();
+    assert_eq!(shares.len(), 1, "grouping continues for descriptors with one anchor");
+    assert_eq!(shares[0]["anchor"], format!("{:X}", grouped.anchor));
+    assert_eq!(pending["skipped"], 0, "an unmodelled tag is not a reason to skip");
+    let ungrouped = pending["ungrouped"].as_array().unwrap();
+    assert_eq!(ungrouped.len(), 2, "{ungrouped:?}");
+    let row_of = |root: triblespace::core::collection::CollectionHandle| ungrouped.iter()
+        .find(|row| row["root"] == format!("blake3:{}", hex::encode(root.raw))).unwrap().clone();
+    let ambiguous_row = row_of(ambiguous_root);
+    assert_eq!(ambiguous_row["descriptor"], "resident");
+    assert_eq!(ambiguous_row["name"], "Ambiguous · compass");
+    assert_eq!(ambiguous_row["role"], "compass");
+    assert_eq!(ambiguous_row["reason"], "descriptor carries 2 candidate anchors");
+    let unanchored_row = row_of(unanchored_root);
+    assert_eq!(unanchored_row["descriptor"], "resident");
+    assert_eq!(unanchored_row["name"], "Unanchored · compass");
+    assert_eq!(unanchored_row["role"], "compass");
+    assert_eq!(unanchored_row["reason"], "descriptor carries no candidate anchor");
+    assert!(recipient.enroll_pending(&ambiguous_anchor, "Ambiguous").is_err(), "an ungrouped root needs explicit routes");
+    let accepted = recipient.enroll_pending(&grouped.anchor, "Local").unwrap();
+    assert_eq!(recipient.workspace(&accepted["workspace"]["workspace"]).routes, grouped.routes);
 }
