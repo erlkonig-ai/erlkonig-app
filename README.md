@@ -84,16 +84,22 @@ tags offer no single anchor, keeps its entry and says why in `reason`;
 granted resources that are resident but no collection descriptor are counted
 under `skipped`; and roots the sync daemon holds grants for in memory only
 appear under `sync_memory_pending`. `config_enroll_pending_share` then
-publishes a local workspace over exactly the roots the listing showed, which
-the caller passes back as `roots`, the consent unit: if the roots granted
-under the anchor differ from them by the time of the call, it refuses and
-names the difference instead of widening or narrowing silently. A first
-enrollment needs a label; roots that arrive later under an enrolled anchor
-are listed beside it (`local_workspace` enrolled) and enrolling exactly them
-extends the workspace with a new revision, label preserved unless given; the
+publishes a local workspace over exactly the roots given as `roots`, the
+consent unit, which are the roots the listing showed: if a root arrived under
+the anchor since the listing, or a given root is not granted under it, the
+call refuses and names the difference instead of widening or narrowing
+silently; the published routes are exactly the roots given, never the whole
+granted group. A granted root that another local workspace already routes
+stays listed, with that workspace in `routed_in`, may be left out of
+`roots`, and is routed here only when given. A first enrollment needs a
+label; roots that arrive later under an enrolled anchor are listed beside it
+(`local_workspace` enrolled) and enrolling them extends the workspace with a
+new revision over the union of routes, label preserved unless given; the
 identical already-routed set is idempotent, and a changed or withdrawn local
-workspace is never overwritten. The bootstrap tools remain the fallback when
-the nodes have not connected yet.
+workspace is never overwritten. A proof edge whose definition is not
+resident or does not decode contributes no claim and is counted under
+`definitions_pending`. The bootstrap tools remain the fallback when the
+nodes have not connected yet.
 
 Sync peering and Full hydration follow the pile's native collection-selection
 registers, not all admitted record/proof roots. Creating a workspace, adding

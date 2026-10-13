@@ -29,6 +29,10 @@
 //! them back; if the grant group has changed since, the call refuses and
 //! names the difference. Roots that arrive later under an enrolled anchor
 //! are shown beside the enrolled workspace and extend it with a new revision.
+//! What gets published is exactly the roots given (first publication) or
+//! the union of the existing routes and the roots given (extension), never
+//! the whole granted group: a root already routed by another local
+//! workspace is disclosed in the listing and routed here only when given.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -95,8 +99,22 @@ pub(crate) struct GrantedCollection {
     /// Native READ/WRITE admission under the resident descriptor, when it
     /// could be evaluated.
     pub admitted: Option<(bool, bool)>,
-    /// The root is routed by a current local workspace.
-    pub enrolled_locally: bool,
+    /// Current local workspaces routing this root.
+    pub routed_in: Vec<LocalRoute>,
+}
+
+/// One current local workspace routing a granted root.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalRoute {
+    pub workspace: Id,
+    pub anchor: Id,
+}
+
+impl GrantedCollection {
+    /// Routed by a current local workspace carrying `anchor`.
+    fn routed_under(&self, anchor: Option<Id>) -> bool {
+        self.routed_in.iter().any(|route| Some(route.anchor) == anchor)
+    }
 }
 
 /// The local workspace state for one anchor.
@@ -171,6 +189,7 @@ const KNOWN_KINDS: [Id; 2] = [
 
 fn note(reason: &mut Option<String>, text: String) {
     match reason {
+        Some(existing) if existing.contains(&text) => {}
         Some(existing) => {
             existing.push_str("; ");
             existing.push_str(&text);
@@ -252,10 +271,15 @@ impl NodeStore {
         expected: &ConfigView,
     ) -> Result<(Vec<GrantedCollection>, usize)> {
         let me = self.signer.verifying_key();
-        let mut local_roots = BTreeSet::new();
+        let mut local_routes: BTreeMap<CollectionHandle, Vec<LocalRoute>> = BTreeMap::new();
         for revision in expected.workspace_ids()? {
             if let Ok(Some(workspace)) = expected.workspace(revision) {
-                local_roots.extend(workspace.routes.values().copied());
+                for root in workspace.routes.values() {
+                    local_routes.entry(*root).or_default().push(LocalRoute {
+                        workspace: workspace.id,
+                        anchor: workspace.anchor,
+                    });
+                }
             }
         }
         self.pile.refresh().context("refresh node pile")?;
@@ -282,17 +306,30 @@ impl NodeStore {
                         claimed_delegate: false,
                         definitions_pending: 0,
                         admitted: None,
-                        enrolled_locally: local_roots.contains(&root),
+                        routed_in: local_routes.get(&root).cloned().unwrap_or_default(),
                     });
                     row.issuers.insert(issuer.to_bytes());
-                    if snapshot.contains_blob(capability)? {
-                        let definition: TribleSet = snapshot.get(capability)?;
-                        row.claimed_read |= exists!(pattern!(&definition, [{ capability_action: ACTION_READ }]));
-                        row.claimed_write |= exists!(pattern!(&definition, [{ capability_action: ACTION_WRITE }]));
-                        row.claimed_delegate |=
-                            exists!(pattern!(&definition, [{ capability_delegate_action: _?action }]));
+                    // A definition that is not resident, or does not decode
+                    // as facts, is unavailable for this edge: no claim is
+                    // read from it, and nothing else is affected.
+                    let definition: Option<TribleSet> = if snapshot.contains_blob(capability)? {
+                        snapshot.get(capability).ok()
                     } else {
-                        row.definitions_pending += 1;
+                        None
+                    };
+                    match definition {
+                        Some(definition) => {
+                            row.claimed_read |= exists!(pattern!(&definition, [{ capability_action: ACTION_READ }]));
+                            row.claimed_write |= exists!(pattern!(&definition, [{ capability_action: ACTION_WRITE }]));
+                            row.claimed_delegate |=
+                                exists!(pattern!(&definition, [{ capability_delegate_action: _?action }]));
+                        }
+                        None => {
+                            row.definitions_pending += 1;
+                            if snapshot.contains_blob(capability)? {
+                                note(&mut row.reason, "a capability definition does not decode".to_owned());
+                            }
+                        }
                     }
                 }
                 issuer = delegate;
@@ -337,6 +374,11 @@ impl NodeStore {
                 0 => note(&mut row.reason, "descriptor carries no candidate anchor".to_owned()),
                 n => note(&mut row.reason, format!("descriptor carries {n} candidate anchors")),
             }
+            for route in &row.routed_in {
+                if Some(route.anchor) != row.anchor {
+                    note(&mut row.reason, format!("routed in local workspace {:X}", route.workspace));
+                }
+            }
             let declared: BTreeSet<Id> =
                 find!(role: Id, pattern!(&facts, [{ entity @ attrs::collection_role: ?role }])).collect();
             row.role = match declared.into_iter().collect::<Vec<_>>()[..] {
@@ -365,8 +407,11 @@ impl NodeStore {
     }
 
     /// Granted collections grouped by their issuing workspace anchor. With
-    /// `all`, roots already routed locally are included (enrollment compares
-    /// the whole group); without, only roots no local workspace routes.
+    /// `all`, roots already routed by the anchor's own local workspace are
+    /// included (enrollment compares the whole group); without, those are
+    /// left out. A root routed by a local workspace of another anchor stays
+    /// in its group, disclosed through `routed_in`; an ungrouped root routed
+    /// anywhere is left out.
     pub(crate) fn pending_shares(
         &mut self,
         expected: &ConfigView,
@@ -384,7 +429,11 @@ impl NodeStore {
             if let Some(anchor) = row.anchor {
                 granted_by_anchor.entry(anchor).or_default().insert(row.root);
             }
-            if row.enrolled_locally && !all {
+            let hidden = match row.anchor {
+                Some(_) => row.routed_under(row.anchor),
+                None => !row.routed_in.is_empty(),
+            };
+            if hidden && !all {
                 continue;
             }
             let Some(anchor) = row.anchor else {
@@ -420,10 +469,14 @@ impl NodeStore {
     /// anchor and select them, as bootstrap enrollment does. No proof,
     /// descriptor or key is imported, copied or created.
     ///
-    /// `roots` are the handles the listing showed for the anchor: the whole
-    /// granted set, or, beside an enrolled workspace, the roots not routed
-    /// yet. Any other set refuses and names the difference. A label is
-    /// required for a first enrollment and preserved otherwise unless given.
+    /// `roots` are the handles the listing showed for the anchor. Every
+    /// shown root that no local workspace routes must be given (a root that
+    /// arrived since the listing refuses, naming it); a root the listing
+    /// disclosed as routed by another local workspace may be left out; a
+    /// root not granted under the anchor refuses, naming it. The published
+    /// routes are exactly the roots given, or their union with the enrolled
+    /// workspace's routes. A label is required for a first enrollment and
+    /// preserved otherwise unless given.
     pub(crate) fn enroll_pending_share(
         &mut self,
         expected: &ConfigView,
@@ -442,33 +495,23 @@ impl NodeStore {
             .find(|share| share.anchor == anchor)
             .context("no resident grant names a collection with this workspace anchor; call config_list_pending_shares")?;
         let granted: BTreeSet<CollectionHandle> = share.collections.iter().map(|row| row.root).collect();
-        let shown: BTreeSet<CollectionHandle> = share
+        let required: BTreeSet<CollectionHandle> = share
             .collections
             .iter()
-            .filter(|row| !row.enrolled_locally)
+            .filter(|row| row.routed_in.is_empty())
             .map(|row| row.root)
             .collect();
-        if *roots != granted && (shown.is_empty() || *roots != shown) {
-            let listed = if shown.is_empty() { &granted } else { &shown };
-            let hexes = |roots: Vec<&CollectionHandle>| {
-                roots.into_iter().map(handle_hex).collect::<Vec<_>>().join(", ")
-            };
-            let mut difference = Vec::new();
-            let arrived: Vec<_> = listed.difference(roots).collect();
-            if !arrived.is_empty() {
-                difference.push(format!("granted now but not given: {}", hexes(arrived)));
-            }
-            let gone: Vec<_> = roots.difference(&granted).collect();
-            if !gone.is_empty() {
-                difference.push(format!("given but not granted under this anchor: {}", hexes(gone)));
-            }
-            let routed: Vec<_> = roots
-                .iter()
-                .filter(|root| granted.contains(*root) && !listed.contains(*root))
-                .collect();
-            if !routed.is_empty() {
-                difference.push(format!("given but already routed locally: {}", hexes(routed)));
-            }
+        let hexes = |roots: Vec<&CollectionHandle>| roots.into_iter().map(handle_hex).collect::<Vec<_>>().join(", ");
+        let mut difference = Vec::new();
+        let arrived: Vec<_> = required.difference(roots).collect();
+        if !arrived.is_empty() {
+            difference.push(format!("granted now but not given: {}", hexes(arrived)));
+        }
+        let gone: Vec<_> = roots.difference(&granted).collect();
+        if !gone.is_empty() {
+            difference.push(format!("given but not granted under this anchor: {}", hexes(gone)));
+        }
+        if !difference.is_empty() {
             bail!(
                 "the roots granted under this anchor differ from the roots given ({}); call config_list_pending_shares again and enroll exactly what it shows",
                 difference.join("; ")
@@ -482,7 +525,7 @@ impl NodeStore {
         };
         let mut write = true;
         let mut delegate = true;
-        for collection in &share.collections {
+        for collection in share.collections.iter().filter(|row| roots.contains(&row.root)) {
             let (role, _) = collection.role.with_context(|| {
                 format!(
                     "granted collection blake3:{} declares no understood faculty role; enroll it with explicit routes",
@@ -508,7 +551,13 @@ impl NodeStore {
                 false
             }
             Some(existing) => {
-                if existing.routes == workspace.routes {
+                let mut union = existing.routes.clone();
+                for (role, root) in &workspace.routes {
+                    if union.insert(*role, *root).is_some_and(|routed| routed != *root) {
+                        bail!("this share grants two collections for one faculty role; enroll it with explicit routes");
+                    }
+                }
+                if union == existing.routes {
                     if label.is_some_and(|label| label != existing.label) {
                         bail!("this share is already enrolled under another label; enrollment will not rename it");
                     }
@@ -521,9 +570,7 @@ impl NodeStore {
                         extended: false,
                     });
                 }
-                if !existing.routes.iter().all(|(role, root)| workspace.routes.get(role) == Some(root)) {
-                    bail!("this share's local workspace routes differ from the grant; enrollment will not overwrite it");
-                }
+                workspace.routes = union;
                 workspace.label = label.map(str::to_owned).unwrap_or(existing.label);
                 true
             }

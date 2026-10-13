@@ -179,6 +179,17 @@ impl Fixture {
         node.put_workspace(&view, workspace).unwrap()
     }
 
+    /// A local workspace over explicit routes, as config_create_workspace
+    /// with explicit routes would publish it.
+    fn put_local_workspace(&self, label: &str, routes: BTreeMap<Id, CollectionHandle>) -> Id {
+        let mut guard = self.config.node.lock().unwrap();
+        let node = guard.as_mut().unwrap();
+        let mut workspace = Workspace::new(label);
+        workspace.routes = routes;
+        let view = node.config().unwrap();
+        node.put_workspace(&view, &workspace).unwrap()
+    }
+
     /// Owner side: share `revision` natively and let the recipient acquire
     /// its proofs, definitions and descriptors.
     fn deliver(&self, revision: Id, workspace: &Workspace, recipient: &Fixture) {
@@ -1499,4 +1510,108 @@ fn native_grants_report_claimed_access_apart_from_admission() {
         assert_ne!(row["admitted"]["read"], true, "{row}");
         assert_ne!(row["admitted"]["write"], true, "{row}");
     }
+}
+
+#[test]
+fn native_grants_route_only_the_consented_roots_and_disclose_roots_routed_elsewhere() {
+    let owner = Fixture::new();
+    let recipient = Fixture::new();
+    let mut shared = Workspace::new("Shared");
+    shared.anchor = genid().id;
+    shared.id = shared.anchor;
+    owner.grow_workspace(&mut shared, "compass");
+    let revision = owner.grow_workspace(&mut shared, "wiki");
+    owner.deliver(revision, &shared, &recipient);
+    let role = |name: &str| workspace::roles().into_iter().find(|(_, role)| *role == name).unwrap().0;
+    let (compass, wiki) = (role("compass"), role("wiki"));
+    let (c1, c2) = (shared.routes[&compass], shared.routes[&wiki]);
+    let hex_of = |root: CollectionHandle| format!("blake3:{}", hex::encode(root.raw));
+    // The recipient's own workspace B already routes C1.
+    let b = recipient.put_local_workspace("B", BTreeMap::from([(compass, c1)]));
+    let pending = recipient.list_pending();
+    let share = pending["shares"].as_array().unwrap().iter()
+        .find(|share| share["anchor"] == format!("{:X}", shared.anchor)).unwrap().clone();
+    assert_eq!(share["local_workspace"], "none");
+    let rows = share["collections"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "a root routed elsewhere is disclosed, not dropped: {rows:?}");
+    let row_of = |root: CollectionHandle| rows.iter().find(|row| row["root"] == hex_of(root)).unwrap().clone();
+    assert_eq!(row_of(c1)["routed_in"], json!([format!("{b:X}")]));
+    assert!(row_of(c1)["reason"].as_str().unwrap().contains("routed in local workspace"), "{}", row_of(c1));
+    assert_eq!(row_of(c2)["routed_in"], json!([]));
+    assert!(row_of(c2)["reason"].is_null());
+    // Consent to C2 alone publishes exactly C2.
+    let accepted = recipient.enroll_pending(&shared.anchor, &[hex_of(c2)], Some("Local")).unwrap();
+    assert_eq!(accepted["extended"], false);
+    let local = recipient.workspace(&accepted["workspace"]["workspace"]);
+    assert_eq!(local.routes, BTreeMap::from([(wiki, c2)]), "no route the user never saw");
+    assert_eq!(recipient.inspect()["workspaces"].as_array().unwrap().len(), 2);
+    // C1 stays disclosed beside the enrolled workspace; repeating the
+    // consented root is idempotent.
+    assert_eq!(recipient.shown_roots(&shared.anchor), vec![hex_of(c1)]);
+    let pending = recipient.list_pending();
+    let share = pending["shares"].as_array().unwrap().iter()
+        .find(|share| share["anchor"] == format!("{:X}", shared.anchor)).unwrap().clone();
+    assert_eq!(share["local_workspace"], "enrolled");
+    let repeated = recipient.enroll_pending(&shared.anchor, &[hex_of(c2)], None).unwrap();
+    assert_eq!(repeated["already_enrolled"], true);
+    assert_eq!(repeated["workspace"]["workspace"], accepted["workspace"]["workspace"]);
+    // C1 given explicitly extends to the union; B is untouched.
+    let extended = recipient.enroll_pending(&shared.anchor, &[hex_of(c1)], None).unwrap();
+    assert_eq!(extended["extended"], true);
+    let local = recipient.workspace(&extended["workspace"]["workspace"]);
+    assert_eq!(local.routes, shared.routes);
+    assert_eq!(local.label, "Local");
+    assert_eq!(recipient.workspace(&json!(format!("{b:X}"))).routes, BTreeMap::from([(compass, c1)]));
+    assert_eq!(recipient.shown_roots(&shared.anchor), Vec::<String>::new());
+}
+
+#[test]
+fn native_grants_treat_an_undecodable_definition_as_unavailable_for_that_edge() {
+    use ed25519_dalek::SigningKey;
+    use triblespace::core::capability::{CapabilityProof, CapabilityResource};
+    use triblespace::core::repo::CapabilityProofStore;
+    let owner = Fixture::new();
+    let recipient = Fixture::new();
+    let id = owner.create("Defined");
+    let original = owner.workspace(&id);
+    owner.share(&id, &recipient, "read_only", None).unwrap();
+    owner.repair_authority_to(&recipient, &original);
+    owner.publish_descriptors_to(&recipient, &original);
+    // A valid proof whose resident definition blob is no SimpleArchive at
+    // all, naming this node for a shared root and for a resource this node
+    // holds no blob for.
+    let stranger = SigningKey::from_bytes(&[0x66; 32]);
+    let absent = [0x33; 32];
+    {
+        let mut guard = recipient.config.node.lock().unwrap();
+        let node = guard.as_mut().unwrap();
+        let me = node.signer.verifying_key();
+        let odd = node.pile.put::<blobencodings::UTF8String, _>("not a definition").unwrap();
+        for resource in original.routes.values().map(|root| root.raw).chain([absent]) {
+            node.pile.insert_proof(CapabilityProof::new(
+                CapabilityResource::new(resource), &stranger, odd.transmute(), me,
+            )).unwrap();
+        }
+        node.pile.flush().unwrap();
+    }
+    let pending = recipient.list_pending();
+    let shares = pending["shares"].as_array().unwrap();
+    assert_eq!(shares.len(), 1, "the share lists beside the odd proof");
+    assert_eq!(shares[0]["anchor"], format!("{:X}", original.anchor));
+    assert_eq!(shares[0]["claimed_access"], "read_only");
+    assert_eq!(shares[0]["admitted_access"], "read_only");
+    for row in shares[0]["collections"].as_array().unwrap() {
+        assert_eq!(row["claimed"]["read"], true);
+        assert_eq!(row["claimed"]["write"], false);
+        assert_eq!(row["claimed"]["definitions_pending"], 1, "{row}");
+        assert!(row["reason"].as_str().unwrap().contains("definition"), "{row}");
+        assert_eq!(row["admitted"], json!({"read":true,"write":false}));
+    }
+    let ungrouped = pending["ungrouped"].as_array().unwrap();
+    assert_eq!(ungrouped.len(), 1);
+    assert_eq!(ungrouped[0]["root"], format!("blake3:{}", hex::encode(absent)));
+    assert_eq!(ungrouped[0]["claimed"]["definitions_pending"], 1);
+    assert_eq!(pending["skipped"], 0);
+    let accepted = recipient.enroll_pending(&original.anchor, &recipient.shown_roots(&original.anchor), Some("Local")).unwrap();
+    assert_eq!(recipient.workspace(&accepted["workspace"]["workspace"]).routes, original.routes);
 }
