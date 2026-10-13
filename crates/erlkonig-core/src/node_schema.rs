@@ -44,4 +44,9 @@ attributes! {
     /// Not an attestation author or an admission-policy authority.
     /// Minted with `trible genid` on 2026-10-08.
     "D461447F2732ABF6FF9E68AE2528BF8F" as expected_signer: inlineencodings::ED25519PublicKey;
+    /// On a workspace collection descriptor: the faculty role (scope ID) the
+    /// bundle created it for. A grouping hint for enrollment, never authority
+    /// or a selection; readers without it fall back to the descriptor name.
+    /// Minted with `trible genid` on 2026-10-13.
+    "DDE29291E38207495A90FE4FF1204DB4" as collection_role: inlineencodings::GenId;
 }

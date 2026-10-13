@@ -852,7 +852,10 @@ fn node_session(
                         previous_snapshot = Some(snapshot);
                         let progress = activity.during(peer.reconcile()).await;
                         received += progress.received_bytes as u128;
-                        let sent = peer.health().blob_serving.sent_bytes;
+                        let health = peer.health();
+                        let sent = health.blob_serving.sent_bytes;
+                        let waiting = health.available.iter().map(|root| format!("blake3:{}", hex::encode(root.raw))).collect::<Vec<_>>();
+                        update(status, |s| if s.node.grants_waiting != waiting { s.node.grants_waiting = waiting; });
                         let delta = progress.received_bytes.saturating_add(sent.saturating_sub(previous_sent));
                         previous_sent = sent;
                         if delta > 0 {

@@ -133,6 +133,38 @@ impl Fixture {
             "bootstrap":invitation["bootstrap"],"label":"Local shared workspace"}))
     }
 
+    fn list_pending(&self) -> Value {
+        self.call("config_list_pending_shares", json!({})).unwrap()
+    }
+
+    fn enroll_pending(&self, anchor: &Id, label: &str) -> Result<Value> {
+        self.call("config_enroll_pending_share", json!({"observation":self.inspect()["observation"],
+            "anchor":format!("{anchor:X}"),"label":label}))
+    }
+
+    /// Deterministic stand-in for native descriptor acquisition: copy exactly
+    /// the root descriptors and their names, as sync would, nothing else.
+    fn publish_descriptors_to(&self, recipient: &Fixture, workspace: &Workspace) {
+        use triblespace::core::repo::transfer;
+        let mut source = self.config.node.lock().unwrap();
+        let source = source.as_mut().unwrap();
+        let snapshot = source.pile.snapshot().unwrap();
+        let mut target = recipient.config.node.lock().unwrap();
+        let target = target.as_mut().unwrap();
+        let mut handles: Vec<Inline<inlineencodings::Handle<triblespace::core::blob::encodings::UnknownBlob>>> = Vec::new();
+        for root in workspace.routes.values() {
+            let facts: TribleSet = snapshot.get(*root).unwrap();
+            handles.push(root.transmute());
+            if let Some(name) = triblespace::core::collection::descriptor::name(&facts).unwrap() {
+                handles.push(name.transmute());
+            }
+        }
+        for copied in transfer(&snapshot, &mut target.pile, handles) {
+            copied.unwrap();
+        }
+        target.pile.flush().unwrap();
+    }
+
     fn workspace(&self, id: &Value) -> Workspace {
         self.config.node.lock().unwrap().as_mut().unwrap().config().unwrap()
             .workspace(revision(id.as_str().unwrap()).unwrap()).unwrap().unwrap()
@@ -874,4 +906,199 @@ fn independent_concurrent_clients_never_share_a_workspace_selection() {
     let b = call(&f.dispatch, "compass_list", json!({"workspace":b})).unwrap();
     assert!(a.contains("only alpha") && !a.contains("only beta"));
     assert!(b.contains("only beta") && !b.contains("only alpha"));
+}
+
+#[test]
+fn native_grants_list_by_workspace_anchor_and_enroll_without_bootstrap() {
+    use triblespace::core::collection::selection::{Selection, sync_selection};
+    let owner = Fixture::new();
+    let recipient = Fixture::new();
+    let owner_id = hex::encode(owner.config.binding.signer);
+    let a = owner.create("Shared research");
+    let b = owner.create("Collaboration");
+    let original_a = owner.workspace(&a);
+    let original_b = owner.workspace(&b);
+    let empty = recipient.list_pending();
+    assert_eq!(empty["shares"], json!([]));
+    assert_eq!(empty["ungrouped"], json!([]));
+    assert_eq!(empty["sync_memory_pending"], json!([]));
+    owner.share(&a, &recipient, "read_only", None).unwrap();
+    owner.share(&b, &recipient, "read_write", Some(true)).unwrap();
+    // Native grant exchange lands proofs and fetches their definitions; the
+    // descriptors arrive separately through sync or repair.
+    owner.repair_authority_to(&recipient, &original_a);
+    owner.repair_authority_to(&recipient, &original_b);
+    let before = recipient.inspect();
+    let pile_before = std::fs::read(&recipient.config.binding.pile).unwrap();
+    let pending = recipient.list_pending();
+    assert_eq!(pending["shares"], json!([]), "no descriptor, no anchor, no group");
+    let ungrouped = pending["ungrouped"].as_array().unwrap();
+    assert_eq!(ungrouped.len(), original_a.routes.len() + original_b.routes.len());
+    for row in ungrouped {
+        assert_eq!(row["descriptor"], "pending");
+        assert!(row["name"].is_null() && row["role"].is_null() && row["admitted"].is_null(), "nothing invented: {row}");
+        assert_eq!(row["issuers"], json!([&owner_id]));
+        assert_eq!(row["granted"]["read"], true);
+        assert_eq!(row["granted"]["definitions_pending"], 0);
+    }
+    let roots = |workspace: &Workspace| workspace.routes.values()
+        .map(|root| json!(format!("blake3:{}", hex::encode(root.raw)))).collect::<Vec<_>>();
+    assert!(ungrouped.iter().filter(|row| roots(&original_a).contains(&row["root"]))
+        .all(|row| row["granted"]["write"] == false && row["granted"]["delegate"] == false));
+    assert!(ungrouped.iter().filter(|row| roots(&original_b).contains(&row["root"]))
+        .all(|row| row["granted"]["write"] == true && row["granted"]["delegate"] == true));
+    assert_eq!(before, recipient.inspect(), "listing has no Config mutation");
+    assert_eq!(pile_before, std::fs::read(&recipient.config.binding.pile).unwrap(), "listing imports nothing");
+    assert!(recipient.enroll_pending(&original_a.anchor, "Too early").is_err(), "descriptor-pending roots carry no anchor to enroll");
+    assert_eq!(before, recipient.inspect());
+    owner.publish_descriptors_to(&recipient, &original_a);
+    owner.publish_descriptors_to(&recipient, &original_b);
+    let pending = recipient.list_pending();
+    assert_eq!(pending["ungrouped"], json!([]));
+    let shares = pending["shares"].as_array().unwrap();
+    assert_eq!(shares.len(), 2);
+    let share_of = |workspace: &Workspace| shares.iter()
+        .find(|share| share["anchor"] == format!("{:X}", workspace.anchor)).unwrap().clone();
+    let share_a = share_of(&original_a);
+    assert_eq!(share_a["label"], "Shared research");
+    assert_eq!(share_a["access"], "read_only");
+    assert_eq!(share_a["delegate"], false);
+    assert_eq!(share_a["enrollable"], true);
+    assert_eq!(share_a["local_workspace"], "none");
+    assert_eq!(share_a["issuers"], json!([&owner_id]));
+    let listed: std::collections::BTreeSet<(String, String)> = share_a["collections"].as_array().unwrap().iter().map(|row| {
+        assert_eq!(row["descriptor"], "resident");
+        assert_eq!(row["role_source"], "declared");
+        assert_eq!(row["admitted"], json!({"read":true,"write":false}));
+        assert_eq!(row["name"], format!("Shared research · {}", row["role"].as_str().unwrap()));
+        (row["role_id"].as_str().unwrap().to_owned(), row["root"].as_str().unwrap().to_owned())
+    }).collect();
+    let expected: std::collections::BTreeSet<(String, String)> = original_a.routes.iter()
+        .map(|(role, root)| (format!("{role:X}"), format!("blake3:{}", hex::encode(root.raw)))).collect();
+    assert_eq!(listed, expected, "grouped roots are exactly the shared bundle");
+    let share_b = share_of(&original_b);
+    assert_eq!(share_b["label"], "Collaboration");
+    assert_eq!(share_b["access"], "read_write");
+    assert_eq!(share_b["delegate"], true);
+    let accepted = recipient.enroll_pending(&original_a.anchor, "Local research").unwrap();
+    assert_eq!(accepted["already_enrolled"], false);
+    assert_eq!(accepted["access"], "read_only");
+    assert_eq!(accepted["sync_complete"], false);
+    let local_id = &accepted["workspace"]["workspace"];
+    let local = recipient.workspace(local_id);
+    assert_eq!(local.label, "Local research", "recipient chooses a local alias");
+    assert_eq!(local.routes, original_a.routes);
+    assert_eq!(local.anchor, original_a.anchor);
+    {
+        let facts = recipient.config.node.lock().unwrap().as_mut().unwrap().config().unwrap().facts().unwrap();
+        assert!(local.routes.values().all(|root| sync_selection(&facts, *root) == Selection::Selected), "enrollment selects the roots for native sync");
+    }
+    assert!(recipient.admission(&local).iter().all(|value| *value == (true, false)));
+    assert_eq!(recipient.inspect()["workspaces"].as_array().unwrap().len(), 1);
+    let pending = recipient.list_pending();
+    assert_eq!(pending["shares"].as_array().unwrap().len(), 1, "enrolled roots leave the prompt");
+    assert_eq!(pending["shares"][0]["anchor"], format!("{:X}", original_b.anchor));
+    let proofs = recipient.proofs();
+    let repeated = recipient.enroll_pending(&original_a.anchor, "Local research").unwrap();
+    assert_eq!(repeated["already_enrolled"], true);
+    assert_eq!(repeated["workspace"]["workspace"], *local_id);
+    assert_eq!(recipient.proofs(), proofs);
+    assert!(recipient.enroll_pending(&original_a.anchor, "Different alias").is_err(), "repeat cannot silently change a chosen alias");
+    assert!(recipient.enroll_pending(&genid().id, "Unknown").is_err(), "unknown anchor is refused");
+    assert!(recipient.call("config_enroll_pending_share", json!({"observation":recipient.inspect()["observation"],
+        "anchor":"not-hex","label":"x"})).is_err());
+    assert!(recipient.call("config_enroll_pending_share", json!({"observation":"stale",
+        "anchor":format!("{:X}", original_b.anchor),"label":"x"})).is_err(), "stale observation is refused");
+    assert_eq!(recipient.inspect()["workspaces"].as_array().unwrap().len(), 1);
+    let accepted_b = recipient.enroll_pending(&original_b.anchor, "Local collaboration").unwrap();
+    assert_eq!(accepted_b["access"], "read_write");
+    assert_eq!(accepted_b["delegate"], true);
+    let local_b = recipient.workspace(&accepted_b["workspace"]["workspace"]);
+    assert_eq!(local_b.routes, original_b.routes);
+    assert!(recipient.admission(&local_b).iter().all(|value| *value == (true, true)));
+    call(&recipient.dispatch, "compass_add", json!({"workspace":accepted_b["workspace"]["workspace"],"title":"Recipient authored"})).unwrap();
+    assert_eq!(recipient.list_pending()["shares"], json!([]));
+    assert_eq!(recipient.list_pending()["ungrouped"], json!([]));
+}
+
+#[test]
+fn native_grants_refuse_withdrawn_anchors_and_report_name_derived_or_missing_roles() {
+    use triblespace::core::capability::policy;
+    use triblespace::core::collection::{Collection, records};
+    use triblespace::core::metadata::MetaDescribe;
+    let owner = Fixture::new();
+    let recipient = Fixture::new();
+    let id = owner.create("Withdrawn later");
+    let original = owner.workspace(&id);
+    owner.share(&id, &recipient, "read_only", None).unwrap();
+    owner.repair_authority_to(&recipient, &original);
+    owner.publish_descriptors_to(&recipient, &original);
+    let accepted = recipient.enroll_pending(&original.anchor, "Local").unwrap();
+    let before = recipient.inspect();
+    recipient.call("config_remove_workspace", json!({"observation":before["observation"],
+        "workspace":accepted["workspace"]["workspace"]})).unwrap();
+    let after = recipient.inspect();
+    let pending = recipient.list_pending();
+    assert_eq!(pending["shares"].as_array().unwrap().len(), 1, "a withdrawn share stays visible");
+    assert_eq!(pending["shares"][0]["local_workspace"], "changed_or_withdrawn");
+    assert_eq!(pending["shares"][0]["enrollable"], false);
+    assert!(recipient.enroll_pending(&original.anchor, "Local").is_err(), "repeat cannot resurrect a withdrawn workspace");
+    assert_eq!(after, recipient.inspect());
+    // Descriptors created before roles were declared, and descriptors that
+    // name no role at all, are shared the same way; the role derivation is
+    // reported rather than hidden.
+    let legacy_anchor = genid().id;
+    let bare_anchor = genid().id;
+    let compass = workspace::roles().into_iter().find(|(_, name)| *name == "compass").unwrap().0;
+    let mut guard = owner.config.node.lock().unwrap();
+    let node = guard.as_mut().unwrap();
+    let signer = node.signer.verifying_key();
+    let mut register = |anchor: Id, name: &str| -> triblespace::core::collection::CollectionHandle {
+        let collection: Collection<blobencodings::SimpleArchive> = node.pile.register_collection(entity! {
+            metadata::tag*: [records::KIND_COLLECTION_DESCRIPTOR, anchor],
+            records::collection_name: name,
+            records::collection_representation*: <blobencodings::SimpleArchive as MetaDescribe>::describe(),
+            policy::resource_policy*: faculties::collection_names::private_policy(signer).fragment(),
+        }).unwrap();
+        collection.handle()
+    };
+    let legacy_root = register(legacy_anchor, "Legacy · compass");
+    let bare_root = register(bare_anchor, "Two independent roots");
+    let mut legacy = Workspace::new("Legacy");
+    legacy.anchor = legacy_anchor;
+    legacy.id = legacy_anchor;
+    legacy.routes.insert(compass, legacy_root);
+    let mut bare = Workspace::new("Bare");
+    bare.anchor = bare_anchor;
+    bare.id = bare_anchor;
+    bare.routes.insert(compass, bare_root);
+    let view = node.config().unwrap();
+    let legacy_id = node.put_workspace(&view, &legacy).unwrap();
+    let view = node.config().unwrap();
+    let bare_id = node.put_workspace(&view, &bare).unwrap();
+    drop(guard);
+    for (revision, workspace) in [(legacy_id, &legacy), (bare_id, &bare)] {
+        owner.share(&json!(format!("{revision:X}")), &recipient, "read_only", None).unwrap();
+        owner.repair_authority_to(&recipient, workspace);
+        owner.publish_descriptors_to(&recipient, workspace);
+    }
+    let pending = recipient.list_pending();
+    let shares = pending["shares"].as_array().unwrap();
+    assert_eq!(shares.len(), 3);
+    let share_of = |anchor: Id| shares.iter().find(|share| share["anchor"] == format!("{anchor:X}")).unwrap().clone();
+    let legacy_share = share_of(legacy_anchor);
+    assert_eq!(legacy_share["label"], "Legacy");
+    assert_eq!(legacy_share["enrollable"], true);
+    assert_eq!(legacy_share["collections"][0]["role"], "compass");
+    assert_eq!(legacy_share["collections"][0]["role_source"], "name");
+    let bare_share = share_of(bare_anchor);
+    assert_eq!(bare_share["label"], "Two independent roots");
+    assert_eq!(bare_share["enrollable"], false);
+    assert!(bare_share["collections"][0]["role"].is_null());
+    assert!(bare_share["collections"][0]["role_source"].is_null());
+    assert!(recipient.enroll_pending(&bare_anchor, "Bare").is_err(), "a root without an understood role needs explicit routes");
+    let accepted = recipient.enroll_pending(&legacy_anchor, "Legacy local").unwrap();
+    let local = recipient.workspace(&accepted["workspace"]["workspace"]);
+    assert_eq!(local.routes, legacy.routes);
+    assert_eq!(recipient.list_pending()["shares"].as_array().unwrap().len(), 2);
 }

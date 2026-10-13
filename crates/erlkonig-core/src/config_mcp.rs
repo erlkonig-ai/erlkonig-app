@@ -69,6 +69,16 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"bootstrap":{"type":"string","maxLength":4194304},"label":{"type":"string","minLength":1}},"required":["observation","bootstrap","label"],"additionalProperties":false}"#,
     },
     Tool {
+        name: "config_list_pending_shares",
+        description: "List collections that resident native grants name for this node and that no current local workspace routes, grouped by the issuing workspace anchor found in their descriptor tags, with the descriptor name, faculty role (declared on the descriptor, or read from the name's role suffix: role_source says which), issuer identities, granted READ/WRITE/delegate actions and native admission. A collection whose descriptor is not yet resident is listed by handle as descriptor pending, with nothing inferred. sync_memory_pending lists handles the running sync daemon holds grants for in memory only. Read-only: fetches, grants, imports and selects nothing. No workspace required. Enroll a group with config_enroll_pending_share; use config_create_workspace with explicit routes for anything ungrouped.",
+        input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+    },
+    Tool {
+        name: "config_enroll_pending_share",
+        description: "After recipient-local consent, publish a local workspace over exactly the resident-granted collections of one workspace anchor from config_list_pending_shares, under a chosen nonempty local label, and select those roots for native sync. No bootstrap is needed: native grant exchange delivered the proofs and sync the descriptors. Imports no proofs, copies no keys, creates no replacement roots and sends no reply to the issuer. Publication completes first; selection follows and its failure does not roll back publication: reinspect before retrying. Repeat unchanged enrollment returns the same revision; a later local edit or withdrawal is never overwritten; a different label for an enrolled anchor is refused. An anchor with no resident grant, or a collection without an understood role, is refused. Explain additive non-expiring rights and that disclosed data cannot be made unread. Returns local publication only. Requires the latest config_inspect observation.",
+        input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"anchor":{"type":"string","minLength":32,"maxLength":32},"label":{"type":"string","minLength":1}},"required":["observation","anchor","label"],"additionalProperties":false}"#,
+    },
+    Tool {
         name: "config_set_settings",
         description: "Save the complete typed port, sync and maintenance settings after config_inspect. Explicitly supersedes observed settings forks; never guesses a winner. Native collection selection and participant discovery are independent; no peer bootstrap setting exists. Sync/maintenance apply while running; a changed MCP port takes effect after restarting Erlkonig and refreshing client integration. Port 0 requests an ephemeral local port. No keys, tokens, arbitrary paths or collection capabilities are accepted.",
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"mcp_port":{"type":"integer","minimum":0,"maximum":65535},"sync_enabled":{"type":"boolean"},"maintenance_enabled":{"type":"boolean"}},"required":["observation","mcp_port","sync_enabled","maintenance_enabled"],"additionalProperties":false}"#,
@@ -170,6 +180,14 @@ struct EnrollShare {
     label: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollPending {
+    observation: String,
+    anchor: String,
+    label: String,
+}
+
 fn current(view: &ConfigView, observation: &str) -> Result<()> {
     if view.observation()? != observation {
         bail!("node configuration changed since inspection; call config_inspect before saving");
@@ -184,6 +202,39 @@ fn revision(value: &str) -> Result<Id> {
         ));
     }
     Id::from_hex(value).context("invalid workspace revision")
+}
+
+fn anchor(value: &str) -> Result<Id> {
+    if value.len() != 32 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(mcp::invalid_arguments(
+            "anchor must be an exact 32-hex workspace anchor from config_list_pending_shares",
+        ));
+    }
+    Id::from_hex(value).context("invalid workspace anchor")
+}
+
+fn granted_json(value: &crate::workspace_grants::GrantedCollection) -> Value {
+    json!({
+        "root": format!("blake3:{}", hex::encode(value.root.raw)),
+        "descriptor": if value.descriptor_resident { "resident" } else { "pending" },
+        "name": value.name,
+        "role": value.role.and_then(|(role, _)| faculties::collection_names::name_for(role)),
+        "role_id": value.role.map(|(role, _)| format!("{role:X}")),
+        "role_source": value.role.map(|(_, source)| source.as_str()),
+        "issuers": value.issuers.iter().map(hex::encode).collect::<Vec<_>>(),
+        "granted": {"read": value.read, "write": value.write, "delegate": value.delegate,
+            "definitions_pending": value.definitions_pending},
+        "admitted": value.admitted.map(|(read, write)| json!({"read": read, "write": write})),
+    })
+}
+
+fn enrolled_json(accepted: &crate::workspace_sharing::Enrolled) -> Value {
+    json!({"workspace":workspace_json(&accepted.workspace),
+        "source_workspace":format!("{:X}",accepted.source),
+        "access":if accepted.write { "read_write" } else { "read_only" },
+        "delegate":accepted.delegate, "already_enrolled":accepted.already_enrolled,
+        "publication":"local_workspace", "sync_complete":false, "native_admission":"requires_native_acquired_evidence",
+        "payloads":"not transferred by enrollment; selected roots use existing enabled node sync"})
 }
 
 fn routes(discovery: &Discovery, values: Vec<Route>) -> Result<BTreeMap<Id, CollectionHandle>> {
@@ -409,12 +460,43 @@ impl ConfigMcp {
                 let args: EnrollShare = mcp::decode_arguments(arguments)?;
                 current(&view, &args.observation)?;
                 let accepted = node.enroll_workspace_share(&view, &args.bootstrap, &args.label)?;
-                json!({"workspace":workspace_json(&accepted.workspace),
-                    "source_workspace":format!("{:X}",accepted.source),
-                    "access":if accepted.write { "read_write" } else { "read_only" },
-                    "delegate":accepted.delegate, "already_enrolled":accepted.already_enrolled,
-                    "publication":"local_workspace", "sync_complete":false, "native_admission":"requires_native_acquired_evidence",
-                    "payloads":"not transferred by enrollment; selected roots use existing enabled node sync"})
+                enrolled_json(&accepted)
+            }
+            "config_list_pending_shares" => {
+                let _: Empty = mcp::decode_arguments(arguments)?;
+                let (shares, ungrouped) = node.pending_shares(&view, false)?;
+                let listed: std::collections::BTreeSet<String> = shares.iter()
+                    .flat_map(|share| share.collections.iter())
+                    .chain(ungrouped.iter())
+                    .map(|row| format!("blake3:{}", hex::encode(row.root.raw)))
+                    .collect();
+                let status = self.services.status.lock().unwrap_or_else(|e| e.into_inner());
+                let sync_memory_pending = status.node.grants_waiting.iter()
+                    .filter(|root| !listed.contains(*root)).cloned().collect::<Vec<_>>();
+                drop(status);
+                json!({"node_id":hex::encode(self.binding.signer),
+                    "shares":shares.iter().map(|share| {
+                        let mut issuers = std::collections::BTreeSet::new();
+                        for row in &share.collections { issuers.extend(row.issuers.iter().map(hex::encode)); }
+                        let enrollable = !share.local_revision
+                            && share.collections.iter().all(|row| row.role.is_some());
+                        json!({"anchor":format!("{:X}", share.anchor), "label":share.label,
+                            "issuers":issuers,
+                            "access":if share.collections.iter().all(|row| row.write) { "read_write" } else { "read_only" },
+                            "delegate":share.collections.iter().all(|row| row.delegate),
+                            "local_workspace":if share.local_revision { "changed_or_withdrawn" } else { "none" },
+                            "enrollable":enrollable,
+                            "collections":share.collections.iter().map(granted_json).collect::<Vec<_>>()})
+                    }).collect::<Vec<_>>(),
+                    "ungrouped":ungrouped.iter().map(granted_json).collect::<Vec<_>>(),
+                    "sync_memory_pending":sync_memory_pending,
+                    "read_only":true, "fetched":"nothing", "enrollment":"not_changed_by_listing"})
+            }
+            "config_enroll_pending_share" => {
+                let args: EnrollPending = mcp::decode_arguments(arguments)?;
+                current(&view, &args.observation)?;
+                let accepted = node.enroll_pending_share(&view, anchor(&args.anchor)?, &args.label)?;
+                enrolled_json(&accepted)
             }
             "config_set_settings" => {
                 let args: Settings = mcp::decode_arguments(arguments)?;

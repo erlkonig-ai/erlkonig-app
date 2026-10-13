@@ -19,4 +19,5 @@ pub mod transport;
 pub mod words;
 pub mod workspace;
 pub mod workspace_dispatch;
+mod workspace_grants;
 mod workspace_sharing;

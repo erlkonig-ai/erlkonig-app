@@ -411,6 +411,7 @@ impl NodeStore {
             let collection: Collection<blobencodings::SimpleArchive> = staging.register_collection(entity! {
                 metadata::tag*: [descriptor::KIND_COLLECTION_DESCRIPTOR, workspace.anchor],
                 descriptor::collection_name: format!("{} · {}", label.trim(), name),
+                attrs::collection_role: role,
                 policy::resource_policy*: faculties::collection_names::private_policy(self.signer.verifying_key()).fragment(),
                 descriptor::collection_representation*: <blobencodings::SimpleArchive as MetaDescribe>::describe(),
             })?;

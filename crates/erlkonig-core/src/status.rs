@@ -46,6 +46,10 @@ pub struct NodeStatus {
     pub transfer_bytes: u64,
     pub maintenance_publications: u64,
     pub sessions_started: u64,
+    /// Collections named by grants to this node that wait in the sync
+    /// daemon's memory for their descriptor (`blake3:` handles). Published by
+    /// native grant exchange; nothing is fetched or enrolled by listing them.
+    pub grants_waiting: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

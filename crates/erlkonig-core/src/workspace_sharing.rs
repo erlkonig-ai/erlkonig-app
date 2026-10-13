@@ -19,7 +19,6 @@ use triblespace::core::collection::{
     CollectionHandle, CollectionStoreExt, descriptor, grant_collection_capability,
 };
 use triblespace::core::metadata;
-use triblespace::core::query::register::{ObservationOrder, maximal};
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::{
     BlobStoreGet, BlobStoreList, BlobStorePut, CapabilityProofRead, CapabilityProofStore,
@@ -434,31 +433,14 @@ impl NodeStore {
         workspace.label = label.trim().to_owned();
         // Repeat enrollment never overwrites a later edit or resurrects a
         // withdrawal. Query the opaque manifest anchor; don't re-hash an ID.
-        let anchor = workspace.anchor;
-        let local = expected.facts()?;
-        let order = ObservationOrder::new(&local, metadata::supersedes.id());
-        let existing: Vec<_> = find!(id: Id, and!(
-            pattern!(&local, [{ ?id @ metadata::tag: attrs::WORKSPACE, config::anchor: anchor }]),
-            maximal(id, &order),
-        ))
-        .collect();
-        if !existing.is_empty() {
-            if existing.len() == 1 {
-                if let Some(value) = expected.workspace(existing[0])? {
-                    if value.label == workspace.label && value.routes == workspace.routes {
-                        return Ok(Enrolled {
-                            workspace: value,
-                            source: prepared.source,
-                            write: prepared.write,
-                            delegate: prepared.delegate,
-                            already_enrolled: true,
-                        });
-                    }
-                }
-            }
-            bail!(
-                "this share's local workspace was changed or withdrawn; enrollment will not overwrite it"
-            );
+        if let Some(value) = crate::workspace_grants::existing_enrollment(expected, &workspace)? {
+            return Ok(Enrolled {
+                workspace: value,
+                source: prepared.source,
+                write: prepared.write,
+                delegate: prepared.delegate,
+                already_enrolled: true,
+            });
         }
         self.publish_share_metadata(&mut prepared)?;
         // Blob insertion changes native observation dependencies even
