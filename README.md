@@ -65,6 +65,22 @@ definition bodies, keys or member data. It is metadata discovery, not authority
 delivery: native grant exchange and collection repair supply proofs, and
 ordinary exact-handle acquisition supplies their definitions.
 
+Without a bootstrap, the same enrollment follows the native grant exchange.
+When the issuer's node connects, the grant's proofs reach the recipient's
+node and land once their descriptors are resident. `config_list_pending_shares`
+lists, read-only, the collections resident proofs grant to this node that no
+current local workspace routes, grouped by the issuing workspace anchor found
+among each descriptor's tags, with the descriptor name, faculty role (declared
+on descriptors created since 2026-10-13, otherwise read from the name's role
+suffix, and `role_source` says which), issuer identities, granted actions and
+native admission; a root whose descriptor is not yet resident is listed by
+handle as descriptor pending, with nothing inferred, and roots the sync daemon
+holds grants for in memory only appear under `sync_memory_pending`.
+`config_enroll_pending_share` then publishes a local workspace over exactly
+those roots under a chosen label and selects them, with the same idempotence
+and refusals as bootstrap enrollment. The bootstrap tools remain the fallback
+when the nodes have not connected yet.
+
 Sync peering and Full hydration follow the pile's native collection-selection
 registers, not all admitted record/proof roots. Creating a workspace, adding
 new routes or accepting an enrollment publishes the workspace first, then
