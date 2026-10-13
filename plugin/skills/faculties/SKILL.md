@@ -58,28 +58,52 @@ Invocation alone never permits onward delegation. Also explain that disclosed
 or copied data cannot be made unread, whether or not delegation is enabled.
 Ask about the consequence in ordinary language, not capability jargon.
 
+The normal flow needs no handoff. The owner runs `config_share_workspace`;
+native grant exchange delivers the proofs to the recipient's node when the
+two nodes connect, and sync delivers the descriptors. On the recipient's node,
+call `config_list_pending_shares` (read-only, no workspace needed). It groups
+the collections resident grants name for this node by the issuing workspace,
+and per collection shows the exact root, the descriptor name and role, the
+access the proof edges claim (`claimed`, `claimed_access`) and, separately,
+what native admission grants right now (`admitted`, `admitted_access`); a
+claim is never effective access, so say both in ordinary language. The role
+is the one declared on the descriptor, or, for older descriptors, read from
+the name's role suffix, and `role_source` (declared or name) says which. A
+root whose descriptor has not arrived is listed as pending with nothing
+inferred; a root another local workspace already routes says so in
+`routed_in`. Explain exactly the roots shown and the disk/network/maintenance
+consequences, and choose a friendly **local alias** with the person. Then
+`config_inspect` and `config_enroll_pending_share` with the latest
+observation, the anchor, that alias and exactly the roots shown: it publishes
+a local workspace over those roots under the existing node key and selects
+them for native sync. If a root arrived or disappeared since the listing, it
+refuses and names the difference; list again rather than guessing. Later,
+when the listing shows new roots beside an enrolled workspace, enrolling
+exactly those roots extends it with a new revision; never pass roots the
+listing did not show. Rights already existed: nothing is acknowledged or
+approved toward the source, no key is copied, no menu is involved, and a
+grant alone neither enrolls nor selects anything.
+
+The JSON handoff is the fallback for when the nodes have not connected yet.
 Hand the opaque returned `bootstrap` unchanged to the intended recipient only
 through the user-requested channel. It contains signed role/root metadata and
 exact descriptor/name blobs, not capability proofs, definition bodies, keys or
 member payloads. Native grant exchange discovers capability evidence separately;
 this metadata handoff is not authority delivery, automatic enrollment, or a
 request/approve/acknowledge protocol. Do not print its internal handles
-unnecessarily or reconstruct it.
+unnecessarily or reconstruct it. On the recipient's node, call
+`config_probe_workspace_share` first. This is read-only: it verifies the
+native signature and recipient binding, NOT actual collection admission. It
+reports the issuer's declared access choice and the current exact collection
+names/roles/roots without importing, activating repair, downloading bodies or
+starting upkeep. Explain what is available and the consequences, and let the
+user choose whether to enroll it and a local label. Do not expand membership
+from common descriptor tags. For that chosen enrollment, inspect and call
+`config_enroll_workspace_share` with the bootstrap, local label and latest
+observation. It imports descriptor/name metadata and configures the **same
+roots and role routes under the existing node key**.
 
-On the recipient's node, call `config_probe_workspace_share` first. This is
-read-only: it verifies the native signature and recipient binding, NOT actual
-collection admission. It reports the issuer's declared access choice and
-reports the current exact collection names/roles/roots without importing,
-activating repair, downloading bodies or starting upkeep. Explain what is
-available and the disk/network/maintenance consequences. Let the user/agent
-choose whether to enroll it and a friendly **local label**. Do not infer roles
-by parsing names or expand membership from common descriptor tags.
-
-For that chosen enrollment, inspect and call `config_enroll_workspace_share`
-with the bootstrap, local label and latest observation. It imports descriptor/
-name metadata and configures the **same roots and role routes under the existing
-node key**. Rights already existed: no acknowledgement or approval goes to the
-source. Use the returned local workspace ID on subsequent faculty calls;
+Either way, use the returned local workspace ID on subsequent faculty calls;
 there is no global default. Repeat unchanged enrollment returns the same
 workspace, never overwriting a later edit or resurrecting a withdrawal.
 

@@ -42,13 +42,21 @@ remain available with zero workspaces. They inspect the public identity and
 typed settings, discover local collection choices, and create/edit/remove
 bundles. `config_share_workspace` grants native access immediately to an exact
 current bundle, invoke-only by default; onward delegation requires explaining
-consequences and the user's opt-in. `config_probe_workspace_share` verifies
-the bounded signed role/root/name metadata without mutation; this verifies the
-signature/recipient binding, not collection admission. No proof or definition
-payload travels in the handoff. Recipient-local
-`config_enroll_workspace_share` publishes a local label and the same roots
-under the existing key, then separately selects newly requested roots for
-enabled native Full sync. Selection failure does not roll back publication.
+consequences and the user's opt-in. The normal flow is then recipient-local:
+`config_list_pending_shares` lists the collections resident native grants name
+for this node, grouped by the issuing workspace, with the exact roots, the
+claimed and the admitted access and the role (declared, or from the name
+suffix, as `role_source` says), and `config_enroll_pending_share` publishes a
+local label over exactly the roots shown, refusing a set that changed since
+the listing; a later extension takes only roots the listing shows beside the
+enrolled workspace. The JSON handoff is the fallback for nodes that have not
+connected yet: `config_probe_workspace_share` verifies the bounded signed
+role/root/name metadata without mutation (the signature/recipient binding,
+not collection admission; no proof or definition payload travels in the
+handoff) and `config_enroll_workspace_share` publishes a local label and the
+same roots under the existing key. Either enrollment then separately selects
+newly requested roots for enabled native Full sync; selection failure does
+not roll back publication.
 Native grant exchange discovers authority evidence without an app authorization
 handshake; a grant alone neither enrolls nor selects a collection.
 Peering follows native `Selected` registers, including manual selections outside
