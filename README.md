@@ -44,8 +44,9 @@ permissions the recipient already holds.
 
 Grants are valid immediately. The returned bounded, opaque `bootstrap` is a
 one-way signed workspace-metadata handoff, not a request/approve/acknowledge protocol.
-Current native sync has no identity-wide cold grant inbox. On the recipient's
-own node, `config_probe_workspace_share` verifies the signed native manifest,
+Native grant exchange delivers capability evidence independently of the
+workspace-metadata handoff. A grant alone neither enrolls nor selects its roots.
+On the recipient's own node, `config_probe_workspace_share` verifies the signed native manifest,
 recipient binding in memory, and reports exact descriptor names and typed
 role/root routes plus the issuer's declared access choice. It does not confirm
 native collection admission. It imports nothing and starts no repair,
@@ -61,35 +62,43 @@ global default. Repeat unchanged enrollment returns the same local revision;
 a later local edit or withdrawal is never overwritten. The bootstrap contains
 descriptor/name blobs and a native signed COMMIT, never capability proofs,
 definition bodies, keys or member data. It is metadata discovery, not authority
-delivery: native repair supplies proofs and ordinary acquisition supplies
-their definitions after explicit local enrollment.
+delivery: native grant exchange and collection repair supply proofs, and
+ordinary exact-handle acquisition supplies their definitions.
 
-Enrolled known roots select Full bootstrap even while local READ evidence is
-pending. The server's resident native READ evidence admits the recipient's
-endpoint; AUTH repair then supplies proof bytes. Descriptor warmup acquires
-names and policy definitions; Full held(C) hydration acquires custom delegated
-definitions. Native evidence still governs local reads/writes and upkeep.
-The existing all-accessible runtime policy and its graph roots, Config,
-receipts and attached dependencies remain unchanged. This feature does not
-globally resource-gate arbitrary resident grants; its off-store probe creates
-no acquisition interest. A broader selection-policy migration is separate.
+Sync peering and Full hydration follow the pile's native collection-selection
+registers, not all admitted record/proof roots. Creating a workspace, adding
+new routes or accepting an enrollment publishes the workspace first, then
+separately selects its newly requested roots, even while local READ evidence
+is pending. Native evidence still governs admission. Startup initializes only
+current understood saved/enrolled roots with an `Unset` native selection;
+`Selected` is a no-op, and `Unselected` or `Conflicted` is preserved. No arbitrary
+grant forest or local Config/metrics control root is automatically selected.
+Manual native selections outside workspace grouping remain authoritative.
+Removing a workspace withdraws routing, not grants or native sync selections.
+
+Maintenance retains its independently all-accessible policy, including local
+Config, metrics and admitted attached targets. With sync enabled, it may fetch
+exact missing payloads for admitted roots outside the native sync selection.
+This is not global resource gating. With sync paused, maintenance stays local-only.
 
 Share/enroll responses mean **local publication**, not multi-replica sync
-completion or payload hydration. Enrollment keeps node service settings and
-peers unchanged, but selects its roots for already-enabled sync/maintenance.
-Issuer public identity is a routing hint, not authority. Discovery uses native
-descriptor authority hints, configured public peers and C-keyed providers;
-unavailable network bootstrap can leave enrollment pending. No peer setting
-is silently changed. Removing enrollment does not promise immediate native
-topic deactivation; the pinned network API has no public deactivate operation.
+completion or payload hydration. Enrollment keeps node service settings unchanged.
+Discovery uses native grant-chain keys, admitted owners and the descriptor
+blob's H-authorized providers; issuer identity alone is not authority.
+Reachability and evidence acquisition can remain pending.
 Source grant preparation and recipient signature/binding checks finish in
 memory before writes; the final workspace revision is one native Config
-COMMIT. Metadata precedes it, but the append-only publication is not a
-multi-record rollback transaction: interrupted I/O may leave valid evidence
-resident. No remote-delivery or revocation receipt is implied.
+COMMIT. Metadata precedes it and native selection follows it: these separate
+publications are not a rollback transaction. A selection error leaves the
+workspace published; reinspect before retrying. Interrupted I/O may leave
+valid evidence resident. No remote-delivery or revocation receipt is implied.
 
-`config_set_settings` saves the complete typed port, sync, maintenance and
-peer-public-ID settings. Peer IDs are bootstrap hints, not sharing permissions.
+`config_set_settings` saves the complete typed port, sync and maintenance settings.
+The obsolete bootstrap-peer setting has been removed. Historical peer facts
+stay inert in the append-only pile; old JSON requests containing `peers` are
+unsupported, not silently accepted as no-ops. At the coordinated upgrade,
+refresh the client package/schema and reload the client (or upload the refreshed
+Cowork archive) before using the new settings tools.
 Port changes require an app restart and client integration refresh; service
 settings apply while running. Responses report the actual running `mcp_url`
 and whether restart is required. After restart, choose **Integrations → your
@@ -112,7 +121,7 @@ exposing their blob handles. Stale edits fail; concurrent native revisions
 remain visible for explicit reconciliation. The existing typed Config
 operations publish the changes, with no separate configuration store.
 Missing access requires a node with appropriate native authority to invite
-the existing node identity. Creating/editing a bundle or configuring a peer
+the existing node identity. Creating/editing a bundle or changing service settings
 issues no grant; sharing uses the explicit sharing tool above. No
 configuration tool accepts private keys, tokens or arbitrary paths.
 
@@ -140,8 +149,12 @@ Workspace Faculty reads are local-only: missing payloads fail instead of
 starting acquisition peers. Native owners and safe pile handles end with the app.
 
 Maintenance uses a dedicated four-worker CPU pool, dependency-first ordering,
-and value-change gating at a one-second cadence. Sync owns its startup/periodic
-held-blob walker (four workers, 30-minute interval). The in-process resource
+and value-change gating at a one-second cadence. Native held sets are maintained
+at the store snapshot boundary; there is no separate held-walker worker.
+The daemon records its actual local bound addresses on startup/rebinding,
+normalizing wildcard sockets to loopback and superseding stale hints. As in the
+native CLI, its last addresses remain soft hints after shutdown, not a liveness
+promise. The in-process resource
 guard pauses services at 48 GiB process physical footprint on macOS (RSS elsewhere)
 or below 20% kernel memory headroom
 (`kern.memorystatus_level` on macOS, not the separate `memory_pressure`

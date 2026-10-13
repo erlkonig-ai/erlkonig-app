@@ -66,6 +66,22 @@ These are pending interactive checks, not an already-passed checklist:
    tools reachable. Reopen must retain explicit pauses.
    No Managed Piles, keyring or per-workspace storage controls should remain.
 
+   Use only port/sync/maintenance fields; old settings requests containing
+   `peers` must fail even for an empty list. Historical peer facts must still
+   read as ordinary settings and remain in the pile. At the coordinated
+   upgrade, refresh the client package/schema and reload the client.
+   In a legacy fixture, only current saved/enrolled roots with an unset native
+   selection should be initialized. Repeat startup must append no selection
+   states. Preserve native unselected/conflicted choices and honor manually
+   selected roots outside workspace grouping. A new admitted record or grant
+   must not automatically select collection peering. New workspace routes and
+   enrollments publish first and select afterward; failure is not rollback.
+   Withdrawal must not revoke grants or silently unselect native roots.
+   The actual daemon socket addresses must be recorded as reachable local
+   hints and superseded on rebinding. Maintenance remains independently
+   all-accessible and can acquire exact missing bodies while sync is enabled;
+   these assertions do not claim global fetch isolation.
+
 Configuration, metrics and workspace collections share one node pile. A
 malformed/unreadable control observation stops node services; a conflicting
 workspace remains unavailable. MCP requires an explicit workspace on every ordinary faculty

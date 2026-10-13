@@ -24,8 +24,11 @@ role/root choices. Explain ambiguous choices in ordinary language; use returned
 IDs yourself. `config_edit_workspace` preserves omitted routes; supplied routes
 replace the entire bundle. `config_remove_workspace` withdraws one exact
 revision without deleting its collections or choosing a concurrent winner.
-`config_set_settings` takes complete typed port, sync, maintenance and public
-peer-ID settings. A port change requires app restart and integration refresh.
+`config_set_settings` takes complete typed port, sync and maintenance settings.
+There is no peer-bootstrap field. Old requests containing `peers` are unsupported;
+at the coordinated upgrade refresh the client package/schema and reload the
+client (or upload the refreshed Cowork archive). A port change also requires
+app restart and integration refresh.
 
 Pass the inspected observation on each edit. If stale, inspect again and
 reconsider the intended change; do not blindly replay it. Conflicted settings
@@ -58,8 +61,8 @@ Ask about the consequence in ordinary language, not capability jargon.
 Hand the opaque returned `bootstrap` unchanged to the intended recipient only
 through the user-requested channel. It contains signed role/root metadata and
 exact descriptor/name blobs, not capability proofs, definition bodies, keys or
-member payloads. Current native sync
-has no identity-wide cold grant discovery: this is a one-way bootstrap, not a
+member payloads. Native grant exchange discovers capability evidence separately;
+this metadata handoff is not authority delivery, automatic enrollment, or a
 request/approve/acknowledge protocol. Do not print its internal handles
 unnecessarily or reconstruct it.
 
@@ -80,23 +83,27 @@ source. Use the returned local workspace ID on subsequent faculty calls;
 there is no global default. Repeat unchanged enrollment returns the same
 workspace, never overwriting a later edit or resurrecting a withdrawal.
 
-Enrollment selects known roots for Full bootstrap even while local READ
-evidence is pending. The server's resident native evidence admits the endpoint;
-AUTH repair supplies proofs, descriptor warmup supplies policy definitions,
-and Full held(C) hydration supplies custom delegate definitions. Native
-evidence still governs local reads/writes and upkeep. Existing all-accessible
-node selection remains unchanged: do not claim arbitrary resident unenrolled
-grants are globally resource-gated. Off-store probing selects nothing.
+Sync peering and Full hydration follow native collection-selection registers,
+not arbitrary admitted grants or the workspace chosen for one call. Startup
+selects only current saved/enrolled roots whose native choice is `Unset`;
+`Selected` is a no-op, while `Unselected` and `Conflicted` are preserved.
+Manual native selections outside workspace grouping remain authoritative.
+An explicit creation, new route or enrollment publishes its workspace first,
+then separately selects newly requested roots, even if READ evidence is pending.
+Native grant exchange and participant discovery deliver authority evidence;
+native admission still governs reads/writes and upkeep. Off-store probing
+selects nothing. Maintenance remains independently all-accessible and, with
+sync enabled, can fetch exact missing bodies outside sync selection. Do not
+claim global resource gating or silently tighten that maintenance policy.
 
 Share/enroll responses confirm local publication, **not replica synchronization
-or payload availability**. Enrollment keeps service settings and peers unchanged
-but selects its roots for existing enabled sync/maintenance. If paused, explain
-that data may remain unavailable. Issuer identity is only a routing hint;
-native descriptor/contact/provider discovery can remain pending. Never silently
-edit peer settings. Native grant and metadata validation precede publication;
-the final Config workspace is one native commit, but the append-only metadata
-publication is not a rollback transaction. Interrupted I/O may retain metadata.
-Removing enrollment does not promise immediate native topic deactivation.
+or payload availability**. Enrollment keeps service settings unchanged.
+If sync is paused, data may remain unavailable. Native grant-chain, owner and
+exact descriptor-blob provider discovery can remain pending; an issuer identity
+alone grants no authority. Native metadata validation precedes publication;
+workspace and native selection use separate commits, not a rollback transaction.
+A selection failure leaves the workspace published. Removing enrollment
+withdraws local routing, not native sync selection or authority.
 Reinspect after an error; do not invent a key-copy, shell-grant or second-service workaround.
 
 ## Choose the data workspace
@@ -122,13 +129,13 @@ Omitted roles are unavailable, including auxiliary roles a tool needs. Report
 the missing configuration; do not synthesize a private root or switch
 workspaces silently. Workspace reads are local-only and may report missing
 payloads. Workspace selection does not change the node's sync or maintenance
-settings or start a second service. Node synchronization includes permitted
+settings or start a second service. Node synchronization follows native-selected
 collections independently of the current request's workspace.
 
 If access is missing, explain that a node with the appropriate native grant
 authority must invite the existing node identity with the required access.
-Use the sharing workflow above when requested. Other Config tools and public
-peer bootstrap hints do not grant authority. Never ask for a secret key or
+Use the sharing workflow above when requested. Other Config tools and native
+selection do not grant authority. Never ask for a secret key or
 create another identity as a workaround.
 
 Reading workspace A and writing workspace B require separate explicit calls

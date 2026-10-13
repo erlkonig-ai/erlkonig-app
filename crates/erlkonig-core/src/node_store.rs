@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use faculties::schemas::config::config;
 use triblespace::core::collection::{
     Collection, CollectionHandle, CollectionSnapshot, CollectionSnapshotExt, CollectionStoreExt,
@@ -22,7 +22,6 @@ use triblespace::core::repo::{
     BlobStoreGet, SnapshotSource, StorageFlush, StoreChanges, StoreDependencies, StoreSnapshot,
 };
 use triblespace::prelude::*;
-use triblespace_net::health_record;
 
 use crate::node_schema as attrs;
 use crate::workspace::Workspace;
@@ -32,7 +31,6 @@ pub struct NodeSettings {
     pub mcp_port: u16,
     pub sync_enabled: bool,
     pub maintenance_enabled: bool,
-    pub peers: Vec<[u8; 32]>,
 }
 
 impl Default for NodeSettings {
@@ -41,7 +39,6 @@ impl Default for NodeSettings {
             mcp_port: 41773,
             sync_enabled: true,
             maintenance_enabled: true,
-            peers: Vec::new(),
         }
     }
 }
@@ -162,12 +159,6 @@ impl ConfigView {
         }
         let mut candidates = Vec::new();
         for state in states {
-            let mut peers: Vec<_> = find!(peer: VerifyingKey,
-                pattern!(&facts, [{ state @ health_record::attrs::peer: ?peer }]))
-            .map(|key| key.to_bytes())
-            .collect();
-            peers.sort_unstable();
-            peers.dedup();
             let before = candidates.len();
             for (mcp_port, sync_enabled, maintenance_enabled) in find!(
                 (port: u16, sync: bool, maintain: bool),
@@ -178,7 +169,6 @@ impl ConfigView {
                     mcp_port,
                     sync_enabled,
                     maintenance_enabled,
-                    peers: peers.clone(),
                 });
             }
             if candidates.len() == before {
@@ -389,7 +379,6 @@ impl NodeStore {
             attrs::mcp_port: value.mcp_port,
             attrs::sync_enabled: value.sync_enabled,
             attrs::maintenance_enabled: value.maintenance_enabled,
-            health_record::attrs::peer*: value.peers.iter().map(VerifyingKey::from_bytes).collect::<std::result::Result<Vec<_>,_>>()?,
             metadata::supersedes*: previous,
         };
         let id = fragment.root().expect("settings entity has a root");
@@ -413,6 +402,7 @@ impl NodeStore {
         let workspace = Workspace::new(label.trim());
         let mut staging = triblespace::core::repo::memoryrepo::MemoryStore::default();
         let mut routes = Fragment::empty();
+        let mut roots = Vec::new();
         for (role, name) in crate::workspace::roles() {
             use triblespace::core::capability::policy;
             use triblespace::core::collection::records as descriptor;
@@ -424,6 +414,7 @@ impl NodeStore {
                 policy::resource_policy*: faculties::collection_names::private_policy(self.signer.verifying_key()).fragment(),
                 descriptor::collection_representation*: <blobencodings::SimpleArchive as MetaDescribe>::describe(),
             })?;
+            roots.push(collection.handle());
             routes += entity! { config::anchor: role, config::selects: collection.handle() };
         }
         let mut fragment = entity! {
@@ -435,6 +426,9 @@ impl NodeStore {
         let id = fragment.root().expect("workspace revision has a root");
         self.pile.commit(self.config, &self.signer, fragment)?;
         self.pile.flush()?;
+        self.select_requested_roots(roots).with_context(|| {
+            format!("workspace {id:X} was published; native sync selection failed; reinspect before retrying")
+        })?;
         Ok(id)
     }
 
@@ -448,9 +442,8 @@ impl NodeStore {
         .collect())
     }
 
-    /// Current local enrollments also request native bootstrap while READ
-    /// evidence is pending. This supplements, never replaces, the existing
-    /// all-accessible acquisition policy and historical discovery seeds.
+    /// Current understood saved bundles, including accepted enrollments.
+    /// Neither historical routes nor arbitrary admitted grants are selected.
     pub fn enrolled_roots(&mut self) -> Result<Vec<CollectionHandle>> {
         let view = self.config()?;
         let mut roots = std::collections::BTreeSet::new();
@@ -460,6 +453,58 @@ impl NodeStore {
             }
         }
         Ok(roots.into_iter().collect())
+    }
+
+    /// Bootstrap legacy bundles only where no native choice exists. A manual
+    /// unselection or concurrent native fork is never implicitly overwritten.
+    pub fn initialize_workspace_sync(&mut self) -> Result<usize> {
+        use triblespace::core::collection::selection::{self, Selection};
+        let roots = self.enrolled_roots()?;
+        let mut written = 0;
+        for root in roots {
+            let facts = selection::config_facts(&self.pile.snapshot()?, self.signer.verifying_key())?;
+            if selection::sync_selection(&facts, root) == Selection::Unset {
+                selection::write_sync_selection(&mut self.pile, self.config, &self.signer, root, true)?;
+                written += 1;
+            }
+        }
+        if written > 0 { self.pile.flush()?; }
+        Ok(written)
+    }
+
+    /// An explicit bundle action selects its newly requested roots AFTER the
+    /// workspace commit. Failure does not roll back that earlier publication.
+    fn select_requested_roots(&mut self, roots: impl IntoIterator<Item = CollectionHandle>) -> Result<()> {
+        use triblespace::core::collection::selection::{self, Selection};
+        for root in roots.into_iter().collect::<std::collections::BTreeSet<_>>() {
+            let facts = selection::config_facts(&self.pile.snapshot()?, self.signer.verifying_key())?;
+            if selection::sync_selection(&facts, root) != Selection::Selected {
+                selection::write_sync_selection(&mut self.pile, self.config, &self.signer, root, true)?;
+            }
+        }
+        self.pile.flush()?;
+        Ok(())
+    }
+
+    /// The daemon publishes reachable local addresses, not bootstrap peers.
+    /// Rebinding supersedes old hints; an unchanged observation appends nothing.
+    pub(crate) fn record_sync_addresses(&mut self, bound: &[std::net::SocketAddr]) -> Result<bool> {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+        use triblespace::core::collection::selection;
+        let addresses = bound.iter().map(|socket| {
+            let ip = match socket.ip() {
+                IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+                ip => ip,
+            };
+            SocketAddr::new(ip, socket.port())
+        }).collect::<std::collections::BTreeSet<_>>();
+        let endpoint = self.signer.verifying_key();
+        let facts = selection::config_facts(&self.pile.snapshot()?, endpoint)?;
+        if selection::sync_addresses(&facts, endpoint) == addresses { return Ok(false); }
+        selection::write_sync_addresses(&mut self.pile, self.config, &self.signer, endpoint, addresses)?;
+        self.pile.flush()?;
+        Ok(true)
     }
 
     pub fn put_workspace(&mut self, expected: &ConfigView, value: &Workspace) -> Result<Id> {
@@ -476,6 +521,14 @@ impl NodeStore {
                 config::anchor: value.anchor }]), maximal(state, &order),
         ))
         .collect();
+        let mut previous_roots = std::collections::BTreeSet::new();
+        for revision in &previous {
+            if let Ok(Some(workspace)) = expected.workspace_revision(*revision) {
+                previous_roots.extend(workspace.routes.values().copied());
+            }
+        }
+        let requested_roots = value.routes.values().copied()
+            .filter(|root| !previous_roots.contains(root)).collect::<Vec<_>>();
         let mut routes = Fragment::empty();
         for (role, root) in &value.routes {
             routes += entity! {
@@ -490,6 +543,9 @@ impl NodeStore {
         let id = fragment.root().expect("workspace revision has a root");
         self.pile.commit(self.config, &self.signer, fragment)?;
         self.pile.flush()?;
+        self.select_requested_roots(requested_roots).with_context(|| {
+            format!("workspace {id:X} was published; native sync selection failed; reinspect before retrying")
+        })?;
         Ok(id)
     }
 

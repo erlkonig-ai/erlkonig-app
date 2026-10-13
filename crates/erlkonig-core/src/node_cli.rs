@@ -129,8 +129,6 @@ pub fn run(args: &[OsString]) -> Result<bool> {
                     "ports":find!(port:u16,pattern!(&facts,[{state @ attrs::mcp_port:?port}])).collect::<Vec<_>>(),
                     "sync":find!(value:bool,pattern!(&facts,[{state @ attrs::sync_enabled:?value}])).collect::<Vec<_>>(),
                     "maintenance":find!(value:bool,pattern!(&facts,[{state @ attrs::maintenance_enabled:?value}])).collect::<Vec<_>>(),
-                    "peers":find!(peer:VerifyingKey,pattern!(&facts,[{state @ triblespace_net::health_record::attrs::peer:?peer}]))
-                        .map(|peer|hex::encode(peer.to_bytes())).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>();
                 seeds.extend(find!(root: CollectionHandle, pattern!(&facts, [
                     { _?workspace @ triblespace::core::metadata::tag: crate::node_schema::WORKSPACE,
@@ -148,16 +146,16 @@ pub fn run(args: &[OsString]) -> Result<bool> {
                 config_report = json!({"handle":hex::encode(config_handle.raw),"resident":true,
                     "has_settings":has_settings,"settings_heads":settings_heads,
                     "settings":match view.settings() {Ok(value)=>json!({"port":value.mcp_port,
-                        "sync":value.sync_enabled,"maintenance":value.maintenance_enabled,
-                        "peers":value.peers.iter().map(hex::encode).collect::<Vec<_>>()}),
+                        "sync":value.sync_enabled,"maintenance":value.maintenance_enabled}),
                         Err(error)=>json!({"problem":format!("{error:#}")})},
                     "workspaces":workspaces});
             }
-            let selection = crate::workspace::AllAccessible::discover(
+            let mut selection = crate::workspace::AllAccessible::discover(
                 &observed,
                 signer,
                 seeds.iter().copied(),
             )?;
+            selection.sync = crate::workspace::selected_sync_roots(&observed, signer)?;
             let mut named = Vec::new();
             for handle in crate::workspace::candidates(&observed, seeds)? {
                 if let Ok(facts) = observed.get::<TribleSet, _>(handle) {
@@ -215,11 +213,6 @@ pub fn run(args: &[OsString]) -> Result<bool> {
                 mcp_port: request.mcp_port,
                 sync_enabled: request.sync_enabled,
                 maintenance_enabled: request.maintenance_enabled,
-                peers: request
-                    .peers
-                    .iter()
-                    .map(|value| public(value).map(|key| key.to_bytes()))
-                    .collect::<Result<Vec<_>>>()?,
             };
             let mut plan = crate::migration::MigrationPlan::prepare(
                 &source,
@@ -290,8 +283,6 @@ pub struct MigrationRequest {
     pub sync_enabled: bool,
     pub maintenance_enabled: bool,
     #[serde(default)]
-    pub peers: Vec<String>,
-    #[serde(default)]
     pub workspaces: Vec<ExistingWorkspace>,
 }
 
@@ -308,6 +299,17 @@ pub struct ExistingWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn removed_peer_field_is_not_accepted_by_handoff_requests() {
+        let mut request = json!({
+            "source_pile":"source.pile","source_public":"public","source_config":"config",
+            "target":{"pile":"target.pile","key":"target.key","expected_signer":"public"},
+            "mcp_port":0,"sync_enabled":false,"maintenance_enabled":false,
+        });
+        assert!(serde_json::from_value::<MigrationRequest>(request.clone()).is_ok());
+        request["peers"] = json!([]);
+        assert!(serde_json::from_value::<MigrationRequest>(request).is_err());
+    }
     #[test]
     fn locator_is_explicit_persistent_and_never_replaces_an_identity() {
         let dir = tempfile::tempdir().unwrap();

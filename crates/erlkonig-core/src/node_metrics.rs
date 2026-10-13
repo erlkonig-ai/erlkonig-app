@@ -193,15 +193,6 @@ impl NodeStore {
                 (_, Some(endpoint)) => endpoint,
                 (None, None) => self.signer.verifying_key(),
             };
-            // ShortString is the existing telemetry vocabulary. Reject an
-            // unsuitable producer label before constructing any publication.
-            if sample.worker.len() > 32
-                || sample.role.len() > 32
-                || sample.worker.as_bytes().contains(&0)
-                || sample.role.as_bytes().contains(&0)
-            {
-                bail!("telemetry worker and role labels must fit 32 UTF-8 bytes without NUL");
-            }
             if sample.cpu_ns.is_some() && (sample.role != "process" || sample.managed.is_some()) {
                 bail!(
                     "process CPU must be reported in a process scope, not duplicated per managed pile"
@@ -246,7 +237,7 @@ impl NodeStore {
         let snapshot = self.pile.snapshot()?;
         let observed = snapshot.collection_acquiring(self.metrics)?;
         let facts: TribleSet = observed.view()?;
-        telemetry::observe(&facts, now_tai_ns, max_age)
+        telemetry::observe(&facts, &snapshot, now_tai_ns, max_age)
             .into_iter()
             .map(|report| {
                 let mut managed: Vec<Id> = find!(entry: Id,

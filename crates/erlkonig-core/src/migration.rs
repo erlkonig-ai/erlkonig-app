@@ -17,7 +17,6 @@ use triblespace::core::repo::{
     BlobStoreGet, BlobStoreList, SnapshotSource, StorageFlush, potential_handles, reachable,
 };
 use triblespace::prelude::*;
-use triblespace_net::health_record;
 
 use crate::{
     config::NodeBinding,
@@ -77,7 +76,6 @@ impl MigrationPlan {
                 config::anchor: attrs::NODE_SETTINGS, attrs::mcp_port: defaults.mcp_port,
                 attrs::sync_enabled: defaults.sync_enabled,
                 attrs::maintenance_enabled: defaults.maintenance_enabled,
-                health_record::attrs::peer*: defaults.peers.iter().map(VerifyingKey::from_bytes).collect::<std::result::Result<Vec<_>,_>>()?,
             };
             plan.settings_successors += 1;
         }
@@ -94,16 +92,6 @@ impl MigrationPlan {
             if maintain.is_empty() {
                 maintain.push(defaults.maintenance_enabled);
             }
-            let mut peers: Vec<VerifyingKey> = find!(peer: VerifyingKey, pattern!(&facts, [{state @ health_record::attrs::peer: ?peer}])).collect();
-            if peers.is_empty()
-                && !exists!(pattern!(&facts,[{state @ attrs::sync_enabled:_?explicit}]))
-            {
-                peers = defaults
-                    .peers
-                    .iter()
-                    .map(VerifyingKey::from_bytes)
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-            }
             if ports.is_empty() {
                 plan.retained.push(format!(
                     "Settings {state:X} has no understood port; retained without choosing a value"
@@ -115,7 +103,6 @@ impl MigrationPlan {
                         fragment += entity! {
                             config::anchor: attrs::NODE_SETTINGS, attrs::mcp_port: port,
                             attrs::sync_enabled: *sync, attrs::maintenance_enabled: *maintain,
-                            health_record::attrs::peer*: peers.iter().copied(),
                             metadata::supersedes: state,
                         };
                         plan.settings_successors += 1;

@@ -3,6 +3,7 @@ use crate::{
     config::Bootstrap, init, node_store::NodeStore, workspace_dispatch::WorkspaceDispatch,
 };
 use faculties::out::Part;
+use ed25519_dalek::VerifyingKey;
 use std::sync::{Arc, Mutex};
 use triblespace::core::collection::{CollectionRecord, CollectionStore, CollectionStoreExt};
 use triblespace::core::repo::{BlobStoreList, BlobStorePut, CapabilityProofRead, SnapshotSource, StorageFlush};
@@ -152,9 +153,9 @@ impl Fixture {
         let mut guard = self.config.node.lock().unwrap();
         let node = guard.as_mut().unwrap();
         let roots = node.workspace_roots().unwrap();
-        let mut selected = crate::workspace::AllAccessible::discover(&node.pile.snapshot().unwrap(), node.signer.verifying_key(), roots).unwrap();
-        selected.sync.extend(node.enrolled_roots().unwrap());
-        selected.sync.sort_unstable(); selected.sync.dedup();
+        let snapshot = node.pile.snapshot().unwrap();
+        let mut selected = crate::workspace::AllAccessible::discover(&snapshot, node.signer.verifying_key(), roots).unwrap();
+        selected.sync = crate::workspace::selected_sync_roots(&snapshot, node.signer.verifying_key()).unwrap();
         selected
     }
 
@@ -309,6 +310,11 @@ fn sharing_read_only_enrolls_same_roots_and_reads_without_write_or_delegation() 
     let local = recipient.workspace(local_id);
     assert_eq!(local.label, "Local shared workspace", "recipient chooses a local alias");
     assert_eq!(local.routes, original.routes);
+    {
+        use triblespace::core::collection::selection::{sync_selection, Selection};
+        let facts = recipient.config.node.lock().unwrap().as_mut().unwrap().config().unwrap().facts().unwrap();
+        assert!(local.routes.values().all(|root| sync_selection(&facts, *root) == Selection::Selected), "enrollment bridges to the native selection register");
+    }
     let selected = recipient.selection();
     assert!(local.routes.values().all(|root| selected.sync.contains(root) && !selected.maintenance.contains(root)), "local consent selects pending known-C bootstrap, not maintenance authority");
     assert!(recipient.admission(&local).iter().all(|value| *value == (false, false)), "metadata/enrollment cannot manufacture admission");
@@ -344,7 +350,7 @@ fn sharing_read_write_admits_authored_commit_and_opt_in_delegation_is_bounded() 
     let recipient_private = recipient.create("Recipient private");
     let recipient_private_routes = recipient.workspace(&recipient_private).routes;
     let settings = recipient.call("config_set_settings", json!({"observation":recipient.inspect()["observation"],
-        "mcp_port":0,"sync_enabled":false,"maintenance_enabled":false,"peers":[]})).unwrap()["settings"].clone();
+        "mcp_port":0,"sync_enabled":false,"maintenance_enabled":false})).unwrap()["settings"].clone();
     let runtime = recipient.inspect()["runtime"].clone();
     let key_bytes = std::fs::read(&recipient.config.binding.key).unwrap();
     let id = owner.create("Collaboration");
@@ -771,11 +777,10 @@ fn settings_conflicts_are_inspected_and_explicitly_reconciled() {
     let mut args = json!({"observation":inspected["observation"],"mcp_port":0,"sync_enabled":false,"maintenance_enabled":true,"peers":["invalid"]});
     assert!(f.call("config_set_settings", args.clone()).is_err());
     assert_eq!(std::fs::read(&f.config.binding.pile).unwrap(), before);
-    args["peers"] = json!([hex::encode(
-        ed25519_dalek::SigningKey::from_bytes(&[45; 32])
-            .verifying_key()
-            .to_bytes()
-    )]);
+    args["peers"] = json!([]);
+    assert!(f.call("config_set_settings", args.clone()).is_err(), "removed peer fields are unsupported, not accepted as no-ops");
+    assert_eq!(std::fs::read(&f.config.binding.pile).unwrap(), before);
+    args.as_object_mut().unwrap().remove("peers");
     let saved = f.call("config_set_settings", args.clone()).unwrap();
     assert_eq!(saved["mcp_url"], "http://127.0.0.1:41773/");
     assert_eq!(saved["port_restart_required"], true);
@@ -783,7 +788,7 @@ fn settings_conflicts_are_inspected_and_explicitly_reconciled() {
     assert!(now["settings_problem"].is_null());
     assert_eq!(now["settings"]["sync_enabled"], false);
     assert_eq!(now["settings"]["maintenance_enabled"], true);
-    assert_eq!(now["settings"]["peers"], args["peers"]);
+    assert!(now["settings"].get("peers").is_none());
     assert!(
         f.call("config_set_settings", args).is_err(),
         "stale complete settings rejected"

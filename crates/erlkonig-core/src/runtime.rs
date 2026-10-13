@@ -29,7 +29,7 @@ use triblespace::core::{
     repo::{SnapshotSource, StorageClose, StoreChanges, StoreSnapshot},
     signing_key_file,
 };
-use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
+use triblespace_net::peer::{Peer, PeerConfig};
 use triblespace_net::reconcile::ReplicationMode;
 
 pub(crate) type SharedNode = Arc<Mutex<Option<NodeStore>>>;
@@ -489,7 +489,11 @@ fn controller(
         }
         let mut start = false;
         match with_node(&node, |node| {
-            node.poll_config()?.map(|view| view.settings()).transpose()
+            node.poll_config()?.map(|view| {
+                let settings = view.settings()?;
+                node.initialize_workspace_sync()?;
+                Ok(settings)
+            }).transpose()
         }) {
             Ok(Some(next)) => {
                 // Workspaces select views: changing their facts must not reopen
@@ -497,7 +501,6 @@ fn controller(
                 let unchanged = settings.as_ref().is_some_and(|old| {
                     old.sync_enabled == next.sync_enabled
                         && old.maintenance_enabled == next.maintenance_enabled
-                        && old.peers == next.peers
                 });
                 if !unchanged {
                     if let Some(old) = task.take() {
@@ -773,24 +776,13 @@ fn node_session(
     let store = faculties::storage::open_pile_strict_as(&binding.pile, signer.verifying_key())?;
     let mut observer = maintenance_observer(signer.verifying_key(), session, status, activity, metrics);
     let result = if settings.sync_enabled {
-        // Same startup and bounded periodic backstop as the native CLI.
-        // Its RAII handle joins only this app's walker during shutdown.
-        let held_walker = store.start_held_walker(Default::default());
-        let peers = settings
-            .peers
-            .iter()
-            .map(|bytes| {
-                iroh_base::EndpointId::from_bytes(bytes).map(iroh_base::EndpointAddr::from)
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut peer = Peer::new(
             store,
             signer.clone(),
             PeerConfig {
-                peers,
-                qos: ReconcileQos {
-                    direction: ReconcileDirection::Bidirectional,
-                },
+                walk_algorithm: triblespace_net::walk_stream::Algorithm::default(),
+                // This app owns the daemon, rather than dialing another one.
+                daemon: None,
                 provider_publication_budget: None,
                 bind: None,
             },
@@ -802,6 +794,7 @@ fn node_session(
         let mut previous_snapshot = None;
         let mut previous_sent = 0u64;
         let mut received = 0u128;
+        let mut recorded_addresses = None;
         update(status, |s| {
             s.node.services = if stop.borrow().is_some() {
                 ServiceState::Stopping
@@ -828,18 +821,21 @@ fn node_session(
                     biased;
                     _ = &mut stopped => break,
                     result = async {
+                        let bound = peer.bound_sockets();
+                        if recorded_addresses.as_ref() != Some(&bound) {
+                            with_node(&node, |node| node.record_sync_addresses(&bound))?;
+                            update(status, |s| s.node.bound_sockets = bound.iter().map(ToString::to_string).collect());
+                            recorded_addresses = Some(bound);
+                        }
                         peer.try_refresh()?;
                         let snapshot = peer.snapshot()?;
                         if previous_snapshot.as_ref().is_none_or(|previous| snapshot.changes_since(previous) != StoreChanges::NONE) {
                             let roots = with_node(&node, NodeStore::workspace_roots)?;
                             let mut next = AllAccessible::discover(&snapshot, signer.verifying_key(), roots)?;
-                            // Local enrollment is consent to known-C acquisition,
-                            // not proof issuance. A server's resident evidence
-                            // admits repair before our READ proofs/definitions
-                            // arrive. Full held(C) hydration also acquires custom
-                            // delegate definitions outside descriptor warmup.
-                            next.sync.extend(with_node(&node, NodeStore::enrolled_roots)?);
-                            next.sync.sort_unstable(); next.sync.dedup();
+                            // Maintenance remains independently all-accessible.
+                            // Only the pile's native Selected relation peers and
+                            // hydrates in Full mode; grants alone select nothing.
+                            next.sync = crate::workspace::selected_sync_roots(&snapshot, signer.verifying_key())?;
                             if previous_snapshot.is_none() || selection.sync != next.sync {
                                 peer.set_replication(ReplicationMode::Full, next.sync.iter().copied());
                                 peer.activate_collections(next.sync.iter().copied());
@@ -878,7 +874,6 @@ fn node_session(
         let stopped = peer
             .shutdown_and_join()
             .context("stop owned native endpoint");
-        drop(held_walker);
         let closed = peer.close().context("close owned node handle");
         session_result(driven, [
             (CleanupFailure::EndpointShutdownFailed, stopped),
@@ -1080,7 +1075,7 @@ mod tests {
         let snapshot = node.pile.snapshot().unwrap();
         let observed = snapshot.collection_acquiring(node.metrics).unwrap();
         let facts: TribleSet = observed.view().unwrap();
-        let mut events = find!((phase: String, code: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
+        let mut events = find!((phase: Inline<inlineencodings::Handle<blobencodings::UTF8String>>, code: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
             pattern!(&facts, [
                 { metadata::tag: crate::node_metrics::KIND_SERVICE_EVENT,
                     health_record::attrs::session: attempt.id,
@@ -1088,8 +1083,9 @@ mod tests {
                 { _?subject @ telemetry::attrs::stage: ?phase },
             ]))
             .map(|(phase, code)| {
+                let phase: View<str> = snapshot.get(phase).unwrap();
                 let text: View<str> = snapshot.get(code).unwrap();
-                (phase, text.to_string())
+                (phase.to_string(), text.to_string())
             })
             .collect::<Vec<_>>();
         events.sort_unstable();
@@ -1176,7 +1172,7 @@ mod tests {
         let mut node = NodeStore::open(&layout.default_pile(), signer.clone()).unwrap();
         let view = node.config().unwrap();
         node.put_settings(&view, &NodeSettings { mcp_port: 0,
-            sync_enabled: true, maintenance_enabled: false, peers: vec![] }).unwrap();
+            sync_enabled: true, maintenance_enabled: false }).unwrap();
         node.close().unwrap();
         let identity = std::env::temp_dir().join(format!("erlkonig-endpoint-{}.lock", hex::encode(signer.verifying_key().as_bytes())));
         let competing = lease(&identity).unwrap();
@@ -1226,7 +1222,7 @@ mod tests {
         let mut node = NodeStore::open(&layout.default_pile(), signer).unwrap();
         let view = node.config().unwrap();
         node.put_settings(&view, &NodeSettings { mcp_port: 0,
-            sync_enabled: true, maintenance_enabled: false, peers: vec![] }).unwrap();
+            sync_enabled: true, maintenance_enabled: false }).unwrap();
         node.close().unwrap();
         let mode = Arc::new(AtomicUsize::new(0));
         let guard = {
@@ -1280,7 +1276,7 @@ mod tests {
         let mut node = NodeStore::open(&layout.default_pile(), signer).unwrap();
         let view = node.config().unwrap();
         node.put_settings(&view, &NodeSettings { mcp_port: 0,
-            sync_enabled: true, maintenance_enabled: false, peers: vec![] }).unwrap();
+            sync_enabled: true, maintenance_enabled: false }).unwrap();
         node.close().unwrap();
         let pressure = Arc::new(AtomicBool::new(false));
         let samples = Arc::new(AtomicUsize::new(0));
@@ -1315,14 +1311,27 @@ mod tests {
         assert_eq!(app.status().node.services, ServiceState::Stopped);
         assert_eq!(app.status().node.sessions_started, 1);
         assert_ne!(app.config().unwrap().observation().unwrap(), observation);
-        let observation = app.config().unwrap().observation().unwrap();
+        let before_retry = app.config().unwrap();
+        let settings_before_retry = before_retry.settings().unwrap();
+        let roots_before_retry = crate::workspace::selected_sync_roots(
+            before_retry.observed.snapshot(),
+            ed25519_dalek::VerifyingKey::from_bytes(&app.binding().signer).unwrap(),
+        ).unwrap();
         assert!(app.retry_services().unwrap());
         // Repeated queued requests coalesce; they cannot replace a live owner.
         let _ = app.retry_services().unwrap();
         let restarted = wait_for(&app, |s| s.node.services == ServiceState::Running);
         assert_eq!(restarted.node.sessions_started, 2);
         assert!(restarted.node.stop_reason.is_none());
-        assert_eq!(app.config().unwrap().observation().unwrap(), observation);
+        let after_retry = app.config().unwrap();
+        assert_eq!(after_retry.settings().unwrap(), settings_before_retry);
+        assert_eq!(after_retry.workspace_ids().unwrap(), before_retry.workspace_ids().unwrap());
+        assert_eq!(crate::workspace::selected_sync_roots(
+            after_retry.observed.snapshot(),
+            ed25519_dalek::VerifyingKey::from_bytes(&app.binding().signer).unwrap(),
+        ).unwrap(), roots_before_retry);
+        // Rebinding publishes new socket hints in the same Config collection;
+        // the whole observation may change without changing user settings.
         assert!(Runtime::start(&layout).is_err());
         pressure.store(true, Ordering::SeqCst);
         wait_for(&app, |s| s.node.services == ServiceState::Stopped);
@@ -1343,7 +1352,6 @@ mod tests {
         assert!(app.retry_services().is_err());
         app.finish().unwrap();
         assert!(app.is_finished());
-        assert_eq!(triblespace::core::collection::held::held_walker_threads(), 0);
         let mut next = Runtime::start(&layout).unwrap();
         let view = next.config().unwrap();
         let mut settings = view.settings().unwrap();
@@ -1480,7 +1488,7 @@ mod tests {
         assert!(!status.node.sync_running && !status.node.maintenance_running);
         assert_eq!(status.node.sessions_started,0);
         let saved = request("config_set_settings",json!({"observation":inspected["observation"],
-            "mcp_port":0,"sync_enabled":false,"maintenance_enabled":false,"peers":[]}));
+            "mcp_port":0,"sync_enabled":false,"maintenance_enabled":false}));
         assert_eq!(saved["port_restart_required"],false);
         assert_eq!(saved["mcp_url"],url);
         assert!(request("config_inspect",json!({}))["settings_problem"].is_null());
@@ -1546,10 +1554,6 @@ mod tests {
             assert!(cancel.borrow().is_some(), "startup must not undo cancellation");
             assert_eq!(activity.count(), 0, "stopped sessions never start a pass");
             drop(state);
-            assert_eq!(
-                triblespace::core::collection::held::held_walker_threads(),
-                0
-            );
             node.lock().unwrap().take().unwrap().close().unwrap();
         }
     }

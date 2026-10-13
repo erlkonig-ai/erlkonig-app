@@ -36,6 +36,7 @@ fn key_handoff_preserves_conflicts_and_out_of_store_data_without_changing_source
                 &old,
                 entity! {
                     config::anchor:attrs::NODE_SETTINGS,attrs::mcp_port:port,
+                    triblespace_net::health_record::attrs::peer:old.verifying_key(),
                 },
             )
             .unwrap();
@@ -56,10 +57,7 @@ fn key_handoff_preserves_conflicts_and_out_of_store_data_without_changing_source
     let before = std::fs::read(&source_boot.pile).unwrap();
     let old_snapshot = source.pile.snapshot().unwrap();
     let target_snapshot = target.pile.snapshot().unwrap();
-    let defaults = NodeSettings {
-        peers: vec![old.verifying_key().to_bytes()],
-        ..NodeSettings::default()
-    };
+    let defaults = NodeSettings::default();
     let plan = MigrationPlan::prepare(
         &old_snapshot,
         source.config.handle(),
@@ -89,6 +87,15 @@ fn key_handoff_preserves_conflicts_and_out_of_store_data_without_changing_source
         view.settings().is_err(),
         "concurrent ports remain conflicts"
     );
+    let facts = view.facts().unwrap();
+    let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+    for revision in find!(state: Id, and!(
+        pattern!(&facts, [{ ?state @ config::anchor: attrs::NODE_SETTINGS }]),
+        maximal(state, &order),
+    )) {
+        assert!(!exists!(pattern!(&facts, [{ revision @ triblespace_net::health_record::attrs::peer: _?peer }])));
+    }
+    assert!(exists!(pattern!(&facts, [{ _?old @ triblespace_net::health_record::attrs::peer: _?peer }])));
     assert!(view.workspace(good.id).unwrap().is_none());
     assert!(
         view.workspace(bad.id).is_err(),

@@ -102,6 +102,28 @@ fn selection(workspace: &Workspace) -> Value {
 }
 
 #[test]
+fn schema_registration_does_not_open_a_pile_key_or_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let pile = dir.path().join("absent.pile");
+    let key = dir.path().join("absent.key");
+    let dispatch = WorkspaceDispatch::new(
+        NodeBinding {
+            pile: pile.clone(),
+            key: key.clone(),
+            signer: [0; 32],
+        },
+        || panic!("schema registration must not request configuration"),
+    )
+    .unwrap();
+    assert!(dispatch.tools().len() > 100);
+    assert!(dispatch.owners.borrow().is_empty());
+    dispatch.close().unwrap();
+    assert!(!pile.exists());
+    assert!(!key.exists());
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn discord_auth_uses_only_the_explicit_workspace_secret_route() {
     let f = Fixture::new();
     let mut workspace = f.workspace("Bot fixture");

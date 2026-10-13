@@ -5,7 +5,6 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
-use ed25519_dalek::VerifyingKey;
 use faculties::mcp::{self, Bytes, Faculty, Tool};
 use faculties::out::Out;
 use faculties::schemas::config::config;
@@ -16,7 +15,6 @@ use triblespace::core::metadata;
 use triblespace::core::query::register::{ObservationOrder, maximal};
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
-use triblespace_net::health_record;
 
 use crate::config::{NodeBinding, parse_handle};
 use crate::node_schema as attrs;
@@ -42,22 +40,22 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "config_create_workspace",
-        description: "Create a named workspace in this node's one store with its existing identity. Omit routes to create a fresh private collection bundle, or supply a nonempty complete list of existing local role/root choices from config_list_collections. No sharing grant, key, path, secret or global selection is changed. Pass the observation from config_inspect; returns the exact workspace revision for ordinary faculty calls.",
+        description: "Create a named workspace in this node's one store with its existing identity. Omit routes to create a fresh private collection bundle, or supply a nonempty complete list of existing local role/root choices from config_list_collections. After successful workspace publication, newly requested roots are separately selected for native sync. A selection failure does not roll back publication: reinspect before retrying. No sharing grant, key, path, secret or global workspace default is changed. Pass the observation from config_inspect; returns the exact workspace revision for ordinary faculty calls.",
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"label":{"type":"string"},"routes":{"type":"array","minItems":1,"items":{"type":"object","properties":{"role":{"type":"string"},"root":{"type":"string"}},"required":["role","root"],"additionalProperties":false}}},"required":["observation","label"],"additionalProperties":false}"#,
     },
     Tool {
         name: "config_edit_workspace",
-        description: "Edit an exact current workspace revision, never a label or prefix. Omitted label/routes are preserved; supplied routes replace the entire bundle with nonempty existing local role/root choices. Old workspace IDs become unavailable, never redirected. Stale observations or conflicted revisions are rejected: inspect again and explicitly resolve the choice. No sharing permissions change.",
+        description: "Edit an exact current workspace revision, never a label or prefix. Omitted label/routes are preserved; supplied routes replace the entire bundle with nonempty existing local role/root choices. After workspace publication, newly added roots are separately selected for native sync; a label-only edit preserves native unselection/conflicts. Selection failure does not roll back publication: reinspect before retrying. Old workspace IDs become unavailable, never redirected. Stale observations or conflicted revisions are rejected: inspect again and explicitly resolve the choice. No sharing permissions change.",
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"workspace":{"type":"string"},"label":{"type":"string"},"routes":{"type":"array","minItems":1,"items":{"type":"object","properties":{"role":{"type":"string"},"root":{"type":"string"}},"required":["role","root"],"additionalProperties":false}}},"required":["observation","workspace"],"additionalProperties":false}"#,
     },
     Tool {
         name: "config_remove_workspace",
-        description: "Withdraw exactly one current workspace revision, including an unavailable or conflicted revision shown by config_inspect. Other concurrent revisions remain visible; no winner is guessed. Collections, data, sharing authority, identity and services remain unchanged. Requires the latest observation from config_inspect.",
+        description: "Withdraw exactly one current workspace revision, including an unavailable or conflicted revision shown by config_inspect. Other concurrent revisions remain visible; no winner is guessed. Collections, data, sharing authority, native sync selections, identity and services remain unchanged. Requires the latest observation from config_inspect.",
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"workspace":{"type":"string"}},"required":["observation","workspace"],"additionalProperties":false}"#,
     },
     Tool {
         name: "config_share_workspace",
-        description: "Share an exact current workspace revision's resolved collection bundle with an exact recipient public node identity. access is read_only or read_write; delegate defaults false (invoke-only). Native grants are valid immediately, without recipient approval or acknowledgement. Returns bounded signed role/root/descriptor-name metadata, never proof or definition payload. Current native sync has no identity-wide unknown-collection grant inbox; enrolled known roots acquire authority evidence through native repair. Only these roots/actions are granted: no old or future membership, settings, keys or global workspace selection. Before choosing delegate=true, explain and obtain the user's choice: the recipient may invite additional participants within these roots/actions without the original user choosing each one. Disclosed or copied data cannot be made unread. Native per-collection authority must support every requested grant; reader/writer access alone does not confer onward delegation. Requires the latest config_inspect observation.",
+        description: "Share an exact current workspace revision's resolved collection bundle with an exact recipient public node identity. access is read_only or read_write; delegate defaults false (invoke-only). Native grants are valid immediately, without recipient approval or acknowledgement. Returns bounded signed role/root/descriptor-name metadata, never proof or definition payload. Native grant exchange delivers capability evidence independently of this metadata handoff; grants alone neither enroll nor select collections locally. Only these roots/actions are granted: no old or future membership, settings, keys or global workspace selection. Before choosing delegate=true, explain and obtain the user's choice: the recipient may invite additional participants within these roots/actions without the original user choosing each one. Disclosed or copied data cannot be made unread. Native per-collection authority must support every requested grant; reader/writer access alone does not confer onward delegation. Requires the latest config_inspect observation.",
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"workspace":{"type":"string"},"recipient":{"type":"string"},"access":{"type":"string","enum":["read_only","read_write"]},"delegate":{"type":"boolean","default":false}},"required":["observation","workspace","recipient","access"],"additionalProperties":false}"#,
     },
     Tool {
@@ -67,13 +65,13 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "config_enroll_workspace_share",
-        description: "After recipient-local consent, enroll a verified one-way bootstrap under a chosen nonempty local label. Imports descriptor/name metadata and configures the SAME exact roots/role routes under the existing node key; never imports proofs, copies signing keys or creates replacement data roots. Explicit enrollment selects known roots for existing enabled Full bootstrap even while local READ evidence is pending. Native server admission gates repair; native acquired evidence gates local reads/writes and maintenance. Existing all-accessible node behavior remains unchanged; no global workspace default. Authority was already valid: no approval/request/acknowledgement goes to the source. Explain additive non-expiring rights, possible onward invitations when delegate=true, and that disclosed/copied data cannot be made unread. Repeat enrollment is idempotent but never overwrites a later edit/withdrawal. Local Config publication is one native commit; preceding metadata I/O is not a multi-record transaction. Reachability/proof/definition acquisition may remain pending; issuer public identity is only a routing hint. Removing local enrollment does not promise immediate native topic deactivation. Returns local publication only, not synchronization completion. Requires the latest config_inspect observation.",
+        description: "After recipient-local consent, enroll a verified one-way bootstrap under a chosen nonempty local label. Imports descriptor/name metadata and configures the SAME exact roots/role routes under the existing node key; never imports proofs, copies signing keys or creates replacement data roots. Workspace publication completes first; newly requested roots are then separately selected for enabled native Full sync, even while local READ evidence is pending. Selection failure does not roll back publication: reinspect before retrying. Native grant exchange and participant discovery deliver authority evidence; native admission governs local reads/writes and upkeep. Sync follows the native Selected relation, not arbitrary grants; maintenance remains independently all-accessible and may acquire exact missing bodies while sync is enabled. No global workspace default or authorization handshake is created. Explain additive non-expiring rights, possible onward invitations when delegate=true, and that disclosed/copied data cannot be made unread. Repeat enrollment never overwrites a later edit/withdrawal. Removing local enrollment neither revokes grants nor unselects native roots. Returns local publication only, not synchronization completion. Requires the latest config_inspect observation.",
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"bootstrap":{"type":"string","maxLength":4194304},"label":{"type":"string","minLength":1}},"required":["observation","bootstrap","label"],"additionalProperties":false}"#,
     },
     Tool {
         name: "config_set_settings",
-        description: "Save the complete typed node settings after config_inspect. Explicitly supersedes observed settings forks; never guesses a winner. Peers are public node IDs used only as sync bootstrap hints, not access grants. Sync/maintenance apply while running; a changed MCP port takes effect after restarting Erlkonig and refreshing client integration. Port 0 requests an ephemeral local port. No keys, tokens, arbitrary paths or collection capabilities are accepted.",
-        input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"mcp_port":{"type":"integer","minimum":0,"maximum":65535},"sync_enabled":{"type":"boolean"},"maintenance_enabled":{"type":"boolean"},"peers":{"type":"array","items":{"type":"string"}}},"required":["observation","mcp_port","sync_enabled","maintenance_enabled","peers"],"additionalProperties":false}"#,
+        description: "Save the complete typed port, sync and maintenance settings after config_inspect. Explicitly supersedes observed settings forks; never guesses a winner. Native collection selection and participant discovery are independent; no peer bootstrap setting exists. Sync/maintenance apply while running; a changed MCP port takes effect after restarting Erlkonig and refreshing client integration. Port 0 requests an ephemeral local port. No keys, tokens, arbitrary paths or collection capabilities are accepted.",
+        input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"mcp_port":{"type":"integer","minimum":0,"maximum":65535},"sync_enabled":{"type":"boolean"},"maintenance_enabled":{"type":"boolean"}},"required":["observation","mcp_port","sync_enabled","maintenance_enabled"],"additionalProperties":false}"#,
     },
 ];
 
@@ -145,7 +143,6 @@ struct Settings {
     mcp_port: u16,
     sync_enabled: bool,
     maintenance_enabled: bool,
-    peers: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -222,8 +219,7 @@ pub(crate) fn workspace_json(workspace: &Workspace) -> Value {
 
 fn settings_json(value: &NodeSettings) -> Value {
     json!({"mcp_port":value.mcp_port, "sync_enabled":value.sync_enabled,
-        "maintenance_enabled":value.maintenance_enabled,
-        "peers":value.peers.iter().map(hex::encode).collect::<Vec<_>>()})
+        "maintenance_enabled":value.maintenance_enabled})
 }
 
 impl Faculty for ConfigMcp {
@@ -281,8 +277,6 @@ impl ConfigMcp {
                     "mcp_ports":find!(port: u16, pattern!(&facts,[{state @ attrs::mcp_port: ?port}])).collect::<Vec<_>>(),
                     "sync_enabled":find!(value: bool, pattern!(&facts,[{state @ attrs::sync_enabled: ?value}])).collect::<Vec<_>>(),
                     "maintenance_enabled":find!(value: bool, pattern!(&facts,[{state @ attrs::maintenance_enabled: ?value}])).collect::<Vec<_>>(),
-                    "peers":find!(peer: VerifyingKey, pattern!(&facts,[{state @ health_record::attrs::peer: ?peer}]))
-                        .map(|peer| hex::encode(peer.to_bytes())).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>();
                 let (settings, problem) = match view.settings() {
                     Ok(value) => (settings_json(&value), None),
@@ -425,22 +419,10 @@ impl ConfigMcp {
             "config_set_settings" => {
                 let args: Settings = mcp::decode_arguments(arguments)?;
                 current(&view, &args.observation)?;
-                let mut peers = Vec::new();
-                for peer in args.peers {
-                    let bytes: [u8; 32] = hex::decode(&peer)
-                        .context("peer must be a full public node ID")?
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("peer must be a full public node ID"))?;
-                    VerifyingKey::from_bytes(&bytes).context("invalid peer public node ID")?;
-                    peers.push(bytes);
-                }
-                peers.sort_unstable();
-                peers.dedup();
                 let value = NodeSettings {
                     mcp_port: args.mcp_port,
                     sync_enabled: args.sync_enabled,
                     maintenance_enabled: args.maintenance_enabled,
-                    peers,
                 };
                 let id = node.put_settings(&view, &value)?;
                 json!({"revision":format!("{id:X}"), "settings":settings_json(&value),

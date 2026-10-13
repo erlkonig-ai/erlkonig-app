@@ -52,7 +52,7 @@ impl WorkspaceDispatch {
         let path = PathBuf::new();
         let catalog = catalog::Catalog::with_storage(
             catalog::Config::new(&path),
-            Storage::shared_with_peers(path, None, Vec::new()).with_collections(BTreeMap::new()),
+            Storage::shared_with_daemon(path, None, None).with_collections(BTreeMap::new()),
         );
         let mut tools = vec![LIST];
         let mut schemas = BTreeMap::new();

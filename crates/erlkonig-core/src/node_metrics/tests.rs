@@ -44,7 +44,7 @@ fn service_causes_and_cleanup_events_survive_reopen_independently() {
     let facts: TribleSet = observed.view().unwrap();
     let mut events = Vec::new();
     for (event, stage, code, description, elapsed, endpoint, collector) in find!(
-        (event: Id, stage: String,
+        (event: Id, stage: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
             code: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
             description: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
             elapsed: u128, endpoint: VerifyingKey, collector: VerifyingKey),
@@ -60,12 +60,13 @@ fn service_causes_and_cleanup_events_survive_reopen_independently() {
             { _?collector @ health_record::attrs::endpoint: ?collector },
         ])
     ) {
+        let stage: View<str> = snapshot.get(stage).unwrap();
         let code: View<str> = snapshot.get(code).unwrap();
         let description: View<str> = snapshot.get(description).unwrap();
         assert_eq!(endpoint, signer.verifying_key());
         assert_eq!(collector, signer.verifying_key());
         events.push((
-            stage,
+            stage.to_string(),
             code.to_string(),
             description.to_string(),
             elapsed,
@@ -103,6 +104,27 @@ fn service_causes_and_cleanup_events_survive_reopen_independently() {
     );
     drop(observed);
     drop(snapshot);
+    node.close().unwrap();
+}
+
+#[test]
+fn telemetry_labels_are_utf8_blobs_not_bounded_inline_strings() {
+    let (_dir, path, signer, mut node) = scratch();
+    let worker = "native worker with a label longer than thirty-two bytes 🦋";
+    let role = "custom\0role with an unbounded UTF-8 label";
+    let mut sample =
+        Sample::now(None, worker, role, genid().id, Duration::from_secs(1)).unwrap();
+    sample.received_bytes = Some(7);
+    node.append_metrics(&[sample]).unwrap();
+    node.close().unwrap();
+
+    let mut node = NodeStore::open(&path, signer).unwrap();
+    let reports = node
+        .metrics(now_tai_ns().unwrap(), Duration::from_secs(60))
+        .unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].report.worker, worker);
+    assert_eq!(reports[0].report.role, role);
     node.close().unwrap();
 }
 

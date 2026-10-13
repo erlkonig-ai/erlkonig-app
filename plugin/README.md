@@ -46,11 +46,20 @@ consequences and the user's opt-in. `config_probe_workspace_share` verifies
 the bounded signed role/root/name metadata without mutation; this verifies the
 signature/recipient binding, not collection admission. No proof or definition
 payload travels in the handoff. Recipient-local
-`config_enroll_workspace_share` chooses a label and selects the same roots
-under the existing key for enabled native known-C bootstrap, with no issuer
-acknowledgement or peer-setting edit. Native repair acquires authority evidence;
-existing all-accessible runtime roots remain unchanged.
-No identity-wide cold grant discovery or sync-completion receipt is implied.
+`config_enroll_workspace_share` publishes a local label and the same roots
+under the existing key, then separately selects newly requested roots for
+enabled native Full sync. Selection failure does not roll back publication.
+Native grant exchange discovers authority evidence without an app authorization
+handshake; a grant alone neither enrolls nor selects a collection.
+Peering follows native `Selected` registers, including manual selections outside
+bundles. Startup fills only unset selections for current saved/enrolled roots;
+unselected/conflicted choices remain intact. Withdrawal does not revoke grants
+or unselect native roots. Maintenance remains independently all-accessible and
+may acquire exact missing bodies outside sync selection while sync is enabled.
+This is not global fetch isolation or a synchronization-completion receipt.
+Typed service settings are port/sync/maintenance only. Old requests containing
+`peers` are unsupported; historical peer facts remain inert. Refresh the client
+package/schema and reload the client at the coordinated upgrade.
 The bundled skill describes the handoff and limits. Ordinary faculties still require an exact workspace on
 each call. Other configuration operations grant no sharing authority; no tool
 exposes a private key, token or arbitrary path editor. The app must be open;

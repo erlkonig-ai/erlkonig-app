@@ -14,6 +14,151 @@ fn scratch() -> (tempfile::TempDir, PathBuf, SigningKey, NodeStore) {
     let node = NodeStore::open(&path, signer.clone()).unwrap();
     (dir, path, signer, node)
 }
+
+fn legacy_bundle(node: &mut NodeStore, roots: &[(Id, CollectionHandle)]) -> Workspace {
+    let mut workspace = Workspace::new("legacy bundle");
+    workspace.routes.extend(roots.iter().copied());
+    let mut routes = Fragment::empty();
+    for (role, root) in roots {
+        routes += entity! { config::anchor: *role, config::selects: *root };
+    }
+    let fragment = entity! {
+        metadata::tag: attrs::WORKSPACE, config::anchor: workspace.anchor,
+        attrs::enrolled: true, metadata::name: workspace.label.clone(),
+        attrs::workspace_route*: routes,
+    };
+    workspace.id = fragment.root().unwrap();
+    node.pile.commit(node.config, &node.signer, fragment).unwrap();
+    node.pile.flush().unwrap();
+    workspace
+}
+
+#[test]
+fn old_peer_annotations_are_inert_and_new_settings_do_not_emit_them() {
+    use triblespace_net::health_record;
+    let (_dir, path, signer, mut node) = scratch();
+    for peer in [SigningKey::from_bytes(&[40; 32]), SigningKey::from_bytes(&[41; 32])] {
+        node.pile.commit(node.config, &signer, entity! {
+            config::anchor: attrs::NODE_SETTINGS, attrs::mcp_port: 41773_u16,
+            attrs::sync_enabled: true, attrs::maintenance_enabled: true,
+            health_record::attrs::peer: peer.verifying_key(),
+        }).unwrap();
+    }
+    node.pile.flush().unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let view = node.config().unwrap();
+    assert_eq!(view.settings().unwrap(), NodeSettings::default());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let revision = node.put_settings(&view, &NodeSettings::default()).unwrap();
+    let facts = node.config().unwrap().facts().unwrap();
+    assert!(!exists!(pattern!(&facts, [{ revision @ health_record::attrs::peer: _?peer }])));
+    assert!(exists!(pattern!(&facts, [{ _?old @ health_record::attrs::peer: _?peer }])));
+    node.close().unwrap();
+}
+
+#[test]
+fn legacy_sync_bootstrap_selects_only_current_bundles_and_restarts_without_growth() {
+    use triblespace::core::collection::{grant_collection_read, selection};
+    let (_dir, path, signer, mut node) = scratch();
+    assert_eq!(node.config.handle(), selection::config_handle(signer.verifying_key()));
+    let empty = std::fs::read(&path).unwrap();
+    assert_eq!(node.initialize_workspace_sync().unwrap(), 0);
+    assert_eq!(std::fs::read(&path).unwrap(), empty);
+    assert!(crate::workspace::selected_sync_roots(&node.pile.snapshot().unwrap(), signer.verifying_key()).unwrap().is_empty());
+    let saved = node.pile.collection("saved", faculties::collection_names::private_policy(signer.verifying_key())).unwrap();
+    let ungrouped = node.pile.collection("ungrouped", faculties::collection_names::private_policy(signer.verifying_key())).unwrap();
+    node.pile.commit(ungrouped, &signer, entity! { metadata::name: "resident but unconfigured" }).unwrap();
+    let owner = SigningKey::from_bytes(&[42; 32]);
+    let invited = node.pile.collection("grant only", faculties::collection_names::private_policy(owner.verifying_key())).unwrap();
+    grant_collection_read(&mut node.pile, invited.handle(), &owner, signer.verifying_key()).unwrap();
+    legacy_bundle(&mut node, &[(faculties::schemas::wiki::DEFAULT_SCOPE_ID, saved.handle())]);
+    assert_eq!(node.initialize_workspace_sync().unwrap(), 1);
+    let selected = crate::workspace::selected_sync_roots(&node.pile.snapshot().unwrap(), signer.verifying_key()).unwrap();
+    assert_eq!(selected, [saved.handle()]);
+    let facts = node.config().unwrap().facts().unwrap();
+    assert_eq!(selection::sync_selection(&facts, invited.handle()), selection::Selection::Unset);
+    assert_eq!(selection::sync_selection(&facts, ungrouped.handle()), selection::Selection::Unset);
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(node.initialize_workspace_sync().unwrap(), 0);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    node.close().unwrap();
+    let mut node = NodeStore::open(&path, signer).unwrap();
+    assert_eq!(node.initialize_workspace_sync().unwrap(), 0);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    node.close().unwrap();
+}
+
+#[test]
+fn legacy_sync_bootstrap_preserves_unselected_and_conflicted_choices() {
+    use triblespace::core::collection::selection::{self, Selection};
+    let (_dir, path, signer, mut node) = scratch();
+    let off = node.pile.collection("off", faculties::collection_names::private_policy(signer.verifying_key())).unwrap();
+    let fork = node.pile.collection("fork", faculties::collection_names::private_policy(signer.verifying_key())).unwrap();
+    legacy_bundle(&mut node, &[
+        (faculties::schemas::wiki::DEFAULT_SCOPE_ID, off.handle()),
+        (faculties::schemas::compass::DEFAULT_SCOPE_ID, fork.handle()),
+    ]);
+    selection::write_sync_selection(&mut node.pile, node.config, &signer, off.handle(), false).unwrap();
+    for value in [true, false] {
+        node.pile.commit(node.config, &signer, entity! { &genid() @
+            selection::sync_collection: fork.handle(), selection::sync_selected: value,
+        }).unwrap();
+    }
+    node.pile.flush().unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(node.initialize_workspace_sync().unwrap(), 0);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let facts = node.config().unwrap().facts().unwrap();
+    assert_eq!(selection::sync_selection(&facts, off.handle()), Selection::Unselected);
+    assert!(matches!(selection::sync_selection(&facts, fork.handle()), Selection::Conflicted(_)));
+    assert!(crate::workspace::selected_sync_roots(&node.pile.snapshot().unwrap(), signer.verifying_key()).unwrap().is_empty());
+    node.close().unwrap();
+}
+
+#[test]
+fn explicit_bundle_changes_select_only_new_roots_and_removal_does_not_unselect() {
+    use triblespace::core::collection::selection::{self, Selection};
+    let (_dir, _path, signer, mut node) = scratch();
+    let first = node.pile.collection("first", faculties::collection_names::private_policy(signer.verifying_key())).unwrap();
+    let second = node.pile.collection("second", faculties::collection_names::private_policy(signer.verifying_key())).unwrap();
+    let manual = node.pile.collection("manual", faculties::collection_names::private_policy(signer.verifying_key())).unwrap();
+    selection::write_sync_selection(&mut node.pile, node.config, &signer, manual.handle(), true).unwrap();
+    let mut workspace = Workspace::new("explicit");
+    workspace.routes.insert(faculties::schemas::wiki::DEFAULT_SCOPE_ID, first.handle());
+    let view = node.config().unwrap();
+    workspace.id = node.put_workspace(&view, &workspace).unwrap();
+    selection::write_sync_selection(&mut node.pile, node.config, &signer, first.handle(), false).unwrap();
+    workspace.label = "label-only edit".into();
+    let view = node.config().unwrap();
+    workspace.id = node.put_workspace(&view, &workspace).unwrap();
+    let facts = node.config().unwrap().facts().unwrap();
+    assert_eq!(selection::sync_selection(&facts, first.handle()), Selection::Unselected);
+    workspace.routes.insert(faculties::schemas::compass::DEFAULT_SCOPE_ID, second.handle());
+    let view = node.config().unwrap();
+    workspace.id = node.put_workspace(&view, &workspace).unwrap();
+    let expected = [second.handle(), manual.handle()].into_iter().collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(crate::workspace::selected_sync_roots(&node.pile.snapshot().unwrap(), signer.verifying_key()).unwrap().into_iter().collect::<std::collections::BTreeSet<_>>(), expected);
+    let view = node.config().unwrap();
+    node.remove_workspace_revision(&view, workspace.id).unwrap();
+    assert_eq!(crate::workspace::selected_sync_roots(&node.pile.snapshot().unwrap(), signer.verifying_key()).unwrap().into_iter().collect::<std::collections::BTreeSet<_>>(), expected);
+    node.close().unwrap();
+}
+
+#[test]
+fn daemon_address_hints_follow_actual_bindings_without_duplicate_appends() {
+    use triblespace::core::collection::selection;
+    let (_dir, path, signer, mut node) = scratch();
+    assert!(node.record_sync_addresses(&["0.0.0.0:7111".parse().unwrap(), "[::]:7112".parse().unwrap()]).unwrap());
+    let facts = node.config().unwrap().facts().unwrap();
+    assert_eq!(selection::sync_addresses(&facts, signer.verifying_key()), ["127.0.0.1:7111".parse().unwrap(), "[::1]:7112".parse().unwrap()].into_iter().collect());
+    let before = std::fs::read(&path).unwrap();
+    assert!(!node.record_sync_addresses(&["0.0.0.0:7111".parse().unwrap(), "[::]:7112".parse().unwrap()]).unwrap());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(node.record_sync_addresses(&["127.0.0.1:7222".parse().unwrap()]).unwrap());
+    let facts = node.config().unwrap().facts().unwrap();
+    assert_eq!(selection::sync_addresses(&facts, signer.verifying_key()), ["127.0.0.1:7222".parse().unwrap()].into_iter().collect());
+    node.close().unwrap();
+}
 #[test]
 fn incomplete_workspace_without_anchor_can_be_withdrawn_without_projection() {
     let (_dir, _path, _signer, mut node) = scratch();

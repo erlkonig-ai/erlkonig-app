@@ -197,12 +197,25 @@ pub struct AllAccessible {
     pub denied: Vec<CollectionHandle>,
 }
 
+/// Sync follows the native selection relation, not admitted record/proof roots
+/// or the grouping used by a particular MCP request. Conflicted states select
+/// nothing; manual selections outside saved bundles remain authoritative.
+pub fn selected_sync_roots<S: StoreRead>(snapshot: &S, signer: VerifyingKey) -> Result<Vec<CollectionHandle>> {
+    use triblespace::core::collection::selection::{self, Selection};
+    let facts = selection::config_facts(snapshot, signer)?;
+    Ok(find!(root: CollectionHandle,
+        pattern!(&facts, [{ _?state @ selection::sync_collection: ?root }]))
+        .filter(|root| selection::sync_selection(&facts, *root) == Selection::Selected)
+        .collect::<std::collections::BTreeSet<_>>().into_iter().collect())
+}
+
 impl AllAccessible {
     pub fn discover<S: StoreRead>(
         snapshot: &S,
         signer: VerifyingKey,
         extra: impl IntoIterator<Item = CollectionHandle>,
     ) -> Result<Self> {
+        use triblespace::core::capability::QuorumOutcome;
         use triblespace::core::collection::{attached_to, collection_reader_is_admitted_by};
         let proofs = snapshot
             .proofs()?
@@ -216,20 +229,11 @@ impl AllAccessible {
                 if !descriptor::parents(&facts)?.is_empty() {
                     return Ok(None);
                 }
-                let admitted = collection_reader_is_admitted_by(snapshot, handle, signer, &proofs)?;
-                if !admitted {
-                    for proof in proofs
-                        .iter()
-                        .filter(|proof| proof.resource().into_bytes() == handle.raw)
-                    {
-                        for capability in proof.capabilities() {
-                            if !snapshot.contains_blob(capability)? {
-                                bail!("invitation capability metadata pending");
-                            }
-                        }
-                    }
+                match collection_reader_is_admitted_by(snapshot, handle, signer, &proofs)? {
+                    QuorumOutcome::Met => Ok(Some(true)),
+                    QuorumOutcome::Unmet => Ok(Some(false)),
+                    QuorumOutcome::Undefined(_) => bail!("invitation capability metadata pending"),
                 }
-                Ok(Some(admitted))
             })();
             match result {
                 Ok(Some(true)) => {

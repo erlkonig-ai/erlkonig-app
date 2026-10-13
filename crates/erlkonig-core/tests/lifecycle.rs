@@ -27,7 +27,6 @@ fn fixture() -> (tempfile::TempDir, Layout) {
             mcp_port: 0,
             sync_enabled: false,
             maintenance_enabled: false,
-            peers: Vec::new(),
         },
     )
     .unwrap();
@@ -293,14 +292,24 @@ fn one_store_services_ignore_workspace_edits_allow_concurrent_writers_and_close_
     )
     .unwrap();
     wait_for(&app, |s| {
-        s.node.sync_running && s.node.maintenance_running && s.sync_collections > 0
+        s.node.sync_running && s.node.maintenance_running && s.maintenance_targets > 0
     });
     let before = app.status();
-    assert_eq!(
-        triblespace::core::collection::held::held_walker_threads(),
-        1
-    );
+    assert_eq!(before.sync_collections, 0, "local control roots do not require remote selection");
     assert!(!before.node.bound_sockets.is_empty());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let facts = app.config().unwrap().facts().unwrap();
+        let addresses = triblespace::core::collection::selection::sync_addresses(&facts,
+            ed25519_dalek::VerifyingKey::from_bytes(&app.binding().signer).unwrap());
+        if !addresses.is_empty() {
+            let ports = before.node.bound_sockets.iter().map(|value| value.parse::<std::net::SocketAddr>().unwrap().port()).collect::<std::collections::BTreeSet<_>>();
+            assert!(addresses.iter().all(|address| ports.contains(&address.port()) && !address.ip().is_unspecified()));
+            break;
+        }
+        assert!(Instant::now() < deadline, "actual daemon addresses were not published");
+        thread::sleep(Duration::from_millis(20));
+    }
     let view = app.config().unwrap();
     app.create_workspace(&view, "First bundle").unwrap();
     wait_for(&app, |s| s.sync_collections >= before.sync_collections + 30);
@@ -320,6 +329,7 @@ fn one_store_services_ignore_workspace_edits_allow_concurrent_writers_and_close_
         )
         .unwrap();
     let prior = app.status().sync_collections;
+    let maintenance_before = app.status().maintenance_targets;
     external
         .commit(
             root,
@@ -327,10 +337,17 @@ fn one_store_services_ignore_workspace_edits_allow_concurrent_writers_and_close_
             entity! {metadata::name:"concurrent external writer"},
         )
         .unwrap();
+    wait_for(&app, |s| s.maintenance_targets > maintenance_before);
+    assert_eq!(app.status().sync_collections, prior, "new admitted records do not auto-select peering");
+    // An explicit native selection outside any bundle is respected.
+    use triblespace::core::collection::selection;
+    let config = external.collection(selection::CONFIG_COLLECTION_NAME,
+        faculties::collection_names::private_policy(signer.verifying_key())).unwrap();
+    selection::write_sync_selection(&mut external, config, &signer, root.handle(), true).unwrap();
+    external.flush().unwrap();
     wait_for(&app, |s| s.sync_collections > prior);
-    // Existing automatic READ selection above is retained. Explicit consent
-    // additionally selects known C before recipient-local evidence arrives;
-    // native authority still excludes this root from Driver maintenance.
+    // Explicit bundle consent additionally selects known C before recipient-
+    // local evidence arrives; native authority still excludes it from upkeep.
     let stranger = ed25519_dalek::SigningKey::from_bytes(&[79; 32]);
     let pending = external.collection("pending enrolled root", faculties::collection_names::private_policy(stranger.verifying_key())).unwrap();
     external.flush().unwrap();
@@ -340,7 +357,14 @@ fn one_store_services_ignore_workspace_edits_allow_concurrent_writers_and_close_
     let view = app.config().unwrap();
     app.put_workspace(&view, &enrolled).unwrap();
     wait_for(&app, |s| s.sync_collections > before_pending.sync_collections);
-    assert_eq!(app.status().maintenance_targets, before_pending.maintenance_targets);
+    external.refresh().unwrap();
+    let upkeep = erlkonig_core::workspace::AllAccessible::discover(
+        &external.snapshot().unwrap(), signer.verifying_key(), [pending.handle()],
+    ).unwrap();
+    assert!(!upkeep.maintenance.contains(&pending.handle()),
+        "pending enrollment is sync consent, not maintenance admission");
+    // Counts can advance as other admitted roots acquire attached targets;
+    // the exact pending root's exclusion is the permission invariant.
     assert_eq!(app.status().node.sessions_started, 1);
     app.finish().unwrap();
     external
@@ -350,10 +374,6 @@ fn one_store_services_ignore_workspace_edits_allow_concurrent_writers_and_close_
             entity! {metadata::name:"external writer survives app shutdown"},
         )
         .unwrap();
-    assert_eq!(
-        triblespace::core::collection::held::held_walker_threads(),
-        0
-    );
     external.close().unwrap();
     for socket in before.node.bound_sockets {
         drop(std::net::UdpSocket::bind(socket).unwrap());
@@ -371,7 +391,6 @@ fn pause_changes_do_not_change_identity_or_store_and_restart_preserves_settings(
             mcp_port: 0,
             sync_enabled: false,
             maintenance_enabled: true,
-            peers: Vec::new(),
         },
     )
     .unwrap();
@@ -383,7 +402,6 @@ fn pause_changes_do_not_change_identity_or_store_and_restart_preserves_settings(
             mcp_port: 0,
             sync_enabled: false,
             maintenance_enabled: false,
-            peers: Vec::new(),
         },
     )
     .unwrap();
@@ -414,7 +432,6 @@ fn two_app_directories_cannot_start_two_endpoints_for_one_identity() {
                 mcp_port: 0,
                 sync_enabled: true,
                 maintenance_enabled: false,
-                peers: Vec::new(),
             },
         )
         .unwrap();
@@ -444,7 +461,6 @@ fn unreadable_config_stops_the_owned_session() {
             mcp_port: 0,
             sync_enabled: false,
             maintenance_enabled: true,
-            peers: Vec::new(),
         },
     )
     .unwrap();
@@ -481,7 +497,6 @@ fn gui_fixture() {
             mcp_port: 0,
             sync_enabled: false,
             maintenance_enabled: false,
-            peers: Vec::new(),
         },
     )
     .unwrap();
@@ -527,7 +542,6 @@ fn force_quit_fixture() {
                 mcp_port: 0,
                 sync_enabled: false,
                 maintenance_enabled: false,
-                peers: Vec::new(),
             },
         )
         .unwrap();
