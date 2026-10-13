@@ -52,7 +52,7 @@ name=Erlkonig-$version-$build-macos-$arch-development.dmg
 # Fail closed on extra resources, including personal plugin caches or user state.
 # The hidden provider manifest directories below are intentional source templates.
 python3 -I - "$app" <<'PY'
-import pathlib, stat, sys
+import json, pathlib, re, stat, sys
 app = pathlib.Path(sys.argv[1])
 files = {
     "Contents/Info.plist", "Contents/PkgInfo", "Contents/MacOS/erlkonig",
@@ -62,7 +62,7 @@ files = {
 plugin_files = {"README.md", ".codex-plugin/plugin.json", ".claude-plugin/plugin.json",
                 "skills/faculties/SKILL.md"}
 files |= {"Contents/Resources/plugin/" + p for p in plugin_files}
-optional = {"Contents/Resources/binary-provenance.txt"}
+optional = {"Contents/Resources/binary-provenance.txt", "Contents/Resources/source-freeze.json"}
 dirs = {str(parent) for p in files for parent in pathlib.PurePath(p).parents if str(parent) != "."}
 seen = set()
 for p in app.rglob("*"):
@@ -74,6 +74,45 @@ for p in app.rglob("*"):
         assert stat.S_ISREG(mode) and rel in files | optional, f"unexpected bundle file: {rel}"
         seen.add(rel)
 assert files <= seen, f"missing bundle files: {sorted(files - seen)}"
+freeze = app / "Contents/Resources/source-freeze.json"
+if freeze.is_file():
+    # This optional signed companion carries source identity, never user state.
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            assert key not in result, "duplicate source-freeze field"
+            result[key] = value
+        return result
+    assert freeze.stat().st_size <= 16384, "source-freeze metadata is too large"
+    data = json.loads(freeze.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+    assert isinstance(data, dict) and set(data) == {"authority", "app", "core_branch", "source_closure", "locks"}, "unexpected source-freeze fields"
+    assert data["authority"] == "Candidate-only compile/test/stage authorized by root; no acceptance or activation", "unexpected source-freeze authority"
+    assert isinstance(data["core_branch"], str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}; not asserted landed", data["core_branch"]), "invalid source-freeze core branch"
+    branch = data["core_branch"].split(";", 1)[0]
+    assert not any(part in ("", ".", "..") or part.endswith((".", ".lock")) for part in branch.split("/")) and ".." not in branch, "invalid source-freeze core branch"
+    def digest(value, length):
+        return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{%d}" % length, value) is not None
+    assert digest(data["app"], 40), "invalid source-freeze app revision"
+    repositories = {"erlkonig-app", "triblespace-rs", "faculties", "mary", "GORBIE", "songbird", "anybytes", "jerky", "burn-fork", "cubecl-fork", "cubek-fork", "soma"}
+    assert isinstance(data["source_closure"], list), "invalid source-freeze source closure"
+    sources = {}
+    for source in data["source_closure"]:
+        assert isinstance(source, dict) and set(source) == {"repository", "revision", "tree"}, "unexpected source-freeze source fields"
+        name = source["repository"]
+        assert isinstance(name, str) and name in repositories and name not in sources, "unexpected or duplicate source-freeze repository"
+        assert digest(source["revision"], 40) and digest(source["tree"], 40), "invalid source-freeze revision or tree"
+        sources[name] = source["revision"]
+    assert set(sources) == repositories and sources["erlkonig-app"] == data["app"], "incomplete or inconsistent source-freeze source closure"
+    lock_files = {"erlkonig-app/Cargo.lock", "faculties/Cargo.lock", "triblespace-rs/Cargo.lock", "erlkonig-app/scripts/app-icon/Cargo.lock"}
+    assert isinstance(data["locks"], list), "invalid source-freeze locks"
+    locks = set()
+    for lock in data["locks"]:
+        assert isinstance(lock, dict) and set(lock) == {"file", "sha256"}, "unexpected source-freeze lock fields"
+        name = lock["file"]
+        assert isinstance(name, str) and name in lock_files and name not in locks, "unexpected or duplicate source-freeze lock path"
+        assert digest(lock["sha256"], 64), "invalid source-freeze lock hash"
+        locks.add(name)
+    assert locks == lock_files, "incomplete source-freeze locks"
 PY
 for file in README.md .codex-plugin/plugin.json .claude-plugin/plugin.json skills/faculties/SKILL.md; do
     cmp -s "$app/Contents/Resources/plugin/$file" "$repo/plugin/$file" || fail "not the source plugin template: $file"

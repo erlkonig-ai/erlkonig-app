@@ -42,6 +42,39 @@ rm "$tmp/fixture/Erlkonig.app/Contents/Resources/self.key"
 touch "$tmp/fixture/Erlkonig.app/Contents/Resources/plugin/.mcp.json"
 expect_failure 'unexpected bundle file' "$pack" --app "$tmp/fixture/Erlkonig.app" --out "$tmp/out"
 rm "$tmp/fixture/Erlkonig.app/Contents/Resources/plugin/.mcp.json"
+freeze=$tmp/fixture/Erlkonig.app/Contents/Resources/source-freeze.json
+if [ -f "$freeze" ]; then
+    cp "$freeze" "$tmp/source-freeze.json"
+    malformed_freeze() {
+        python3 -I - "$tmp/source-freeze.json" "$freeze" "$1" <<'PY'
+import json, pathlib, sys
+data = json.loads(pathlib.Path(sys.argv[1]).read_text())
+case = sys.argv[3]
+if case == "credential": data["mcp_token"] = "test-only-forbidden-field"
+elif case == "authority": data["authority"] = "test-only-arbitrary-prose"
+elif case == "branch": data["core_branch"] = "../escape; not asserted landed"
+elif case == "revision": data["source_closure"][0]["revision"] = "not-a-revision"
+elif case == "tree": data["source_closure"][0]["tree"] = "not-a-tree"
+elif case == "app": data["app"] = "0" * 40
+elif case == "repository": data["source_closure"][0]["repository"] = "personal-state"
+elif case == "absolute-lock": data["locks"][0]["file"] = "/tmp/Cargo.lock"
+elif case == "traversal-lock": data["locks"][0]["file"] = "erlkonig-app/../Cargo.lock"
+elif case == "hash": data["locks"][0]["sha256"] = "not-a-hash"
+else: raise AssertionError(case)
+pathlib.Path(sys.argv[2]).write_text(json.dumps(data))
+PY
+    }
+    for case in credential authority branch revision tree app repository absolute-lock traversal-lock hash; do
+        malformed_freeze "$case"
+        expect_failure 'source-freeze' "$pack" --app "$tmp/fixture/Erlkonig.app" --out "$tmp/out"
+    done
+    cp "$tmp/source-freeze.json" "$freeze"
+    rm "$freeze"
+    ln -s "$tmp/source-freeze.json" "$freeze"
+    expect_failure 'unexpected bundle symlink' "$pack" --app "$tmp/fixture/Erlkonig.app" --out "$tmp/out"
+    rm "$freeze"
+    cp "$tmp/source-freeze.json" "$freeze"
+fi
 printf 'changed test template\n' >>"$tmp/fixture/Erlkonig.app/Contents/Resources/plugin/README.md"
 expect_failure 'not the source plugin template' "$pack" --app "$tmp/fixture/Erlkonig.app" --out "$tmp/out"
 original=$(shasum -a 256 "$app/Contents/MacOS/erlkonig")
@@ -63,4 +96,4 @@ mv "$tmp/original.dmg" "$image"
 "$pack" --app "$app" --out "$tmp/out" --overwrite
 [ "$original" = "$(shasum -a 256 "$app/Contents/MacOS/erlkonig")" ]
 codesign --verify --deep --strict "$app"
-printf 'PASS: DMG mount/payload/signature; input/secret/cache rejection; no-clobber/overwrite; create and attached-mount failure cleanup; unchanged source\n'
+printf 'PASS: DMG mount/payload/signature; input/secret/cache and source-freeze rejection; no-clobber/overwrite; create and attached-mount failure cleanup; unchanged source\n'
