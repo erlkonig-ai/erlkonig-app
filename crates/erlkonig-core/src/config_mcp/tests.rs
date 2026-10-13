@@ -1615,3 +1615,52 @@ fn native_grants_treat_an_undecodable_definition_as_unavailable_for_that_edge() 
     let accepted = recipient.enroll_pending(&original.anchor, &recipient.shown_roots(&original.anchor), Some("Local")).unwrap();
     assert_eq!(recipient.workspace(&accepted["workspace"]["workspace"]).routes, original.routes);
 }
+
+#[test]
+fn native_grants_refuse_an_empty_roots_list_instead_of_publishing_an_empty_workspace() {
+    let owner = Fixture::new();
+    let recipient = Fixture::new();
+    let mut shared = Workspace::new("Shared");
+    shared.anchor = genid().id;
+    shared.id = shared.anchor;
+    let revision = owner.grow_workspace(&mut shared, "compass");
+    owner.deliver(revision, &shared, &recipient);
+    let compass = workspace::roles().into_iter().find(|(_, role)| *role == "compass").unwrap().0;
+    let c1 = shared.routes[&compass];
+    let hex_of = |root: CollectionHandle| format!("blake3:{}", hex::encode(root.raw));
+    // The recipient's own workspace B routes every root of the group, so the
+    // listing shows C1 only as routed elsewhere and nothing is required.
+    let b = recipient.put_local_workspace("B", BTreeMap::from([(compass, c1)]));
+    let pending = recipient.list_pending();
+    let share = pending["shares"].as_array().unwrap().iter()
+        .find(|share| share["anchor"] == format!("{:X}", shared.anchor)).unwrap().clone();
+    let rows = share["collections"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["routed_in"], json!([format!("{b:X}")]));
+    let proofs = recipient.proofs();
+    // An empty consent is no consent: refused, naming the listing, before
+    // anything is published.
+    let outcome = recipient.enroll_pending(&shared.anchor, &[], Some("Local"));
+    assert!(outcome.is_err(), "an empty roots list published a workspace: {outcome:?}");
+    let refused = format!("{:#}", outcome.unwrap_err());
+    assert!(refused.contains("nothing to enroll"), "{refused}");
+    assert!(refused.contains("config_list_pending_shares"), "{refused}");
+    let workspaces = recipient.inspect()["workspaces"].as_array().unwrap().clone();
+    assert_eq!(workspaces.len(), 1, "no empty-route workspace was published: {workspaces:?}");
+    assert_eq!(workspaces[0]["workspace"], format!("{b:X}"));
+    assert_eq!(recipient.proofs(), proofs);
+    // Giving the routed root explicitly still enrolls it, as before.
+    let accepted = recipient.enroll_pending(&shared.anchor, &[hex_of(c1)], Some("Local")).unwrap();
+    assert_eq!(accepted["already_enrolled"], false);
+    let local = recipient.workspace(&accepted["workspace"]["workspace"]);
+    assert_eq!(local.routes, BTreeMap::from([(compass, c1)]));
+    assert_eq!(recipient.inspect()["workspaces"].as_array().unwrap().len(), 2);
+    // An empty list is refused for an enrolled workspace too: it is not the
+    // idempotent repeat, which names the routed set.
+    let refused = format!("{:#}", recipient.enroll_pending(&shared.anchor, &[], None).unwrap_err());
+    assert!(refused.contains("nothing to enroll"), "{refused}");
+    assert_eq!(recipient.inspect()["workspaces"].as_array().unwrap().len(), 2);
+    let repeated = recipient.enroll_pending(&shared.anchor, &[hex_of(c1)], None).unwrap();
+    assert_eq!(repeated["already_enrolled"], true);
+    assert_eq!(repeated["workspace"]["workspace"], accepted["workspace"]["workspace"]);
+}
