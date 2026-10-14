@@ -5,6 +5,9 @@
 //! to that existing owner; it never enters the menu or starts native services.
 
 #[cfg(target_os = "macos")]
+mod app;
+
+#[cfg(target_os = "macos")]
 mod mac;
 
 #[cfg(target_os = "macos")]
