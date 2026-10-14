@@ -304,6 +304,22 @@ impl Frame {
     }
 }
 
+impl Frame {
+    /// The crown centred in a `side × side` canvas at its own aspect ratio,
+    /// for hosts and icon themes that expect square pixmaps. Same pixel
+    /// layout as [`Frame::rgba`]; the padding rows are entirely zero.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub fn square_rgba(&self, side: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let height = ((f64::from(side) * HEIGHT / WIDTH).round() as u32).clamp(1, side);
+        let top = ((side - height) / 2) as usize;
+        let row = side as usize * 4;
+        let mut pixels = vec![0_u8; row * side as usize];
+        pixels[top * row..(top + height as usize) * row]
+            .copy_from_slice(&self.rgba(side, height, rgba));
+        pixels
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl Frame {
     /// AppKit redraws this vector at the destination backing scale. There is
@@ -781,6 +797,26 @@ mod tests {
             twice += a.x * b.y - b.x * a.y;
         }
         twice.abs() * 0.5
+    }
+
+    #[test]
+    fn square_rgba_centres_the_crown_at_its_own_aspect() {
+        let colour = [200, 200, 200, 255];
+        for side in [22, 24, 32, 48, 256] {
+            for attention in [false, true] {
+                let frame = super::frame(Duration::ZERO, None, true, attention);
+                let pixels = frame.square_rgba(side, colour);
+                let row = side as usize * 4;
+                assert_eq!(pixels.len(), row * side as usize);
+                let height = (f64::from(side) * HEIGHT / WIDTH).round() as usize;
+                let top = (side as usize - height) / 2;
+                let inner = &pixels[top * row..(top + height) * row];
+                assert_eq!(inner, frame.rgba(side, height as u32, colour).as_slice());
+                assert!(pixels[..top * row].iter().all(|&b| b == 0));
+                assert!(pixels[(top + height) * row..].iter().all(|&b| b == 0));
+                assert!(inner.chunks(4).any(|p| p[3] == 255));
+            }
+        }
     }
 
     #[test]
