@@ -11,6 +11,10 @@ publish.workspace = true
 name = "crown-render"
 path = "../../scripts/crown-render.rs"
 
+[[example]]
+name = "linux-icons"
+path = "../../scripts/linux/render-icons.rs"
+
 [dependencies]
 erlkonig-core.workspace = true
 signal-hook.workspace = true

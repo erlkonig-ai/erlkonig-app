@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Erlkonig
+Comment=Local Erlkonig node and tools
+Exec=@EXEC@
+Icon=ai.erlkonig.app
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+StartupWMClass=ai.erlkonig.app
