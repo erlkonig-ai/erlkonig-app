@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 pub const MARKETPLACE: &str = "erlkonig-local";
 pub const PLUGIN_ID: &str = "erlkonig@erlkonig-local";
 pub const COWORK_URL: &str = "https://claude.ai/customize/plugins";
-pub const COWORK_HELP: &str = "Cowork plugins are managed on your Claude account, separately from local Claude Code installs. In Customize → Plugins, use Add → Upload plugin and choose the prepared ZIP. Remove it there too. Erlkonig cannot observe or check your account installation. The package contains no secret and works on this Mac only while Erlkonig is open. This is a Cowork/Code plugin, not a standalone chat extension.";
+pub const COWORK_HELP: &str = "Cowork plugins are managed on your Claude account, separately from local Claude Code installs. In Customize → Plugins, use Add → Upload plugin and choose the prepared ZIP. Remove it there too. Erlkonig cannot observe or check your account installation. The package contains no secret and works on this computer only while Erlkonig is open. This is a Cowork/Code plugin, not a standalone chat extension.";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 
@@ -487,7 +487,7 @@ pub fn prepare(layout: &Layout, executable: &Path, url: &str) -> Result<PathBuf,
     json_file(
         &root.join(".agents/plugins/marketplace.json"),
         &json!({
-            "name":MARKETPLACE, "interface":{"displayName":"Erlkonig on this Mac"},
+            "name":MARKETPLACE, "interface":{"displayName":"Erlkonig on this computer"},
             "plugins":[{"name":"erlkonig", "source":{"source":"local", "path":"./openai"},
                 "policy":{"installation":"AVAILABLE", "authentication":"ON_USE"}, "category":"Productivity"}]
         }),
@@ -647,6 +647,14 @@ pub fn set_installed_with_client(
     Ok(after)
 }
 
+/// Info-ZIP's `zip` from the given `PATH`, else the distribution's usual
+/// location; the archive step then reports a missing tool as "Cannot start".
+fn zip_program(path: Option<&std::ffi::OsStr>) -> PathBuf {
+    let on_path = path.map(std::env::split_paths).into_iter().flatten();
+    first_executable(on_path.map(|dir| dir.join("zip")))
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/zip"))
+}
+
 pub fn cowork_archive(
     layout: &Layout,
     executable: &Path,
@@ -662,7 +670,7 @@ pub fn cowork_archive(
     ));
     let result = (|| {
         run(
-            Path::new("/usr/bin/zip"),
+            &zip_program(std::env::var_os("PATH").as_deref()),
             &[
                 "-q",
                 temporary.to_str().ok_or("Archive path is not UTF-8")?,
@@ -885,7 +893,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(openai_market["name"], MARKETPLACE);
-        assert_eq!(openai_market["interface"]["displayName"], "Erlkonig on this Mac");
+        assert_eq!(
+            openai_market["interface"]["displayName"],
+            "Erlkonig on this computer"
+        );
         assert_eq!(claude_market["name"], MARKETPLACE);
         assert_eq!(claude_market["owner"]["name"], "Erlkonig");
     }
@@ -914,6 +925,30 @@ mod tests {
         assert!(prepare(&layout, exe, "http://127.0.0.1:41773/").is_err());
         assert!(root.join("claude/hooks").exists());
         assert!(!layout.dir.join("erlkonig-claude-plugin.zip").exists());
+    }
+    #[test]
+    fn user_visible_text_names_this_computer_not_a_mac() {
+        assert!(COWORK_HELP.contains("works on this computer only while Erlkonig is open"));
+        assert!(!COWORK_HELP.contains("Mac"));
+    }
+    #[test]
+    fn zip_is_resolved_on_path_with_a_system_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let (first, second) = (temp.path().join("first"), temp.path().join("second"));
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("zip"), b"not executable").unwrap();
+        fs::write(second.join("zip"), b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(second.join("zip"), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([first.as_path(), second.as_path()]).unwrap();
+        assert_eq!(zip_program(Some(&path)), second.join("zip"));
+        let fallback = Path::new("/usr/bin/zip");
+        assert_eq!(
+            zip_program(Some(&std::env::join_paths([&first]).unwrap())),
+            fallback
+        );
+        assert_eq!(zip_program(Some(std::ffi::OsStr::new(""))), fallback);
+        assert_eq!(zip_program(None), fallback);
     }
     #[test]
     fn cancellation_prevents_starting_a_client() {

@@ -89,7 +89,16 @@ pub fn protected_folder_warnings(pile: &Path, key: &Path, home: &Path) -> Vec<St
     for (what, path) in [("pile", pile), ("key", key)] {
         for folder in ["Desktop", "Documents", "Downloads"] {
             if path.starts_with(home.join(folder)) {
-                warnings.push(format!("The {what} {} is inside {folder}; macOS may require permission (again after an ad-hoc rebuild).", path.display()));
+                // Only macOS gates these folders behind a per-app permission.
+                let rule = if cfg!(target_os = "macos") {
+                    "; macOS may require permission (again after an ad-hoc rebuild)."
+                } else {
+                    "."
+                };
+                warnings.push(format!(
+                    "The {what} {} is inside {folder}{rule}",
+                    path.display()
+                ));
             }
         }
     }
@@ -105,6 +114,32 @@ mod tests {
         assert_eq!(b.pile, Path::new("/d/self.pile"));
         assert_eq!(b.key, Path::new("/d/self.key"));
         assert!(parse_handle("wiki").is_err());
+    }
+
+    #[test]
+    fn protected_folder_warnings_state_the_platform_rule() {
+        let home = Path::new("/home/someone");
+        let warnings = protected_folder_warnings(
+            &home.join("Documents/node/self.pile"),
+            &home.join(".local/share/erlkonig/self.key"),
+            home,
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0]
+                .starts_with("The pile /home/someone/Documents/node/self.pile is inside Documents")
+        );
+        if cfg!(target_os = "macos") {
+            assert!(warnings[0].contains("macOS may require permission"));
+        } else {
+            // No permission prompt guards these folders elsewhere.
+            assert!(!warnings[0].contains("macOS"));
+            assert!(!warnings[0].contains("permission"));
+        }
+        assert!(
+            protected_folder_warnings(Path::new("/srv/self.pile"), Path::new("/srv/k"), home)
+                .is_empty()
+        );
     }
 
     #[test]
