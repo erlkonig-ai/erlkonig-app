@@ -1,14 +1,17 @@
-//! erlkonig: the Erlkonig menu-bar app (macOS, milestone 1).
+//! erlkonig: the Erlkonig menu-bar app (macOS) and tray app (Linux).
 //!
 //! The main-thread menu owns the complete native service lifetime. Quit stops
 //! the HTTP listener and joins workers. `mcp-stdio` is a client-owned transport
 //! to that existing owner; it never enters the menu or starts native services.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod app;
 
 #[cfg(target_os = "macos")]
 mod mac;
+
+#[cfg(target_os = "linux")]
+mod linux;
 
 #[cfg(target_os = "macos")]
 mod crown_display;
@@ -26,9 +29,11 @@ fn main() {
     }
     #[cfg(target_os = "macos")]
     mac::main();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    linux::main();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        eprintln!("erlkonig: the menu-bar application requires macOS");
+        eprintln!("erlkonig: the menu-bar application requires macOS or Linux");
         std::process::exit(1);
     }
 }
