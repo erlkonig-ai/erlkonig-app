@@ -2,18 +2,32 @@
 //! cargo run --release -p erlkonig --example crown-render -- OUTPUT_DIRECTORY
 //! Does not create an application, window, status item, timer or network service.
 
+#[cfg(target_os = "macos")]
 #[allow(dead_code)]
 #[path = "../crates/erlkonig/src/crown.rs"]
 mod crown;
 
+#[cfg(target_os = "macos")]
 use objc2::{AnyThread, rc::Retained};
+#[cfg(target_os = "macos")]
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSCalibratedRGBColorSpace,
     NSCustomImageRep, NSGraphicsContext, NSImage,
 };
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize};
+#[cfg(target_os = "macos")]
 use std::{fmt::Write as _, path::Path, time::Duration};
 
+// The AppKit proof is macOS-only; on other systems the example still builds so
+// `cargo test -p erlkonig` can run the platform-neutral crown tests.
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("crown-render: the AppKit proof requires macOS");
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "macos")]
 fn render(image: &NSImage, scale: usize) -> Retained<NSBitmapImageRep> {
     let width = crown::WIDTH as usize * scale;
     let height = crown::HEIGHT as usize * scale;
@@ -38,6 +52,7 @@ fn render(image: &NSImage, scale: usize) -> Retained<NSBitmapImageRep> {
     bitmap
 }
 
+#[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let destination = std::env::args().nth(1).ok_or("usage: crown-render OUTPUT_DIRECTORY")?;
     if destination == "--ripple-phases" {
@@ -133,6 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Native proof for the selected travelling ripple; sampled at full attack.
+#[cfg(target_os = "macos")]
 fn ripple_phases(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(destination)?;
     for (phase, millis) in [(0, 3600), (90, 900), (135, 1350), (180, 1800), (270, 2700)] {

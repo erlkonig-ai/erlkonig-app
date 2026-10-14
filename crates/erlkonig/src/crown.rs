@@ -233,6 +233,77 @@ pub fn frame(
     Frame { points, animating }
 }
 
+impl Frame {
+    /// Anti-aliased raster of the closed crown polygon as straight
+    /// (non-premultiplied) RGBA8, `width_px × height_px`, row-major, top row
+    /// first: the layout `tray_icon::Icon::from_rgba` takes. (tray-icon 0.26
+    /// rotates each pixel to network-order ARGB for StatusNotifierItem and
+    /// never premultiplies; see its `platform_impl/ksni/icon.rs`.) The 26 × 18
+    /// point template geometry is scaled to the requested size on each axis.
+    ///
+    /// Coverage is exact along x and sampled on sixteen sub-scanlines per
+    /// pixel row along y, under the nonzero winding rule. A pixel the polygon
+    /// does not touch is entirely zero; every other pixel carries `rgba`'s
+    /// colour unchanged with its alpha scaled by the coverage. No dependency,
+    /// no intermediate bitmap: the same vector drives AppKit on macOS.
+    pub fn rgba(&self, width_px: u32, height_px: u32, rgba: [u8; 4]) -> Vec<u8> {
+        const SUBSAMPLES: usize = 16;
+        let (width, height) = (width_px as usize, height_px as usize);
+        let (scale_x, scale_y) = (width as f64 / WIDTH, height as f64 / HEIGHT);
+        let mut pixels = vec![0_u8; width * height * 4];
+        let mut coverage = vec![0.0_f64; width];
+        let mut crossings: Vec<(f64, i32)> = Vec::new();
+        for row in 0..height {
+            coverage.fill(0.0);
+            for sub in 0..SUBSAMPLES {
+                let y = (row as f64 + (sub as f64 + 0.5) / SUBSAMPLES as f64) / scale_y;
+                crossings.clear();
+                for i in 0..self.points.len() {
+                    let (a, b) = (self.points[i], self.points[(i + 1) % self.points.len()]);
+                    // Half-open in y: a vertex on the scanline counts for one
+                    // of its two edges, and horizontal edges never cross.
+                    if (a.y <= y) == (b.y <= y) {
+                        continue;
+                    }
+                    let x = a.x + (y - a.y) * (b.x - a.x) / (b.y - a.y);
+                    crossings.push((x * scale_x, if a.y < b.y { 1 } else { -1 }));
+                }
+                crossings.sort_by(|p, q| p.0.total_cmp(&q.0));
+                let (mut winding, mut start) = (0, 0.0);
+                for &(x, direction) in &crossings {
+                    if winding == 0 {
+                        start = x;
+                    }
+                    winding += direction;
+                    if winding != 0 {
+                        continue;
+                    }
+                    let (left, right) = (start.max(0.0), x.min(width as f64));
+                    if right <= left {
+                        continue;
+                    }
+                    for column in left.floor() as usize..(right.ceil() as usize).min(width) {
+                        let from = (column as f64).max(left);
+                        let to = (column as f64 + 1.0).min(right);
+                        coverage[column] += (to - from).max(0.0);
+                    }
+                }
+            }
+            for (column, covered) in coverage.iter().enumerate() {
+                let alpha = (covered / SUBSAMPLES as f64).clamp(0.0, 1.0) * f64::from(rgba[3]);
+                let alpha = alpha.round() as u8;
+                if alpha == 0 {
+                    continue;
+                }
+                let at = (row * width + column) * 4;
+                pixels[at..at + 3].copy_from_slice(&rgba[..3]);
+                pixels[at + 3] = alpha;
+            }
+        }
+        pixels
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl Frame {
     /// AppKit redraws this vector at the destination backing scale. There is
@@ -677,5 +748,150 @@ mod tests {
             * (-0.32 * radius * radius).exp() * taper;
         assert!((high - low - expected).abs() < 0.003); // 120 sampled phases
         assert!(high - low > 1.0); // At least two native Retina pixels of travel.
+    }
+
+    // The native proof in scripts/crown-render.rs renders these ten frames at
+    // 1× and 2× and inspects the AppKit alpha mask. The portable raster must
+    // satisfy the same assertions.
+    const PROOF_CASES: [(&str, u64, Option<u64>, bool, bool); 10] = [
+        ("idle", 0, None, false, false),
+        ("attack", 80, Some(80), false, false),
+        ("working", 1000, Some(1000), false, false),
+        ("landing", 3599, Some(1000), false, false),
+        ("settled", 3600, Some(1000), false, false),
+        ("reduced", 1000, Some(1000), true, false),
+        ("attention", 0, None, false, true),
+        ("attention-working", 1000, Some(1000), false, true),
+        ("attention-settled", 3600, Some(1000), false, true),
+        ("attention-reduced", 1000, Some(1000), true, true),
+    ];
+
+    fn proof_frame(now: u64, last: Option<u64>, reduced: bool, attention: bool) -> Frame {
+        let activity = last.map(|last| WorkActivity {
+            began_at: Duration::ZERO,
+            ended_at: Some(ms(last)),
+        });
+        super::frame(ms(now), activity, reduced, attention)
+    }
+
+    fn shoelace_area(points: &[Point]) -> f64 {
+        let mut twice = 0.0;
+        for i in 0..points.len() {
+            let (a, b) = (points[i], points[(i + 1) % points.len()]);
+            twice += a.x * b.y - b.x * a.y;
+        }
+        twice.abs() * 0.5
+    }
+
+    #[test]
+    fn rgba_mirrors_the_native_mask_proof() {
+        let black = [0, 0, 0, 255];
+        let mut idle_pixels = Vec::new();
+        let mut attention_pixels = Vec::new();
+        for (label, now, last, reduced, attention) in PROOF_CASES {
+            let frame = proof_frame(now, last, reduced, attention);
+            for scale in [1_u32, 2] {
+                let (width, height) = (26 * scale as usize, 18 * scale as usize);
+                let pixels = frame.rgba(26 * scale, 18 * scale, black);
+                assert_eq!(pixels.len(), width * height * 4);
+                assert!(pixels.chunks_exact(4).all(|p| p[..3] == [0, 0, 0]));
+                let solid = pixels.chunks_exact(4).filter(|p| p[3] == 255).count();
+                let partial = pixels
+                    .chunks_exact(4)
+                    .filter(|p| p[3] > 0 && p[3] < 255)
+                    .count();
+                assert!(
+                    solid > 0 && partial > 0,
+                    "{label} {scale}x: {solid} solid, {partial} partial"
+                );
+                for row in 0..height {
+                    assert_eq!(pixels[(row * width) * 4 + 3], 0);
+                    assert_eq!(pixels[(row * width + width - 1) * 4 + 3], 0);
+                }
+                assert!(pixels[..width * 4].iter().all(|p| *p == 0));
+                assert!(pixels[(height - 1) * width * 4..].iter().all(|p| *p == 0));
+                if scale == 2 {
+                    match label {
+                        "idle" => idle_pixels = pixels,
+                        "settled" | "reduced" => assert_eq!(pixels, idle_pixels, "{label}"),
+                        "working" => assert_ne!(pixels, idle_pixels),
+                        "attention" => {
+                            assert_ne!(pixels, idle_pixels);
+                            attention_pixels = pixels;
+                        }
+                        "attention-settled" | "attention-reduced" => {
+                            assert_eq!(pixels, attention_pixels, "{label}");
+                        }
+                        "attention-working" => assert_ne!(pixels, attention_pixels),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rgba_is_mirror_symmetric_like_the_geometry() {
+        for (label, now, last, reduced, attention) in PROOF_CASES {
+            let frame = proof_frame(now, last, reduced, attention);
+            for (width, height) in [(26_u32, 18_u32), (52, 36), (32, 32), (24, 24)] {
+                let pixels = frame.rgba(width, height, [255, 255, 255, 255]);
+                let width = width as usize;
+                for (i, pixel) in pixels.chunks_exact(4).enumerate() {
+                    let (row, column) = (i / width, i % width);
+                    let mirror = pixels[(row * width + width - 1 - column) * 4 + 3];
+                    // Mirror-image coverage differs only by floating-point rounding.
+                    assert!(
+                        pixel[3].abs_diff(mirror) <= 1,
+                        "{label} {width}×{height} ({column},{row})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rgba_keeps_straight_colour_and_scales_alpha_by_coverage() {
+        let frame = frame(ms(0), None, false);
+        let opaque = frame.rgba(52, 36, [10, 200, 30, 255]);
+        let translucent = frame.rgba(52, 36, [10, 200, 30, 128]);
+        assert_eq!(opaque.len(), translucent.len());
+        let mut touched = 0;
+        for (a, b) in opaque.chunks_exact(4).zip(translucent.chunks_exact(4)) {
+            if a[3] == 0 {
+                // Untouched pixels are entirely zero, not a transparent colour.
+                assert_eq!(a, [0, 0, 0, 0]);
+                assert_eq!(b, [0, 0, 0, 0]);
+                continue;
+            }
+            touched += 1;
+            // Straight alpha: the colour is never premultiplied by coverage.
+            assert_eq!(a[..3], [10, 200, 30]);
+            assert_eq!(b[..3], [10, 200, 30]);
+            assert!(b[3] <= 128);
+            assert!((f64::from(b[3]) - f64::from(a[3]) * 128.0 / 255.0).abs() <= 1.0);
+        }
+        assert!(touched > 100);
+    }
+
+    #[test]
+    fn rgba_coverage_integrates_to_the_polygon_area() {
+        for (label, now, last, reduced, attention) in PROOF_CASES {
+            let frame = proof_frame(now, last, reduced, attention);
+            let area = shoelace_area(&frame.points);
+            assert!(area > 100.0 && area < 250.0, "{label}: {area}");
+            for (width, height) in [(26_u32, 18_u32), (52, 36), (104, 72), (52, 18)] {
+                let pixels = frame.rgba(width, height, [0, 0, 0, 255]);
+                let covered: f64 = pixels
+                    .chunks_exact(4)
+                    .map(|p| f64::from(p[3]) / 255.0)
+                    .sum();
+                let expected = area * f64::from(width) / WIDTH * f64::from(height) / HEIGHT;
+                assert!(
+                    (covered - expected).abs() < 0.01 * expected,
+                    "{label} {width}×{height}: covered {covered}, polygon {expected}"
+                );
+            }
+        }
     }
 }
