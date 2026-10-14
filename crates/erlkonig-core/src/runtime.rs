@@ -386,11 +386,8 @@ impl StopCause {
     fn new(reason: &str, code: ServiceCode) -> Self { Self { reason: reason.into(), code } }
     fn guard(error: &anyhow::Error) -> Self {
         let code = match error.downcast_ref::<crate::resource_guard::Failure>() {
-            #[cfg(not(target_os = "macos"))]
-            Some(crate::resource_guard::Failure::RssLimit) => ServiceCode::ResourceRssLimit,
-            // The existing generic code is truthful for footprint; the shared
-            // RSS-specific vocabulary remains reserved for actual RSS stops.
-            #[cfg(target_os = "macos")]
+            // No platform samples RSS, so the RSS-specific code is never
+            // truthful here; the generic code names a footprint stop.
             Some(crate::resource_guard::Failure::FootprintLimit) => ServiceCode::ResourceLimit,
             Some(crate::resource_guard::Failure::HeadroomLimit) => ServiceCode::ResourceHeadroomLimit,
             None => ServiceCode::ResourceObservationFailed,
@@ -1000,15 +997,13 @@ mod tests {
     fn guard_stop_uses_the_platform_memory_vocabulary() {
         let cause = StopCause::guard(&crate::resource_guard::check(48 * 1024 * 1024 * 1024, 100)
             .unwrap_err());
-        if cfg!(target_os = "macos") {
-            assert_eq!(cause.code, ServiceCode::ResourceLimit);
-            assert!(cause.reason.contains("physical footprint reached 48 GiB"));
-            assert!(!cause.reason.contains("RSS"));
-            assert!(!cause.code.description().contains("RSS"));
-        } else {
-            assert_eq!(cause.code, ServiceCode::ResourceRssLimit);
-            assert!(cause.reason.contains("RSS reached 48 GiB"));
-        }
+        // Neither platform samples RSS: Darwin reports the physical footprint,
+        // Linux anonymous, shared and swapped pages. The vocabulary must not
+        // claim otherwise on either.
+        assert_eq!(cause.code, ServiceCode::ResourceLimit);
+        assert!(cause.reason.contains("footprint reached 48 GiB"));
+        assert!(!cause.reason.contains("RSS"));
+        assert!(!cause.code.description().contains("RSS"));
         let headroom = StopCause::guard(&crate::resource_guard::check(1024, 19).unwrap_err());
         assert_eq!(headroom.code, ServiceCode::ResourceHeadroomLimit);
         let invalid = StopCause::guard(&crate::resource_guard::check(1024, 101).unwrap_err());
@@ -1096,11 +1091,7 @@ mod tests {
             ("cleanup".into(), "endpoint_shutdown_timeout".into()),
             ("cleanup".into(), "store_close_failed".into()),
             ("session".into(), "session_failed".into()),
-            ("stop".into(), if cfg!(target_os = "macos") {
-                "resource_limit".into()
-            } else {
-                "resource_rss_limit".into()
-            }),
+            ("stop".into(), "resource_limit".into()),
         ]);
         drop(observed);
         drop(snapshot);
