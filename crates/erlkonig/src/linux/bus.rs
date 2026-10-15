@@ -44,9 +44,17 @@ pub(crate) enum Claim {
 }
 
 pub(crate) fn claim(proxy: EventLoopProxy<UserEvent>) -> Claim {
+    // zbus requests names with AllowReplacement | ReplaceExisting by default,
+    // so a second launch would take the name over and start a second owner.
+    // Neither: the holder keeps the name and a later launch gets NameTaken.
     let built = zbus::blocking::connection::Builder::session()
         .and_then(|builder| builder.serve_at(PATH, Activation(Mutex::new(proxy))))
         .and_then(|builder| builder.name(NAME))
+        .map(|builder| {
+            builder
+                .allow_name_replacements(false)
+                .replace_existing_names(false)
+        })
         .and_then(|builder| builder.build());
     match built {
         Ok(connection) => Claim::Primary(connection),
