@@ -173,12 +173,12 @@ mod tests {
     #[test]
     fn file_uris_escape_everything_outside_the_unreserved_set() {
         assert_eq!(
-            file_uri(Path::new("/home/jp/.local/share/erlkonig")),
-            "file:///home/jp/.local/share/erlkonig"
+            file_uri(Path::new("/home/someone/.local/share/erlkonig")),
+            "file:///home/someone/.local/share/erlkonig"
         );
         assert_eq!(
-            file_uri(Path::new("/home/jp/My Files/100%/ä#?")),
-            "file:///home/jp/My%20Files/100%25/%C3%A4%23%3F"
+            file_uri(Path::new("/home/someone/My Files/100%/ä#?")),
+            "file:///home/someone/My%20Files/100%25/%C3%A4%23%3F"
         );
     }
 
