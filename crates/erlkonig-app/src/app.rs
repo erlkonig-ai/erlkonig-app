@@ -77,12 +77,6 @@ pub enum Then {
     Cowork(Option<PathBuf>),
     /// Button 0 opens the platform's login item settings.
     LoginSettings,
-    /// The install / remove / refresh choice for one host's plugin.
-    Plugin {
-        host: install::Host,
-        program: PathBuf,
-        installed: bool,
-    },
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -137,15 +131,28 @@ pub struct App<S: Shell> {
     plugin_states: [Option<Result<install::Inventory, String>>; 2],
     clients: Option<install::ClientAvailability>,
     plugin_task: Option<PluginTask>,
+    /// The last plugin failure in the client's own words, for the details.
+    plugin_error: Option<String>,
+    /// Standing observations about client configuration, for the details.
+    plugin_notes: Vec<String>,
     prompts: VecDeque<Prompt>,
+    /// Tests run without services; this stands in for their MCP URL.
+    #[cfg(test)]
+    test_url: Option<String>,
 }
 
 enum PluginResult {
     Inventory {
         clients: install::ClientAvailability,
         states: [Option<Result<install::Inventory, String>>; 2],
+        notes: Vec<String>,
     },
-    Changed(install::Host, Result<install::Inventory, String>),
+    Changed(
+        install::Host,
+        install::Change,
+        Result<install::Inventory, String>,
+    ),
+    Refreshed(Vec<(install::Host, Result<install::Inventory, String>)>),
     Archive(Result<PathBuf, String>),
 }
 
@@ -230,7 +237,11 @@ impl<S: Shell> App<S> {
             plugin_states: [None, None],
             clients: None,
             plugin_task: None,
+            plugin_error: None,
+            plugin_notes: Vec::new(),
             prompts: VecDeque::new(),
+            #[cfg(test)]
+            test_url: None,
         }
     }
 
@@ -295,17 +306,22 @@ impl<S: Shell> App<S> {
                     self.shell.open_login_settings();
                 }
             }
-            Then::Plugin {
-                host,
-                program,
-                installed,
-            } => self.plugin_chosen(host, program, installed, answer),
         }
     }
 
-    /// The text behind the attention item: the problem, or the live status.
+    /// The running services' MCP URL, which every staged package names.
+    fn mcp_url(&self) -> Option<String> {
+        #[cfg(test)]
+        if let Some(url) = &self.test_url {
+            return Some(url.clone());
+        }
+        self.runtime.as_ref().and_then(|r| r.status().mcp_url)
+    }
+
+    /// The text behind the attention item: the problem, or the live status,
+    /// then the last plugin failure and any client configuration notes.
     fn details(&self) -> String {
-        self.problem.clone().unwrap_or_else(|| {
+        let mut text = self.problem.clone().unwrap_or_else(|| {
             self.runtime
                 .as_ref()
                 .map(|r| {
@@ -318,7 +334,21 @@ impl<S: Shell> App<S> {
                     )
                 })
                 .unwrap_or_default()
-        })
+        });
+        for line in self.plugin_error.iter().chain(&self.plugin_notes) {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(line);
+        }
+        text
+    }
+
+    /// One short prompt for a plugin failure; the client's own words go to
+    /// the status details instead of the dialog.
+    fn plugin_failed(&mut self, title: &str, sentence: &str, error: String) {
+        self.plugin_error = Some(error);
+        self.ask(title, sentence, &["OK"], Then::Nothing);
     }
 
     /// The menu as it is right now, plus the oldest unanswered prompt.
@@ -410,7 +440,10 @@ impl<S: Shell> App<S> {
         let attention = if self.problem.is_some() {
             Some("Attention needed")
         } else {
-            status.as_ref().and_then(|s| s.attention_label())
+            status
+                .as_ref()
+                .and_then(|s| s.attention_label())
+                .or(self.plugin_error.as_ref().map(|_| "Plugin problem"))
         };
         if let Some(label) = attention {
             self.items.status.set_text(label);
@@ -575,14 +608,11 @@ impl<S: Shell> App<S> {
             .spawn(move || work(worker_cancel))
         {
             Ok(thread) => self.plugin_task = Some(PluginTask { cancel, thread }),
-            Err(error) => {
-                self.ask(
-                    "Cannot start plugin operation",
-                    &error.to_string(),
-                    &["OK"],
-                    Then::Nothing,
-                );
-            }
+            Err(error) => self.plugin_failed(
+                "Plugin not changed",
+                "Erlkonig could not start the plugin operation; the details are in its status.",
+                format!("Plugin operation: {error}"),
+            ),
         }
         self.update_plugin_items();
     }
@@ -608,12 +638,22 @@ impl<S: Shell> App<S> {
             clients.openai_cli =
                 install::find_client_with_apps(install::Host::OpenAi, &openai_apps);
             clients.claude_cli = install::find_client_with_apps(install::Host::ClaudeCode, &[]);
-            let states = [install::Host::OpenAi, install::Host::ClaudeCode].map(|host| {
+            let hosts = [install::Host::OpenAi, install::Host::ClaudeCode];
+            let states = hosts.map(|host| {
                 clients
                     .cli(host)
                     .map(|program| install::inventory_with_client(host, program, &layout, &cancel))
             });
-            PluginResult::Inventory { clients, states }
+            let notes = hosts
+                .into_iter()
+                .filter(|host| clients.cli(*host).is_some())
+                .filter_map(install::legacy_config_notice)
+                .collect();
+            PluginResult::Inventory {
+                clients,
+                states,
+                notes,
+            }
         });
         if self.plugin_task.is_none() {
             self.rebuild_integrations();
@@ -722,23 +762,62 @@ impl<S: Shell> App<S> {
             return;
         };
         match task.thread.join() {
-            Ok(PluginResult::Inventory { clients, states }) => {
+            Ok(PluginResult::Inventory {
+                clients,
+                states,
+                notes,
+            }) => {
                 self.clients = Some(clients);
+                if states.iter().flatten().all(Result::is_ok) {
+                    self.plugin_error = None;
+                }
                 self.plugin_states = states;
+                self.plugin_notes = notes;
                 self.rebuild_integrations();
+                self.refresh_stale_plugins();
             }
-            Ok(PluginResult::Changed(host, result)) => {
-                let text = match &result {
-                    Ok(state) if state.installed => {
-                        "The local client reports the plugin installed. Its enabled state is shown in the menu. Restart/reload the client to use the current package; installation is not proof of an active MCP connection."
+            // Success is the check mark itself; only a failure speaks.
+            Ok(PluginResult::Changed(host, change, result)) => {
+                match &result {
+                    Ok(_) => self.plugin_error = None,
+                    Err(error) => {
+                        let (title, verb) = match change {
+                            install::Change::Install => ("Plugin not installed", "install"),
+                            install::Change::Remove => ("Plugin not removed", "remove"),
+                            install::Change::Refresh => ("Plugin not updated", "update"),
+                        };
+                        self.plugin_failed(
+                            title,
+                            &format!(
+                                "{} did not {verb} the Erlkonig plugin; the details are in Erlkonig's status.",
+                                host.client()
+                            ),
+                            format!("{}: {error}", host.label()),
+                        );
                     }
-                    Ok(_) => {
-                        "The local client confirms the plugin was removed. Other plugins, marketplace registration and unrelated settings were left alone. A separate Claude account installation, if any, is unchanged."
-                    }
-                    Err(error) => error,
-                };
-                self.ask(host.label(), text, &["OK"], Then::Nothing);
+                }
                 self.plugin_states[host_index(host)] = Some(result);
+            }
+            // A quiet refresh speaks once, however many clients failed.
+            Ok(PluginResult::Refreshed(results)) => {
+                let (mut clients, mut errors) = (Vec::new(), Vec::new());
+                for (host, result) in results {
+                    if let Err(error) = &result {
+                        clients.push(host.client());
+                        errors.push(format!("{}: {error}", host.label()));
+                    }
+                    self.plugin_states[host_index(host)] = Some(result);
+                }
+                if !errors.is_empty() {
+                    self.plugin_failed(
+                        "Plugin not updated",
+                        &format!(
+                            "{} could not update the Erlkonig plugin; the details are in Erlkonig's status.",
+                            clients.join(" and ")
+                        ),
+                        errors.join("\n"),
+                    );
+                }
             }
             Ok(PluginResult::Archive(result)) => match result {
                 Ok(path) => {
@@ -749,9 +828,11 @@ impl<S: Shell> App<S> {
                         Then::Cowork(Some(path)),
                     );
                 }
-                Err(error) => {
-                    self.ask("Cowork package unavailable", &error, &["OK"], Then::Nothing);
-                }
+                Err(error) => self.plugin_failed(
+                    "Cowork package unavailable",
+                    "Erlkonig could not prepare the plugin ZIP; the details are in its status.",
+                    format!("Cowork package: {error}"),
+                ),
             },
             Err(_) => {
                 self.plugin_states = [
@@ -764,6 +845,8 @@ impl<S: Shell> App<S> {
         self.update_plugin_items();
     }
 
+    /// The check mark is the consent: a click on an unchecked row installs,
+    /// a click on a checked row removes, with no dialog in between.
     fn plugin_action(&mut self, host: install::Host) {
         if self.plugin_task.is_some() || self.quitting.is_some() {
             return;
@@ -786,75 +869,27 @@ impl<S: Shell> App<S> {
             self.manage_cowork();
             return;
         }
-        let scope = match host {
-            install::Host::OpenAi => {
-                "This is the local OpenAI package for supported ChatGPT Work/Codex clients on this Mac. Status is the installed Codex CLI's inventory, not proof of ChatGPT UI refresh."
-            }
-            install::Host::ClaudeCode => {
-                "This changes only this Mac's user-scope Claude Code plugin. It does not install or remove a Cowork account plugin."
-            }
-        };
-        #[cfg(not(target_os = "macos"))]
-        let scope = scope.replace("this Mac", "this computer");
-        let text = format!(
-            "{scope}\n\nKeep Erlkonig open while using its tools. After moving/updating the app, Refresh package reinstalls the current executable path; enable/reload it in the client if needed.\n\n{}",
-            install::legacy_config_notice(host)
-                .unwrap_or("No credentials are copied to the plugin or client settings.")
-        );
-        let buttons: &[&str] = if state.installed {
-            &["Remove plugin", "Refresh package", "Cancel"]
+        let change = if state.installed {
+            install::Change::Remove
         } else {
-            &["Install plugin", "Cancel"]
+            install::Change::Install
         };
-        let then = Then::Plugin {
-            host,
-            program,
-            installed: state.installed,
-        };
-        self.ask(host.label(), &text, buttons, then);
-    }
-
-    fn plugin_chosen(
-        &mut self,
-        host: install::Host,
-        program: PathBuf,
-        installed: bool,
-        answer: usize,
-    ) {
-        let wanted = if installed {
-            match answer {
-                0 => false,
-                1 => true,
-                _ => return,
-            }
-        } else {
-            if answer != 0 {
-                return;
-            }
-            true
-        };
-        // A drawn prompt can be answered after other work has started.
-        if self.plugin_task.is_some() || self.quitting.is_some() {
-            return;
-        }
-        let url = self.runtime.as_ref().and_then(|r| r.status().mcp_url);
-        if wanted && url.is_none() {
-            self.ask(
-                "Erlkonig is not running",
-                "Start the app's services before installing the plugin.",
-                &["OK"],
-                Then::Nothing,
+        let url = self.mcp_url();
+        if change == install::Change::Install && url.is_none() {
+            self.plugin_failed(
+                "Plugin not installed",
+                "Erlkonig's services are not running, so the plugin would have nothing to connect to.",
+                format!("{}: services are not running", host.label()),
             );
             return;
         }
         let executable = match std::env::current_exe() {
             Ok(path) => path,
             Err(error) => {
-                self.ask(
-                    "Plugin operation unavailable",
-                    &error.to_string(),
-                    &["OK"],
-                    Then::Nothing,
+                self.plugin_failed(
+                    "Plugin not changed",
+                    "Erlkonig cannot locate its own program file; the details are in its status.",
+                    format!("{}: {error}", host.label()),
                 );
                 return;
             }
@@ -863,16 +898,53 @@ impl<S: Shell> App<S> {
         self.start_plugin_task(move |cancel| {
             PluginResult::Changed(
                 host,
-                install::set_installed_with_client(
+                change,
+                install::change_with_client(
                     host,
                     &program,
-                    wanted,
+                    change,
                     &layout,
                     &executable,
                     url.as_deref().unwrap_or(""),
                     &cancel,
                 ),
             )
+        });
+    }
+
+    /// After an inventory: if the staged package was made for another
+    /// executable path, data directory, endpoint or package version, quietly
+    /// reinstall the plugins the clients report installed. Unchecked plugins
+    /// are never touched; the worker re-reads each inventory before acting.
+    fn refresh_stale_plugins(&mut self) {
+        let installed = [install::Host::OpenAi, install::Host::ClaudeCode]
+            .into_iter()
+            .filter(|host| {
+                matches!(
+                    &self.plugin_states[host_index(*host)],
+                    Some(Ok(state)) if state.installed
+                )
+            })
+            .filter_map(|host| {
+                let clients = self.clients.as_ref()?;
+                Some((host, clients.cli(host)?.to_path_buf()))
+            })
+            .collect::<Vec<_>>();
+        if installed.is_empty() {
+            return;
+        }
+        let (Some(url), Ok(executable)) = (self.mcp_url(), std::env::current_exe()) else {
+            return;
+        };
+        let layout = self.layout.clone();
+        self.start_plugin_task(move |cancel| {
+            PluginResult::Refreshed(install::refresh_if_stale(
+                &installed,
+                &layout,
+                &executable,
+                &url,
+                &cancel,
+            ))
         });
     }
 
@@ -968,8 +1040,8 @@ impl<S: Shell> App<S> {
             self.plugin_action(install::Host::OpenAi);
         } else if id == self.items.openai_manual.id() {
             self.ask(
-                "OpenAI plugin management unavailable",
-                "The desktop app is installed, but a supported Codex management CLI was not detected. Use the app's plugin settings, or install the Codex CLI and choose Refresh plugin status. Erlkonig has not checked or changed the app's plugin installation.",
+                "Codex CLI not found",
+                "Erlkonig installs this plugin with the Codex CLI. Install it, then choose Refresh plugin status.",
                 &["OK"],
                 Then::Nothing,
             );
@@ -1177,5 +1249,298 @@ mod tests {
         let id = app.view().login.id;
         app.on_menu(MenuEvent { id });
         assert_eq!(*log.borrow(), ["login false"].map(String::from).to_vec());
+    }
+
+    const URL: &str = "http://127.0.0.1:41773/";
+
+    fn fake_client(dir: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let program = dir.join(name);
+        std::fs::write(
+            &program,
+            include_str!("../../erlkonig-core/tests/fixtures/fake-client.sh"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        program
+    }
+
+    /// The argv lists a fake client received since the last call.
+    fn take_argv(program: &Path) -> Vec<Vec<String>> {
+        let log = program.with_file_name("argv.log");
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        std::fs::write(&log, "").unwrap();
+        text.lines()
+            .map(|line| line.split_terminator('\u{1f}').map(String::from).collect())
+            .collect()
+    }
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| (*w).to_owned()).collect()
+    }
+
+    fn alerts(log: &Rc<RefCell<Vec<String>>>) -> Vec<String> {
+        log.borrow()
+            .iter()
+            .filter(|line| line.starts_with("alert "))
+            .cloned()
+            .collect()
+    }
+
+    /// Let the plugin worker (and anything it starts) finish.
+    fn settle(app: &mut App<Fake>) {
+        for _ in 0..1500 {
+            app.next_refresh = Instant::now();
+            app.tick();
+            if app.plugin_task.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("plugin worker did not finish");
+    }
+
+    /// A fake client whose plugin is (or is not) installed from our marketplace.
+    fn client(dir: &Path, name: &str, layout: &Layout, installed: bool) -> PathBuf {
+        let program = fake_client(dir, name);
+        let root = install::marketplace_root(layout);
+        std::fs::write(dir.join("market"), format!("{}\n", root.display())).unwrap();
+        std::fs::write(dir.join("installed"), if installed { "1\n" } else { "0\n" }).unwrap();
+        program
+    }
+
+    /// An app whose Claude Code row shows the fake client's inventory.
+    fn plugin_app(temp: &Path, shell: Fake, installed: bool) -> (App<Fake>, PathBuf) {
+        let layout = Layout::new(temp.join("data"));
+        std::fs::create_dir_all(&layout.dir).unwrap();
+        let claude = client(&temp.join("claude"), "claude", &layout, installed);
+        let mut app = App::new(shell, layout.clone(), Arc::new(AtomicBool::new(false)));
+        app.test_url = Some(URL.into());
+        app.clients = Some(install::ClientAvailability {
+            claude_cli: Some(claude.clone()),
+            ..Default::default()
+        });
+        app.plugin_states[1] = Some(install::inventory_with_client(
+            install::Host::ClaudeCode,
+            &claude,
+            &layout,
+            &AtomicBool::new(false),
+        ));
+        take_argv(&claude);
+        app.rebuild_integrations();
+        app.update_plugin_items();
+        assert_eq!(app.items.claude.is_checked(), installed);
+        (app, claude)
+    }
+
+    fn click_claude(app: &mut App<Fake>) {
+        let id = app.items.claude.id().clone();
+        app.on_menu(MenuEvent { id });
+    }
+
+    #[test]
+    fn clicking_an_unchecked_plugin_installs_it_without_a_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let shell = Fake {
+            log: log.clone(),
+            ..Fake::default()
+        };
+        let (mut app, claude) = plugin_app(temp.path(), shell, false);
+        click_claude(&mut app);
+        assert_eq!(app.view().prompt, None);
+        settle(&mut app);
+        let calls = take_argv(&claude);
+        assert!(
+            calls.contains(&argv(&[
+                "plugin",
+                "install",
+                install::PLUGIN_ID,
+                "--scope",
+                "user"
+            ])),
+            "{calls:?}"
+        );
+        assert!(app.items.claude.is_checked());
+        assert_eq!(alerts(&log), Vec::<String>::new());
+        assert_eq!(app.view().prompt, None);
+    }
+
+    #[test]
+    fn clicking_a_checked_plugin_uninstalls_it_without_a_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let shell = Fake {
+            log: log.clone(),
+            ..Fake::default()
+        };
+        let (mut app, claude) = plugin_app(temp.path(), shell, true);
+        click_claude(&mut app);
+        assert_eq!(app.view().prompt, None);
+        settle(&mut app);
+        let calls = take_argv(&claude);
+        assert!(
+            calls.contains(&argv(&[
+                "plugin",
+                "uninstall",
+                install::PLUGIN_ID,
+                "--scope",
+                "user"
+            ])),
+            "{calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.contains(&"install".to_owned()))
+        );
+        assert!(!app.items.claude.is_checked());
+        assert_eq!(alerts(&log), Vec::<String>::new());
+    }
+
+    #[test]
+    fn success_raises_no_prompt_even_where_modals_answer_at_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        // A native modal that would press its first button.
+        let shell = Fake {
+            modal: Some(0),
+            log: log.clone(),
+            ..Fake::default()
+        };
+        let (mut app, _claude) = plugin_app(temp.path(), shell, false);
+        click_claude(&mut app);
+        settle(&mut app);
+        assert!(app.items.claude.is_checked());
+        assert_eq!(alerts(&log), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_client_error_raises_exactly_one_short_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let shell = Fake {
+            log: log.clone(),
+            ..Fake::default()
+        };
+        let (mut app, claude) = plugin_app(temp.path(), shell, false);
+        std::fs::write(claude.with_file_name("fail"), "").unwrap();
+        click_claude(&mut app);
+        settle(&mut app);
+        assert_eq!(alerts(&log), ["alert Plugin not installed"]);
+        let prompt = app.view().prompt.expect("one error prompt");
+        assert_eq!(prompt.buttons, ["OK"]);
+        assert!(!prompt.text.contains('\n'), "{}", prompt.text);
+        assert!(prompt.text.len() <= 100, "{}", prompt.text);
+        assert_eq!(prompt.text.matches(". ").count(), 0, "{}", prompt.text);
+        // The client's own words stay available in the status details.
+        assert!(
+            app.view().details.contains("failed"),
+            "{}",
+            app.view().details
+        );
+        assert!(!app.items.claude.is_checked());
+    }
+
+    /// Inventory as the worker reports it, from the given fake clients.
+    fn inventory(app: &mut App<Fake>, claude: PathBuf, codex: PathBuf) {
+        let layout = app.layout.clone();
+        let clients = install::ClientAvailability {
+            openai_cli: Some(codex),
+            claude_cli: Some(claude),
+            ..Default::default()
+        };
+        app.start_plugin_task(move |cancel| {
+            let states = [install::Host::OpenAi, install::Host::ClaudeCode].map(|host| {
+                clients
+                    .cli(host)
+                    .map(|program| install::inventory_with_client(host, program, &layout, &cancel))
+            });
+            PluginResult::Inventory {
+                clients,
+                states,
+                notes: Vec::new(),
+            }
+        });
+        settle(app);
+    }
+
+    #[test]
+    fn a_stale_package_is_refreshed_quietly_for_installed_plugins_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let layout = Layout::new(temp.path().join("data"));
+        std::fs::create_dir_all(&layout.dir).unwrap();
+        // Staged for an app bundle that has since moved.
+        install::prepare(&layout, Path::new("/old/Erlkonig.app/erlkonig"), URL).unwrap();
+        let claude = client(&temp.path().join("claude"), "claude", &layout, true);
+        let codex = client(&temp.path().join("codex"), "codex", &layout, false);
+        let mut app = App::new(
+            Fake {
+                log: log.clone(),
+                ..Fake::default()
+            },
+            layout.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.test_url = Some(URL.into());
+        inventory(&mut app, claude.clone(), codex.clone());
+        let calls = take_argv(&claude);
+        let reinstall = [
+            argv(&[
+                "plugin",
+                "uninstall",
+                install::PLUGIN_ID,
+                "--scope",
+                "user",
+                "--keep-data",
+            ]),
+            argv(&["plugin", "install", install::PLUGIN_ID, "--scope", "user"]),
+        ];
+        assert!(calls.windows(2).any(|w| w == reinstall), "{calls:?}");
+        // The unchecked plugin is never installed or touched.
+        let calls = take_argv(&codex);
+        assert!(
+            calls.iter().all(|call| call.contains(&"list".to_owned())),
+            "{calls:?}"
+        );
+        assert!(app.items.claude.is_checked());
+        assert!(!app.items.chatgpt.is_checked());
+        let staged = install::marketplace_root(&layout).join("claude/.mcp.json");
+        let staged = std::fs::read_to_string(staged).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        assert!(staged.contains(&format!("\"command\": \"{}\"", exe.display())));
+        assert!(!staged.contains("/old/"));
+        assert_eq!(alerts(&log), Vec::<String>::new());
+        // Once current, a later inventory changes nothing.
+        inventory(&mut app, claude.clone(), codex.clone());
+        let calls = take_argv(&claude);
+        assert!(
+            calls.iter().all(|call| call.contains(&"list".to_owned())),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_current_package_is_not_refreshed() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(temp.path().join("data"));
+        std::fs::create_dir_all(&layout.dir).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        install::prepare(&layout, &exe, URL).unwrap();
+        let claude = client(&temp.path().join("claude"), "claude", &layout, true);
+        let codex = client(&temp.path().join("codex"), "codex", &layout, true);
+        let mut app = App::new(Fake::default(), layout, Arc::new(AtomicBool::new(false)));
+        app.test_url = Some(URL.into());
+        inventory(&mut app, claude.clone(), codex.clone());
+        for program in [claude, codex] {
+            let calls = take_argv(&program);
+            assert!(
+                calls.iter().all(|call| call.contains(&"list".to_owned())),
+                "{calls:?}"
+            );
+        }
+        assert!(app.items.claude.is_checked() && app.items.chatgpt.is_checked());
     }
 }

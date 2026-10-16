@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 pub const MARKETPLACE: &str = "erlkonig-local";
 pub const PLUGIN_ID: &str = "erlkonig@erlkonig-local";
 pub const COWORK_URL: &str = "https://claude.ai/customize/plugins";
-pub const COWORK_HELP: &str = "Cowork plugins are managed on your Claude account, separately from local Claude Code installs. In Customize → Plugins, use Add → Upload plugin and choose the prepared ZIP. Remove it there too. Erlkonig cannot observe or check your account installation. The package contains no secret and works on this computer only while Erlkonig is open. This is a Cowork/Code plugin, not a standalone chat extension.";
+/// The one manual step: Cowork plugins live on the Claude account. The
+/// caveats are in README.md and plugin/README.md, not in this dialog.
+pub const COWORK_HELP: &str = "In Claude, open Customize → Plugins, choose Add → Upload plugin and pick the prepared ZIP. Remove it there too.";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 
@@ -30,6 +32,13 @@ impl Host {
         match self {
             Self::OpenAi => "OpenAI local plugin",
             Self::ClaudeCode => "Claude Code plugin",
+        }
+    }
+    /// The client application a person recognises in a short message.
+    pub fn client(self) -> &'static str {
+        match self {
+            Self::OpenAi => "Codex",
+            Self::ClaudeCode => "Claude Code",
         }
     }
     fn program(self) -> &'static str {
@@ -323,7 +332,7 @@ pub fn inventory_with_client(
 
 /// Diagnostic only: a legacy server may be user-authored. Never remove or
 /// rewrite it, even when its name or URL looks like an old Erlkonig install.
-pub fn legacy_config_notice(host: Host) -> Option<&'static str> {
+pub fn legacy_config_notice(host: Host) -> Option<String> {
     let home = PathBuf::from(std::env::var_os("HOME")?);
     let present = match host {
         Host::OpenAi => {
@@ -356,7 +365,12 @@ pub fn legacy_config_notice(host: Host) -> Option<&'static str> {
             })
         }
     };
-    present.then_some("A separate MCP configuration named erlkonig also exists. It may expose duplicate tools. It is not owned by this plugin installer and has been left untouched; review it in the client before using the plugin.")
+    present.then(|| {
+        format!(
+            "{}: a separate MCP server named erlkonig is also configured and may duplicate the plugin's tools; Erlkonig leaves it alone.",
+            host.client()
+        )
+    })
 }
 
 fn read_inventory(
@@ -439,31 +453,42 @@ fn validate_package_tree(root: &Path, directory: &Path, manifest: &str) -> Resul
     Ok(())
 }
 
-/// Two provider packages, one skill. Code and the account ZIP use exactly the
-/// same Claude directory. No credential is read by package/lifecycle code.
-pub fn prepare(layout: &Layout, executable: &Path, url: &str) -> Result<PathBuf, String> {
+/// Provider directory, manifest directory and manifest of each package.
+const PROVIDERS: [(&str, &str, &str); 2] = [
+    (
+        "openai",
+        ".codex-plugin",
+        include_str!("../../../plugin/.codex-plugin/plugin.json"),
+    ),
+    (
+        "claude",
+        ".claude-plugin",
+        include_str!("../../../plugin/.claude-plugin/plugin.json"),
+    ),
+];
+const SKILL: &[u8] = include_bytes!("../../../plugin/skills/faculties/SKILL.md");
+
+/// The `.mcp.json` this executable stages: its absolute path, data directory
+/// and the running endpoint, as separate argument values.
+fn mcp_json(layout: &Layout, executable: &Path, url: &str) -> Result<Vec<u8>, String> {
     if !executable.is_absolute() || !layout.dir.is_absolute() {
         return Err("Plugin executable and app data paths must be absolute".into());
     }
     let executable = executable.to_str().ok_or("Executable path is not UTF-8")?;
     let data = layout.dir.to_str().ok_or("Data path is not UTF-8")?;
+    let mcp = json!({"mcpServers":{"faculties":{"command":executable,
+        "args":["mcp-stdio", "--data-dir", data, "--url", url]}}});
+    serde_json::to_vec_pretty(&mcp).map_err(|e| e.to_string())
+}
+
+/// Two provider packages, one skill. Code and the account ZIP use exactly the
+/// same Claude directory. No credential is read by package/lifecycle code.
+pub fn prepare(layout: &Layout, executable: &Path, url: &str) -> Result<PathBuf, String> {
+    let mcp = mcp_json(layout, executable, url)?;
     directory(&layout.dir.join("plugins"))?;
     let root = marketplace_root(layout);
     directory(&root)?;
-    let mcp = json!({"mcpServers":{"faculties":{"command":executable,
-        "args":["mcp-stdio", "--data-dir", data, "--url", url]}}});
-    for (provider, manifest_dir, manifest) in [
-        (
-            "openai",
-            ".codex-plugin",
-            include_str!("../../../plugin/.codex-plugin/plugin.json"),
-        ),
-        (
-            "claude",
-            ".claude-plugin",
-            include_str!("../../../plugin/.claude-plugin/plugin.json"),
-        ),
-    ] {
+    for (provider, manifest_dir, manifest) in PROVIDERS {
         let plugin = root.join(provider);
         directory(&plugin)?;
         validate_package_tree(&plugin, &plugin, manifest_dir)?;
@@ -475,12 +500,9 @@ pub fn prepare(layout: &Layout, executable: &Path, url: &str) -> Result<PathBuf,
             manifest.as_bytes(),
         )
         .map_err(|e| e.to_string())?;
-        write_atomic(
-            &plugin.join("skills/faculties/SKILL.md"),
-            include_bytes!("../../../plugin/skills/faculties/SKILL.md"),
-        )
-        .map_err(|e| e.to_string())?;
-        json_file(&plugin.join(".mcp.json"), &mcp)?;
+        write_atomic(&plugin.join("skills/faculties/SKILL.md"), SKILL)
+            .map_err(|e| e.to_string())?;
+        write_atomic(&plugin.join(".mcp.json"), &mcp).map_err(|e| e.to_string())?;
     }
     directory(&root.join(".agents"))?;
     directory(&root.join(".agents/plugins"))?;
@@ -501,6 +523,58 @@ pub fn prepare(layout: &Layout, executable: &Path, url: &str) -> Result<PathBuf,
         }),
     )?;
     Ok(root)
+}
+
+/// Whether both staged packages are exactly what this executable would stage
+/// now: the same executable path, data directory, endpoint, manifests and
+/// skill. Clients install a copy, so a moved or updated app (or a new port)
+/// leaves an installed plugin pointing at the old one until it is refreshed.
+pub fn staged_is_current(layout: &Layout, executable: &Path, url: &str) -> bool {
+    let Ok(mcp) = mcp_json(layout, executable, url) else {
+        return false;
+    };
+    let root = marketplace_root(layout);
+    PROVIDERS.iter().all(|(provider, manifest_dir, manifest)| {
+        let plugin = root.join(provider);
+        let same = |path: PathBuf, bytes: &[u8]| fs::read(path).is_ok_and(|b| b == bytes);
+        same(plugin.join(".mcp.json"), &mcp)
+            && same(
+                plugin.join(manifest_dir).join("plugin.json"),
+                manifest.as_bytes(),
+            )
+            && same(plugin.join("skills/faculties/SKILL.md"), SKILL)
+    })
+}
+
+/// Quietly bring installed plugins up to date with this executable. While the
+/// staged package is current nothing runs at all. Otherwise each named host
+/// whose client still reports our plugin installed is re-staged and
+/// reinstalled; one the client reports absent is left absent.
+pub fn refresh_if_stale(
+    installed: &[(Host, PathBuf)],
+    layout: &Layout,
+    executable: &Path,
+    url: &str,
+    cancel: &AtomicBool,
+) -> Vec<(Host, Result<Inventory, String>)> {
+    if installed.is_empty() || staged_is_current(layout, executable, url) {
+        return Vec::new();
+    }
+    installed
+        .iter()
+        .map(|(host, program)| {
+            let result = change_with_client(
+                *host,
+                program,
+                Change::Refresh,
+                layout,
+                executable,
+                url,
+                cancel,
+            );
+            (*host, result)
+        })
+        .collect()
 }
 
 /// A marketplace name alone is not ownership evidence. Verify the source path.
@@ -577,6 +651,15 @@ pub fn set_installed(
     set_installed_with_client(host, &program, wanted, layout, executable, url, cancel)
 }
 
+/// What a plugin lifecycle step asks of the client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    Install,
+    Remove,
+    /// Reinstall from a freshly staged package, only if already installed.
+    Refresh,
+}
+
 /// Use the exact CLI whose inventory the menu observed, not a fresh PATH choice.
 pub fn set_installed_with_client(
     host: Host,
@@ -587,7 +670,30 @@ pub fn set_installed_with_client(
     url: &str,
     cancel: &AtomicBool,
 ) -> Result<Inventory, String> {
+    let change = if wanted {
+        Change::Install
+    } else {
+        Change::Remove
+    };
+    change_with_client(host, program, change, layout, executable, url, cancel)
+}
+
+/// The only plugin mutations are the client's own commands for our exact
+/// plugin ID at user scope; nothing here deletes a file or directory.
+pub fn change_with_client(
+    host: Host,
+    program: &Path,
+    change: Change,
+    layout: &Layout,
+    executable: &Path,
+    url: &str,
+    cancel: &AtomicBool,
+) -> Result<Inventory, String> {
+    let wanted = change != Change::Remove;
     let before = read_inventory(host, &program, &layout.dir, cancel)?;
+    if change == Change::Refresh && !before.installed {
+        return Ok(before);
+    }
     if before.account_managed && !before.installed {
         return Err("This Claude plugin is account-managed. Manage or remove it in Customize → Plugins on your Claude account".into());
     }
@@ -609,9 +715,9 @@ pub fn set_installed_with_client(
                 return Err("Client did not register the expected marketplace".into());
             }
         }
-        // Explicit Refresh reinstalls even at the same version, so a cached
-        // command cannot silently remain pinned to a previous app bundle path.
-        // If the second step fails, inventory reports the partial outcome.
+        // Reinstall even at the same version, so a cached command cannot
+        // silently remain pinned to a previous app bundle path. If the second
+        // step fails, inventory reports the partial outcome.
         if before.installed {
             let args: &[&str] = match host {
                 Host::OpenAi => &["plugin", "remove", PLUGIN_ID, "--json"],
@@ -927,9 +1033,10 @@ mod tests {
         assert!(!layout.dir.join("erlkonig-claude-plugin.zip").exists());
     }
     #[test]
-    fn user_visible_text_names_this_computer_not_a_mac() {
-        assert!(COWORK_HELP.contains("works on this computer only while Erlkonig is open"));
+    fn cowork_help_is_the_manual_step_only() {
+        assert!(COWORK_HELP.contains("Upload plugin"));
         assert!(!COWORK_HELP.contains("Mac"));
+        assert!(COWORK_HELP.len() < 140);
     }
     #[test]
     fn zip_is_resolved_on_path_with_a_system_fallback() {

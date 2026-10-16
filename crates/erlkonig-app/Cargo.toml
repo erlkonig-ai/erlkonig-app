@@ -23,3 +23,6 @@ winit.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 tray-icon = { workspace = true, features = ["ksni"] }
 winit = { workspace = true, features = ["x11"] }
+
+[dev-dependencies]
+tempfile = "3"
