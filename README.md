@@ -27,7 +27,10 @@ Secrets route and native WRITE admission are checked before collecting input.
 Login uses a username field and a native secure password field. Its encrypted
 UTF-8 payload is JSON with exactly `username` and `password` string fields.
 Generic secret entry uses one native secure field and encrypts its UTF-8 bytes
-without JSON framing. No TOTP generation, password change, credential registry
+without JSON framing. Both login fields, or the generic value, must contain at
+least one character. An empty-field Save returns a fixed error asking for a new
+local entry and publishes nothing; values are not trimmed or echoed in errors.
+No TOTP generation, password change, credential registry
 or grant operation is added. Existing collection and Secrets delivery semantics
 are unchanged; keep credentials out of an invoice-only shared workspace bundle.
 
