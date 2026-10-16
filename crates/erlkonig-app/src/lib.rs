@@ -7,6 +7,8 @@
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod app;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod native_menu;
 
 pub mod crown;
 

@@ -144,7 +144,7 @@ impl ApplicationHandler<MenuEvent> for Mac {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         if cause == StartCause::Init {
             match TrayIconBuilder::new()
-                .with_menu(Box::new(self.0.menu.clone()))
+                .with_menu(Box::new(self.0.native_menu()))
                 .with_autosave_name("ai.erlkonig.app.status")
                 .build()
             {

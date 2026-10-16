@@ -3,6 +3,7 @@
 //! the event loop and implements [`Shell`] for what only it can do.
 
 use crate::crown::{self, WorkActivity};
+use crate::native_menu::NativeMenu;
 use erlkonig_core::{
     install,
     paths::{self, Layout},
@@ -15,9 +16,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
-use tray_icon::menu::{
-    CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, MenuItemKind, PredefinedMenuItem, Submenu,
-};
+use tray_icon::menu::{Menu, MenuEvent, MenuId};
 use winit::event_loop::ActiveEventLoop;
 
 /// Observed state of the platform's start-at-login registration.
@@ -53,20 +52,110 @@ pub trait Shell {
     fn show_window(&mut self);
 }
 
-pub struct Items {
-    pub status: MenuItem,
-    pub integrations: Submenu,
-    pub no_clients: MenuItem,
-    pub chatgpt: CheckMenuItem,
-    pub openai_manual: MenuItem,
-    pub claude: CheckMenuItem,
-    pub cowork: MenuItem,
-    pub refresh_plugins: MenuItem,
-    pub login: CheckMenuItem,
-    pub pause_sync: MenuItem,
-    pub retry_services: MenuItem,
-    pub storage_folder: MenuItem,
-    pub quit: MenuItem,
+/// The menu as plain data: what every entry shows, which optional entries
+/// are present, and what the Integrations submenu lists. The native menu is
+/// a projection of this ([`NativeMenu`]); the status window reads it through
+/// [`App::view`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Items {
+    pub(crate) status: Control,
+    /// The submenu's own label and enabled state.
+    pub(crate) integrations: Control,
+    pub(crate) no_clients: Control,
+    pub(crate) chatgpt: Control,
+    pub(crate) openai_manual: Control,
+    pub(crate) claude: Control,
+    pub(crate) cowork: Control,
+    pub(crate) refresh_plugins: Control,
+    pub(crate) login: Control,
+    pub(crate) pause_sync: Control,
+    pub(crate) retry_services: Control,
+    pub(crate) storage_folder: Control,
+    pub(crate) quit: Control,
+    /// The attention item is shown, first in the menu.
+    pub(crate) status_visible: bool,
+    /// The retry item is shown, after Pause sync.
+    pub(crate) retry_visible: bool,
+    /// The Integrations submenu's rows, in order.
+    pub(crate) rows: Vec<Row>,
+}
+
+/// One row of the Integrations submenu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Row {
+    NoClients,
+    ChatGpt,
+    OpenAiManual,
+    Claude,
+    Cowork,
+    Separator,
+    Refresh,
+}
+
+fn entry(id: &str, label: &str, enabled: bool, checked: Option<bool>) -> Control {
+    Control {
+        id: MenuId::new(id),
+        label: label.into(),
+        enabled,
+        checked,
+    }
+}
+
+impl Items {
+    fn new() -> Self {
+        Items {
+            status: entry("erlkonig.status", "Attention needed", true, None),
+            integrations: entry("erlkonig.integrations", "Integrations", true, None),
+            no_clients: entry("erlkonig.no-clients", "Checking clients…", false, None),
+            chatgpt: entry(
+                "erlkonig.openai-plugin",
+                "OpenAI local plugin · checking…",
+                false,
+                Some(false),
+            ),
+            openai_manual: entry(
+                "erlkonig.openai-manual",
+                "OpenAI plugin · CLI unavailable…",
+                false,
+                None,
+            ),
+            claude: entry(
+                "erlkonig.claude-plugin",
+                "Claude Code plugin · checking…",
+                false,
+                Some(false),
+            ),
+            cowork: entry("erlkonig.cowork", "Manage Cowork plugin…", false, None),
+            refresh_plugins: entry(
+                "erlkonig.refresh-plugins",
+                "Refresh plugin status…",
+                false,
+                None,
+            ),
+            login: entry("erlkonig.login", "Open at login", true, Some(false)),
+            pause_sync: entry("erlkonig.sync", "Pause sync", false, None),
+            retry_services: entry("erlkonig.retry", "Retry services", false, None),
+            storage_folder: entry("erlkonig.storage", "Show storage folder", false, None),
+            quit: entry("erlkonig.quit", "Quit Erlkonig", true, None),
+            status_visible: false,
+            retry_visible: false,
+            rows: vec![Row::NoClients, Row::Refresh],
+        }
+    }
+
+    /// The entry a submenu row shows; `None` for the separator.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    fn row(&self, row: Row) -> Option<&Control> {
+        match row {
+            Row::NoClients => Some(&self.no_clients),
+            Row::ChatGpt => Some(&self.chatgpt),
+            Row::OpenAiManual => Some(&self.openai_manual),
+            Row::Claude => Some(&self.claude),
+            Row::Cowork => Some(&self.cowork),
+            Row::Separator => None,
+            Row::Refresh => Some(&self.refresh_plugins),
+        }
+    }
 }
 
 /// What happens once the person has answered a prompt.
@@ -91,7 +180,6 @@ pub struct Prompt {
 }
 
 /// One menu entry as a window draws it; activating it is the menu event `id`.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Control {
     pub id: MenuId,
@@ -122,9 +210,8 @@ pub struct App<S: Shell> {
     runtime: Option<Runtime>,
     pub problem: Option<String>,
     items: Items,
-    pub menu: Menu,
-    status_visible: bool,
-    retry_visible: bool,
+    /// The native menu, once a shell has asked for it on its own thread.
+    native: Option<NativeMenu>,
     origin: Instant,
     activity: Option<WorkActivity>,
     pub next_refresh: Instant,
@@ -170,67 +257,15 @@ fn host_index(host: install::Host) -> usize {
     }
 }
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-fn control(item: &MenuItem) -> Control {
-    Control {
-        id: item.id().clone(),
-        label: item.text(),
-        enabled: item.is_enabled(),
-        checked: None,
-    }
-}
-
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-fn check_control(item: &CheckMenuItem) -> Control {
-    Control {
-        id: item.id().clone(),
-        label: item.text(),
-        enabled: item.is_enabled(),
-        checked: Some(item.is_checked()),
-    }
-}
-
 impl<S: Shell> App<S> {
     pub fn new(shell: S, layout: Layout, terminate: Arc<AtomicBool>) -> Self {
-        let items = Items {
-            status: MenuItem::new("Attention needed", true, None),
-            integrations: Submenu::new("Integrations", true),
-            no_clients: MenuItem::new("Checking clients…", false, None),
-            chatgpt: CheckMenuItem::new("OpenAI local plugin · checking…", false, false, None),
-            openai_manual: MenuItem::new("OpenAI plugin · CLI unavailable…", false, None),
-            claude: CheckMenuItem::new("Claude Code plugin · checking…", false, false, None),
-            cowork: MenuItem::new("Manage Cowork plugin…", false, None),
-            refresh_plugins: MenuItem::new("Refresh plugin status…", false, None),
-            login: CheckMenuItem::new("Open at login", true, false, None),
-            pause_sync: MenuItem::new("Pause sync", false, None),
-            retry_services: MenuItem::new("Retry services", false, None),
-            storage_folder: MenuItem::new("Show storage folder", false, None),
-            quit: MenuItem::new("Quit Erlkonig", true, None),
-        };
-        items
-            .integrations
-            .append_items(&[&items.no_clients, &items.refresh_plugins])
-            .expect("integrations menu");
-        let menu = Menu::new();
-        menu.append_items(&[
-            &items.pause_sync,
-            &PredefinedMenuItem::separator(),
-            &items.integrations,
-            &items.storage_folder,
-            &PredefinedMenuItem::separator(),
-            &items.login,
-            &items.quit,
-        ])
-        .expect("menu");
         App {
             shell,
             layout,
             runtime: None,
             problem: None,
-            items,
-            menu,
-            status_visible: false,
-            retry_visible: false,
+            items: Items::new(),
+            native: None,
             origin: Instant::now(),
             activity: None,
             next_refresh: Instant::now(),
@@ -245,6 +280,24 @@ impl<S: Shell> App<S> {
             prompts: VecDeque::new(),
             #[cfg(test)]
             test_url: None,
+        }
+    }
+
+    /// The native menu for the platform's status item, built on first call.
+    /// Call it only on the thread that runs the event loop: from then on
+    /// every refresh brings it in line with the app's state.
+    pub fn native_menu(&mut self) -> Menu {
+        let items = &self.items;
+        self.native
+            .get_or_insert_with(|| NativeMenu::new(items))
+            .menu
+            .clone()
+    }
+
+    /// Bring the native menu, if there is one, in line with the model.
+    fn sync_native(&mut self) {
+        if let Some(native) = &mut self.native {
+            native.sync(&self.items);
         }
     }
 
@@ -366,28 +419,20 @@ impl<S: Shell> App<S> {
     /// The menu as it is right now, plus the oldest unanswered prompt.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn view(&self) -> View {
-        let integrations = self
-            .items
-            .integrations
-            .items()
-            .iter()
-            .filter_map(|item| match item {
-                MenuItemKind::MenuItem(item) => Some(control(item)),
-                MenuItemKind::Check(item) => Some(check_control(item)),
-                _ => None,
-            })
-            .collect();
+        let items = &self.items;
         View {
-            attention: self.status_visible.then(|| control(&self.items.status)),
+            attention: items.status_visible.then(|| items.status.clone()),
             details: self.details(),
-            sync: control(&self.items.pause_sync),
-            retry: self
-                .retry_visible
-                .then(|| control(&self.items.retry_services)),
-            integrations,
-            storage: control(&self.items.storage_folder),
-            login: check_control(&self.items.login),
-            quit: control(&self.items.quit),
+            sync: items.pause_sync.clone(),
+            retry: items.retry_visible.then(|| items.retry_services.clone()),
+            integrations: items
+                .rows
+                .iter()
+                .filter_map(|row| items.row(*row).cloned())
+                .collect(),
+            storage: items.storage_folder.clone(),
+            login: items.login.clone(),
+            quit: items.quit.clone(),
             prompt: self.prompts.front().cloned(),
         }
     }
@@ -398,8 +443,15 @@ impl<S: Shell> App<S> {
         }
     }
 
-    /// One refresh step; true once the event loop should exit.
+    /// One refresh step; true once the event loop should exit. The native
+    /// menu, if any, shows the resulting state.
     pub fn tick(&mut self) -> bool {
+        let exit = self.step();
+        self.sync_native();
+        exit
+    }
+
+    fn step(&mut self) -> bool {
         if self.terminate.load(Ordering::Relaxed) && self.quitting.is_none() {
             self.quit();
         }
@@ -414,13 +466,12 @@ impl<S: Shell> App<S> {
                 );
                 std::process::exit(1);
             }
-            self.items
-                .quit
-                .set_text(if since.elapsed() < Duration::from_secs(5) {
-                    "Shutting down…"
-                } else {
-                    "Finishing work…"
-                });
+            self.items.quit.label = if since.elapsed() < Duration::from_secs(5) {
+                "Shutting down…"
+            } else {
+                "Finishing work…"
+            }
+            .into();
             if self.runtime.as_ref().is_none_or(Runtime::is_finished)
                 && self
                     .plugin_task
@@ -458,66 +509,36 @@ impl<S: Shell> App<S> {
                 .or(self.plugin_error.as_ref().map(|_| "Plugin problem"))
         };
         if let Some(label) = attention {
-            self.items.status.set_text(label);
-            if !self.status_visible {
-                self.menu
-                    .insert(&self.items.status, 0)
-                    .expect("insert attention item");
-                self.status_visible = true;
-            }
-        } else if self.status_visible {
-            self.menu
-                .remove(&self.items.status)
-                .expect("remove attention item");
-            self.status_visible = false;
+            self.items.status.label = label.into();
         }
+        self.items.status_visible = attention.is_some();
         let retry_visible = status.as_ref().is_some_and(|s| {
             s.config_problem.is_none()
                 && s.node.services == erlkonig_core::status::ServiceState::Stopped
         });
         let retry_pending = status.as_ref().is_some_and(|s| s.node.retry_pending);
-        self.items.retry_services.set_text(if retry_pending {
+        self.items.retry_services.label = if retry_pending {
             "Retry requested…"
         } else {
             "Retry services"
-        });
-        self.items
-            .retry_services
-            .set_enabled(retry_visible && !retry_pending);
-        if retry_visible && !self.retry_visible {
-            self.menu
-                .insert(
-                    &self.items.retry_services,
-                    1 + usize::from(self.status_visible),
-                )
-                .expect("insert retry item");
-            self.retry_visible = true;
-        } else if !retry_visible && self.retry_visible {
-            self.menu
-                .remove(&self.items.retry_services)
-                .expect("remove retry item");
-            self.retry_visible = false;
         }
-        self.items.storage_folder.set_enabled(
-            self.runtime
-                .as_ref()
-                .and_then(|runtime| runtime.binding().storage_folder())
-                .is_some(),
-        );
-        self.items
-            .pause_sync
-            .set_enabled(status.as_ref().is_some_and(|s| s.config_problem.is_none()));
-        self.items
-            .pause_sync
-            .set_text(if status.as_ref().is_some_and(|s| s.node.sync_enabled) {
-                "Pause sync"
-            } else {
-                "Resume sync"
-            });
+        .into();
+        self.items.retry_services.enabled = retry_visible && !retry_pending;
+        self.items.retry_visible = retry_visible;
+        self.items.storage_folder.enabled = self
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.binding().storage_folder())
+            .is_some();
+        self.items.pause_sync.enabled = status.as_ref().is_some_and(|s| s.config_problem.is_none());
+        self.items.pause_sync.label = if status.as_ref().is_some_and(|s| s.node.sync_enabled) {
+            "Pause sync"
+        } else {
+            "Resume sync"
+        }
+        .into();
         self.update_plugin_items();
-        self.items
-            .login
-            .set_checked(self.shell.login() != Login::Off);
+        self.items.login.checked = Some(self.shell.login() != Login::Off);
         let now = self.origin.elapsed();
         crown::observe(
             &mut self.activity,
@@ -537,28 +558,24 @@ impl<S: Shell> App<S> {
         if let Some(task) = &self.plugin_task {
             task.cancel.store(true, Ordering::Relaxed);
         }
-        self.items.chatgpt.set_enabled(false);
-        self.items.claude.set_enabled(false);
+        let items = &mut self.items;
         for item in [
-            &self.items.openai_manual,
-            &self.items.cowork,
-            &self.items.refresh_plugins,
-            &self.items.storage_folder,
-            &self.items.quit,
+            &mut items.chatgpt,
+            &mut items.claude,
+            &mut items.openai_manual,
+            &mut items.cowork,
+            &mut items.refresh_plugins,
+            &mut items.storage_folder,
+            &mut items.quit,
+            &mut items.login,
+            &mut items.status,
+            &mut items.pause_sync,
+            &mut items.retry_services,
+            &mut items.integrations,
         ] {
-            item.set_enabled(false);
+            item.enabled = false;
         }
-        self.items.login.set_enabled(false);
-        self.items.status.set_enabled(false);
-        self.items.pause_sync.set_enabled(false);
-        self.items.retry_services.set_enabled(false);
-        if self.retry_visible {
-            self.menu
-                .remove(&self.items.retry_services)
-                .expect("remove retry item");
-            self.retry_visible = false;
-        }
-        self.items.integrations.set_enabled(false);
+        items.retry_visible = false;
         if let Some(runtime) = &self.runtime {
             runtime.begin_shutdown();
         }
@@ -671,60 +688,46 @@ impl<S: Shell> App<S> {
         }
     }
 
-    fn rebuild_integrations(&self) {
-        let menu = &self.items.integrations;
-        while menu.remove_at(0).is_some() {}
+    fn rebuild_integrations(&mut self) {
+        let mut rows = Vec::new();
         match &self.clients {
             Some(clients) => {
                 if clients.openai_label().is_some() {
                     if clients.openai_cli.is_some() {
-                        let _ = menu.append(&self.items.chatgpt);
+                        rows.push(Row::ChatGpt);
                     } else {
-                        let _ = menu.append(&self.items.openai_manual);
+                        rows.push(Row::OpenAiManual);
                     }
                 }
                 if clients.claude_cli.is_some() {
-                    let _ = menu.append(&self.items.claude);
+                    rows.push(Row::Claude);
                 }
                 if clients.claude_desktop {
-                    let _ = menu.append(&self.items.cowork);
+                    rows.push(Row::Cowork);
                 }
                 if !clients.any() {
-                    self.items
-                        .no_clients
-                        .set_text("No supported clients detected");
-                    let _ = menu.append(&self.items.no_clients);
+                    self.items.no_clients.label = "No supported clients detected".into();
+                    rows.push(Row::NoClients);
                 }
             }
             None => {
-                self.items
-                    .no_clients
-                    .set_text(if self.plugin_task.is_some() {
-                        "Checking clients…"
-                    } else {
-                        "Client detection unavailable"
-                    });
-                let _ = menu.append(&self.items.no_clients);
+                self.items.no_clients.label = if self.plugin_task.is_some() {
+                    "Checking clients…"
+                } else {
+                    "Client detection unavailable"
+                }
+                .into();
+                rows.push(Row::NoClients);
             }
         }
-        let _ = menu.append_items(&[
-            &PredefinedMenuItem::separator(),
-            &self.items.refresh_plugins,
-        ]);
+        rows.extend([Row::Separator, Row::Refresh]);
+        self.items.rows = rows;
     }
 
-    fn update_plugin_items(&self) {
-        for (host, item) in [
-            (install::Host::OpenAi, &self.items.chatgpt),
-            (install::Host::ClaudeCode, &self.items.claude),
-        ] {
+    fn update_plugin_items(&mut self) {
+        for host in [install::Host::OpenAi, install::Host::ClaudeCode] {
             let state = self.plugin_states[host_index(host)].as_ref();
             let (checked, actionable, suffix) = install::inventory_menu_state(state);
-            if let Some(checked) = checked {
-                item.set_checked(checked);
-            }
-            // On an error retain the last-known check, disable the control and
-            // explicitly mark uncertainty instead of claiming uninstallation.
             let label = (host == install::Host::OpenAi)
                 .then(|| {
                     self.clients
@@ -733,32 +736,35 @@ impl<S: Shell> App<S> {
                 })
                 .flatten()
                 .unwrap_or_else(|| host.label().into());
-            item.set_text(format!("{label} · {suffix}"));
-            item.set_enabled(self.plugin_task.is_none() && actionable);
+            let item = match host {
+                install::Host::OpenAi => &mut self.items.chatgpt,
+                install::Host::ClaudeCode => &mut self.items.claude,
+            };
+            // On an error retain the last-known check, disable the control and
+            // explicitly mark uncertainty instead of claiming uninstallation.
+            if let Some(checked) = checked {
+                item.checked = Some(checked);
+            }
+            item.label = format!("{label} · {suffix}");
+            item.enabled = self.plugin_task.is_none() && actionable;
         }
         if let Some(label) = self
             .clients
             .as_ref()
             .and_then(|clients| clients.openai_label())
         {
-            self.items
-                .openai_manual
-                .set_text(format!("{label} · CLI unavailable…"));
+            self.items.openai_manual.label = format!("{label} · CLI unavailable…");
         }
-        self.items
-            .openai_manual
-            .set_enabled(self.plugin_task.is_none());
-        self.items
-            .refresh_plugins
-            .set_text(if self.plugin_task.is_some() {
-                "Checking / updating plugins…"
-            } else {
-                "Refresh plugin status…"
-            });
-        self.items
-            .refresh_plugins
-            .set_enabled(self.plugin_task.is_none());
-        self.items.cowork.set_enabled(self.plugin_task.is_none());
+        let idle = self.plugin_task.is_none();
+        self.items.openai_manual.enabled = idle;
+        self.items.refresh_plugins.label = if idle {
+            "Refresh plugin status…"
+        } else {
+            "Checking / updating plugins…"
+        }
+        .into();
+        self.items.refresh_plugins.enabled = idle;
+        self.items.cowork.enabled = idle;
     }
 
     fn finish_plugin_task(&mut self) {
@@ -852,9 +858,10 @@ impl<S: Shell> App<S> {
         if self.plugin_task.is_some() || self.quitting.is_some() {
             return;
         }
-        // AppKit toggles a check item immediately; restore observed state until
-        // the client has actually confirmed the requested mutation.
-        self.update_plugin_items();
+        // The platform may already have toggled the native check mark. The
+        // decision comes from the last inventory, never from that mark, and
+        // the next sync restores the mark to the model until the client has
+        // confirmed the change.
         let Some(Ok(state)) = self.plugin_states[host_index(host)].clone() else {
             return;
         };
@@ -1075,12 +1082,17 @@ impl<S: Shell> App<S> {
 
     /// Handle one menu (or window) activation; the caller refreshes next.
     pub fn on_menu(&mut self, event: MenuEvent) {
+        // A check item may have toggled itself natively before this event
+        // arrived: the next sync re-applies the whole model.
+        if let Some(native) = &mut self.native {
+            native.invalidate();
+        }
         let id = event.id();
-        if id == self.items.quit.id() {
+        if id == &self.items.quit.id {
             self.quit();
-        } else if id == self.items.pause_sync.id() {
+        } else if id == &self.items.pause_sync.id {
             self.toggle_sync();
-        } else if id == self.items.retry_services.id() {
+        } else if id == &self.items.retry_services.id {
             if let Some(Err(error)) = self.runtime.as_ref().map(Runtime::retry_services) {
                 self.ask(
                     "Services not retried",
@@ -1089,26 +1101,26 @@ impl<S: Shell> App<S> {
                     Then::Nothing,
                 );
             }
-        } else if id == self.items.storage_folder.id() {
+        } else if id == &self.items.storage_folder.id {
             self.show_storage_folder();
-        } else if id == self.items.chatgpt.id() {
+        } else if id == &self.items.chatgpt.id {
             self.plugin_action(install::Host::OpenAi);
-        } else if id == self.items.openai_manual.id() {
+        } else if id == &self.items.openai_manual.id {
             self.ask(
                 "Codex CLI not found",
                 "Erlkonig installs this plugin with the Codex CLI. Install it, then choose Refresh plugin status.",
                 &["OK"],
                 Then::Nothing,
             );
-        } else if id == self.items.claude.id() {
+        } else if id == &self.items.claude.id {
             self.plugin_action(install::Host::ClaudeCode);
-        } else if id == self.items.cowork.id() {
+        } else if id == &self.items.cowork.id {
             self.manage_cowork();
-        } else if id == self.items.refresh_plugins.id() {
+        } else if id == &self.items.refresh_plugins.id {
             self.check_plugins();
-        } else if id == self.items.login.id() {
+        } else if id == &self.items.login.id {
             self.toggle_login();
-        } else if id == self.items.status.id() {
+        } else if id == &self.items.status.id {
             let text = self.details();
             self.ask("Erlkonig", &text, &["OK"], Then::Nothing);
         }
@@ -1305,6 +1317,227 @@ mod tests {
         app.on_menu(MenuEvent { id });
         assert_eq!(*log.borrow(), ["login false"].map(String::from).to_vec());
     }
+    /// AppKit refuses native menu objects off its main thread, and libtest
+    /// runs each test on a worker: the app's state never needs one.
+    #[test]
+    fn the_app_runs_on_any_thread_without_native_menu_objects() {
+        std::thread::spawn(|| {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut app = app(Fake {
+                login: Some(Login::On),
+                log: log.clone(),
+                ..Fake::default()
+            });
+            app.problem = Some("Cannot create menu: no host".into());
+            assert!(!app.tick());
+            let view = app.view();
+            app.on_menu(MenuEvent { id: view.login.id });
+            let attention = view.attention.expect("attention shown");
+            app.on_menu(MenuEvent { id: attention.id });
+            app.answer(0);
+            let clients = install::ClientAvailability {
+                claude_cli: Some("/nonexistent/claude".into()),
+                ..Default::default()
+            };
+            report(&mut app, clients, [None, Some(Ok(absent()))], Vec::new());
+            app.answer(1);
+            app.on_menu(MenuEvent { id: view.quit.id });
+            assert!(app.tick());
+            assert!(app.native.is_none(), "no native menu was created");
+            assert_eq!(alerts(&log), ["alert Erlkonig", "alert Integrate Erlkonig"]);
+            assert!(log.borrow().contains(&"login false".to_owned()));
+        })
+        .join()
+        .expect("the scenario runs on a worker thread");
+    }
+
+    #[cfg(target_os = "linux")]
+    type NativeRow = (String, bool, Option<bool>);
+
+    /// The native entries as (label, enabled, checked); "—" is a separator.
+    #[cfg(target_os = "linux")]
+    fn native_rows(items: &[tray_icon::menu::MenuItemKind]) -> Vec<NativeRow> {
+        use tray_icon::menu::MenuItemKind as Kind;
+        items
+            .iter()
+            .map(|item| match item {
+                Kind::MenuItem(i) => (i.text(), i.is_enabled(), None),
+                Kind::Check(i) => (i.text(), i.is_enabled(), Some(i.is_checked())),
+                Kind::Submenu(i) => (i.text(), i.is_enabled(), None),
+                Kind::Predefined(_) => ("—".into(), true, None),
+                Kind::Icon(i) => (i.text(), i.is_enabled(), None),
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn row(label: &str, enabled: bool, checked: Option<bool>) -> NativeRow {
+        (label.into(), enabled, checked)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn integrations_submenu(menu: &Menu) -> tray_icon::menu::Submenu {
+        menu.items()
+            .into_iter()
+            .find_map(|item| match item {
+                tray_icon::menu::MenuItemKind::Submenu(submenu) => Some(submenu),
+                _ => None,
+            })
+            .expect("integrations submenu")
+    }
+
+    /// The native menu is built on request and follows the model on every
+    /// refresh, including a check mark the platform toggled on a click.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_native_menu_is_a_projection_of_the_model() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut app = app(Fake {
+            log: log.clone(),
+            ..Fake::default()
+        });
+        assert!(app.native.is_none());
+        let menu = app.native_menu();
+        let sep = || row("—", true, None);
+        assert_eq!(
+            native_rows(&menu.items()),
+            [
+                row("Pause sync", false, None),
+                sep(),
+                row("Integrations", true, None),
+                row("Show storage folder", false, None),
+                sep(),
+                row("Open at login", true, Some(false)),
+                row("Quit Erlkonig", true, None),
+            ]
+        );
+        assert_eq!(
+            native_rows(&integrations_submenu(&menu).items()),
+            [
+                row("Checking clients…", false, None),
+                row("Refresh plugin status…", false, None),
+            ]
+        );
+
+        // Text, enabled and checked follow the model on the next refresh.
+        app.problem = Some("no services".into());
+        app.shell.login = Some(Login::On);
+        assert!(!app.tick());
+        let top = native_rows(&menu.items());
+        assert_eq!(top[0], row("Attention needed", true, None));
+        assert_eq!(top[1], row("Resume sync", false, None));
+        assert_eq!(top[6], row("Open at login", true, Some(true)));
+        assert_eq!(
+            native_rows(&integrations_submenu(&menu).items())[1],
+            row("Refresh plugin status…", true, None)
+        );
+
+        // A click toggles the native mark before its event arrives. The
+        // intent comes from the observed state, and the mark is restored.
+        let login = menu
+            .items()
+            .into_iter()
+            .find_map(|item| match item {
+                tray_icon::menu::MenuItemKind::Check(item) => Some(item),
+                _ => None,
+            })
+            .expect("login item");
+        assert_eq!(login.id(), &app.view().login.id);
+        login.set_checked(false);
+        app.on_menu(MenuEvent {
+            id: login.id().clone(),
+        });
+        assert!(!app.tick());
+        let logins = log
+            .borrow()
+            .iter()
+            .filter(|line| line.starts_with("login "))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(logins, ["login false"]);
+        assert!(
+            login.is_checked(),
+            "the mark shows the observed state again"
+        );
+
+        // Integration entries appear and disappear with the clients.
+        app.clients = Some(install::ClientAvailability {
+            claude_cli: Some("/nonexistent/claude".into()),
+            claude_desktop: true,
+            ..Default::default()
+        });
+        app.plugin_states[1] = Some(Ok(install::Inventory {
+            installed: true,
+            enabled: true,
+            ..absent()
+        }));
+        app.rebuild_integrations();
+        app.update_plugin_items();
+        app.sync_native();
+        let claude = &app.items.claude;
+        assert!(claude.label.starts_with("Claude Code plugin · "));
+        assert_eq!(
+            native_rows(&integrations_submenu(&menu).items()),
+            [
+                row(&claude.label, claude.enabled, Some(true)),
+                row("Manage Cowork plugin…", true, None),
+                sep(),
+                row("Refresh plugin status…", true, None),
+            ]
+        );
+        app.clients = Some(Default::default());
+        app.rebuild_integrations();
+        app.sync_native();
+        assert_eq!(
+            native_rows(&integrations_submenu(&menu).items()),
+            [
+                row("No supported clients detected", false, None),
+                sep(),
+                row("Refresh plugin status…", true, None),
+            ]
+        );
+
+        // The attention and retry items come and go in their places.
+        app.items.retry_visible = true;
+        app.items.retry_services.enabled = true;
+        app.sync_native();
+        assert_eq!(
+            native_rows(&menu.items())[..3],
+            [
+                row("Attention needed", true, None),
+                row("Resume sync", false, None),
+                row("Retry services", true, None),
+            ]
+        );
+        app.items.status_visible = false;
+        app.sync_native();
+        assert_eq!(
+            native_rows(&menu.items())[..2],
+            [
+                row("Resume sync", false, None),
+                row("Retry services", true, None),
+            ]
+        );
+        app.items.status_visible = true;
+        app.sync_native();
+        assert_eq!(native_rows(&menu.items())[0].0, "Attention needed");
+        assert_eq!(native_rows(&menu.items())[2].0, "Retry services");
+
+        // Quit relabels Quit and disables every entry, retry included.
+        app.on_menu(MenuEvent {
+            id: app.items.quit.id.clone(),
+        });
+        assert!(app.tick());
+        let top = native_rows(&menu.items());
+        assert_eq!(top.last(), Some(&row("Shutting down…", false, None)));
+        assert!(!top.iter().any(|(label, _, _)| label == "Retry services"));
+        assert!(
+            top.iter()
+                .filter(|(label, _, _)| label != "—")
+                .all(|(_, enabled, _)| !enabled),
+            "{top:?}"
+        );
+    }
 
     const URL: &str = "http://127.0.0.1:41773/";
 
@@ -1398,7 +1631,7 @@ mod tests {
         app.rebuild_integrations();
         app.update_plugin_items();
         assert_eq!(
-            app.items.claude.is_checked(),
+            checked(&app.items.claude),
             installed,
             "{:?}",
             app.plugin_states[1]
@@ -1406,8 +1639,13 @@ mod tests {
         (app, claude)
     }
 
+    /// A check item's mark in the model.
+    fn checked(control: &Control) -> bool {
+        control.checked.expect("a check item")
+    }
+
     fn click_claude(app: &mut App<Fake>) {
-        let id = app.items.claude.id().clone();
+        let id = app.items.claude.id.clone();
         app.on_menu(MenuEvent { id });
     }
 
@@ -1434,7 +1672,7 @@ mod tests {
             ])),
             "{calls:?}"
         );
-        assert!(app.items.claude.is_checked());
+        assert!(checked(&app.items.claude));
         assert_eq!(alerts(&log), Vec::<String>::new());
         assert_eq!(app.view().prompt, None);
     }
@@ -1467,7 +1705,7 @@ mod tests {
                 .iter()
                 .any(|call| call.contains(&"install".to_owned()))
         );
-        assert!(!app.items.claude.is_checked());
+        assert!(!checked(&app.items.claude));
         assert_eq!(alerts(&log), Vec::<String>::new());
     }
 
@@ -1484,7 +1722,7 @@ mod tests {
         let (mut app, _claude) = plugin_app(temp.path(), shell, false);
         click_claude(&mut app);
         settle(&mut app);
-        assert!(app.items.claude.is_checked());
+        assert!(checked(&app.items.claude));
         assert_eq!(alerts(&log), Vec::<String>::new());
     }
 
@@ -1512,7 +1750,7 @@ mod tests {
             "{}",
             app.view().details
         );
-        assert!(!app.items.claude.is_checked());
+        assert!(!checked(&app.items.claude));
     }
 
     type States = [Option<Result<install::Inventory, String>>; 2];
@@ -1731,7 +1969,7 @@ mod tests {
                 codex_list,
             ]
         );
-        assert!(app.items.claude.is_checked() && app.items.chatgpt.is_checked());
+        assert!(checked(&app.items.claude) && checked(&app.items.chatgpt));
         assert_eq!(alerts(&log), ["alert Integrate Erlkonig"]);
         assert_eq!(app.view().prompt, None);
     }
@@ -1750,7 +1988,7 @@ mod tests {
         settle(&mut app);
         assert!(take_argv(&claude).is_empty() && take_argv(&codex).is_empty());
         assert_eq!(data_entries(&layout), before, "nothing is stored");
-        assert!(!app.items.claude.is_checked());
+        assert!(!checked(&app.items.claude));
         // The next run asks again while nothing is connected.
         let (mut next, _, _) = unconnected(temp.path(), &log);
         inventory(&mut next, claude, codex);
@@ -1803,7 +2041,7 @@ mod tests {
             "{calls:?}"
         );
         assert_eq!(alerts(&log), ["alert Plugin not updated"]);
-        assert!(app.items.chatgpt.is_checked() && app.items.claude.is_checked());
+        assert!(checked(&app.items.chatgpt) && checked(&app.items.claude));
     }
 
     #[test]
@@ -1845,8 +2083,8 @@ mod tests {
             calls.iter().all(|call| call.contains(&"list".to_owned())),
             "{calls:?}"
         );
-        assert!(app.items.claude.is_checked());
-        assert!(!app.items.chatgpt.is_checked());
+        assert!(checked(&app.items.claude));
+        assert!(!checked(&app.items.chatgpt));
         let staged = install::marketplace_root(&layout).join("claude/.mcp.json");
         let staged = std::fs::read_to_string(staged).unwrap();
         let exe = std::env::current_exe().unwrap();
@@ -1890,6 +2128,6 @@ mod tests {
                 "{calls:?}"
             );
         }
-        assert!(app.items.claude.is_checked() && app.items.chatgpt.is_checked());
+        assert!(checked(&app.items.claude) && checked(&app.items.chatgpt));
     }
 }

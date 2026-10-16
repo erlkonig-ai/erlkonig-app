@@ -200,7 +200,7 @@ impl ApplicationHandler<UserEvent> for Linux {
         if cause == StartCause::Init {
             let mut builder = TrayIconBuilder::new()
                 .with_id(bus::NAME)
-                .with_menu(Box::new(self.app.menu.clone()))
+                .with_menu(Box::new(self.app.native_menu()))
                 .with_tooltip("Erlkonig")
                 .with_title("Erlkonig");
             if let Some(icon) = tray_icon(false, self.app.shell.colour) {
