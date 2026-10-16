@@ -177,7 +177,10 @@ same pile. There is no parallel mutable workspace database, and raw credentials
 are never stored as facts.
 
 `erlkonig-core` owns configuration, credentials, lifecycle and client setup.
-`erlkonig` owns the macOS menu and crown. `faculties`, `trible` and
+`erlkonig-app` owns the platform-neutral menu state, crown geometry and
+command-line dispatch. `erlkonig-mac` (the macOS menu and AppKit crown) and
+`erlkonig-linux` (the Linux tray and status window) are the platform binaries;
+both are installed as the `erlkonig` command. `faculties`, `trible` and
 `triblespace-net` are linked libraries, not launched commands. The node's
 single sync owner provides its durable Peer and enabled maintenance. With
 sync paused, maintenance is local-only and starts no acquisition networking.
@@ -369,7 +372,10 @@ reads add no network traffic. There is no animation-preview mode.
 Use `scripts/validate-native.sh` for the scoped, reserved Mac release test/build
 lane. It uses Rust 1.98, four nice'd jobs and a disposable target directory.
 `scripts/bundle.sh --release-dir DIR --out DIR` assembles and signs a bundle
-containing only `Contents/MacOS/erlkonig`. It does not launch or install it.
+containing only `Contents/MacOS/erlkonig`, copied from the `erlkonig-mac` build
+in DIR. It does not launch or install it. On Linux,
+`scripts/linux/package-tarball.sh` packs the `erlkonig-linux` build as
+`erlkonig` with `install-user.sh`.
 
 `scripts/accept.sh APP` checks that signed bundle's inventory. Native lifecycle
 tests use temporary piles and a test-harness fixture, not a production headless
