@@ -22,7 +22,7 @@ use winit::event_loop::ActiveEventLoop;
 
 /// Observed state of the platform's start-at-login registration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Login {
+pub enum Login {
     Off,
     On,
     /// Registered but waiting for the person's approval (macOS only).
@@ -30,7 +30,7 @@ pub(crate) enum Login {
 }
 
 /// What only the platform can do. Everything else lives in [`App`].
-pub(crate) trait Shell {
+pub trait Shell {
     /// A native modal answers with the pressed button's index. A shell that
     /// draws its prompts itself returns `None`: [`App`] then queues the prompt
     /// and the shell answers later through [`App::answer`].
@@ -53,25 +53,25 @@ pub(crate) trait Shell {
     fn show_window(&mut self);
 }
 
-pub(crate) struct Items {
-    pub(crate) status: MenuItem,
-    pub(crate) integrations: Submenu,
-    pub(crate) no_clients: MenuItem,
-    pub(crate) chatgpt: CheckMenuItem,
-    pub(crate) openai_manual: MenuItem,
-    pub(crate) claude: CheckMenuItem,
-    pub(crate) cowork: MenuItem,
-    pub(crate) refresh_plugins: MenuItem,
-    pub(crate) login: CheckMenuItem,
-    pub(crate) pause_sync: MenuItem,
-    pub(crate) retry_services: MenuItem,
-    pub(crate) storage_folder: MenuItem,
-    pub(crate) quit: MenuItem,
+pub struct Items {
+    pub status: MenuItem,
+    pub integrations: Submenu,
+    pub no_clients: MenuItem,
+    pub chatgpt: CheckMenuItem,
+    pub openai_manual: MenuItem,
+    pub claude: CheckMenuItem,
+    pub cowork: MenuItem,
+    pub refresh_plugins: MenuItem,
+    pub login: CheckMenuItem,
+    pub pause_sync: MenuItem,
+    pub retry_services: MenuItem,
+    pub storage_folder: MenuItem,
+    pub quit: MenuItem,
 }
 
 /// What happens once the person has answered a prompt.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Then {
+pub enum Then {
     Nothing,
     /// Button 0 opens the account plugin page and, if given, reveals the archive.
     Cowork(Option<PathBuf>),
@@ -87,51 +87,51 @@ pub(crate) enum Then {
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Prompt {
-    pub(crate) title: String,
-    pub(crate) text: String,
-    pub(crate) buttons: Vec<String>,
+pub struct Prompt {
+    pub title: String,
+    pub text: String,
+    pub buttons: Vec<String>,
     then: Then,
 }
 
 /// One menu entry as a window draws it; activating it is the menu event `id`.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Control {
-    pub(crate) id: MenuId,
-    pub(crate) label: String,
-    pub(crate) enabled: bool,
+pub struct Control {
+    pub id: MenuId,
+    pub label: String,
+    pub enabled: bool,
     /// `Some` for a check item.
-    pub(crate) checked: Option<bool>,
+    pub checked: Option<bool>,
 }
 
 /// The menu's current state, for a window that shows the same thing.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct View {
-    pub(crate) attention: Option<Control>,
-    pub(crate) details: String,
-    pub(crate) sync: Control,
-    pub(crate) retry: Option<Control>,
-    pub(crate) integrations: Vec<Control>,
-    pub(crate) storage: Control,
-    pub(crate) login: Control,
-    pub(crate) quit: Control,
-    pub(crate) prompt: Option<Prompt>,
+pub struct View {
+    pub attention: Option<Control>,
+    pub details: String,
+    pub sync: Control,
+    pub retry: Option<Control>,
+    pub integrations: Vec<Control>,
+    pub storage: Control,
+    pub login: Control,
+    pub quit: Control,
+    pub prompt: Option<Prompt>,
 }
 
-pub(crate) struct App<S: Shell> {
-    pub(crate) shell: S,
+pub struct App<S: Shell> {
+    pub shell: S,
     layout: Layout,
     runtime: Option<Runtime>,
-    pub(crate) problem: Option<String>,
+    pub problem: Option<String>,
     items: Items,
-    pub(crate) menu: Menu,
+    pub menu: Menu,
     status_visible: bool,
     retry_visible: bool,
     origin: Instant,
     activity: Option<WorkActivity>,
-    pub(crate) next_refresh: Instant,
+    pub next_refresh: Instant,
     quitting: Option<Instant>,
     terminate: Arc<AtomicBool>,
     plugin_states: [Option<Result<install::Inventory, String>>; 2],
@@ -182,7 +182,7 @@ fn check_control(item: &CheckMenuItem) -> Control {
 }
 
 impl<S: Shell> App<S> {
-    pub(crate) fn new(shell: S, layout: Layout, terminate: Arc<AtomicBool>) -> Self {
+    pub fn new(shell: S, layout: Layout, terminate: Arc<AtomicBool>) -> Self {
         let items = Items {
             status: MenuItem::new("Attention needed", true, None),
             integrations: Submenu::new("Integrations", true),
@@ -235,7 +235,7 @@ impl<S: Shell> App<S> {
     }
 
     /// Start native services once the platform's status item exists.
-    pub(crate) fn start(&mut self) {
+    pub fn start(&mut self) {
         if std::env::current_exe().is_ok_and(|p| paths::is_translocated(&p)) {
             self.problem = Some("Move Erlkonig to Applications, then open it again.".into());
         } else {
@@ -249,13 +249,13 @@ impl<S: Shell> App<S> {
 
     /// The monotonic origin the crown's activity is measured against.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub(crate) fn origin(&self) -> Instant {
+    pub fn origin(&self) -> Instant {
         self.origin
     }
 
     /// Show a prompt and continue with `then` once it is answered: at once
     /// for a native modal, or when the shell later calls [`Self::answer`].
-    pub(crate) fn ask(&mut self, title: &str, text: &str, buttons: &[&str], then: Then) {
+    pub fn ask(&mut self, title: &str, text: &str, buttons: &[&str], then: Then) {
         match self.shell.alert(title, text, buttons) {
             Some(answer) => self.follow(then, answer),
             None => {
@@ -272,7 +272,7 @@ impl<S: Shell> App<S> {
 
     /// The oldest queued prompt was answered with button `index`.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
-    pub(crate) fn answer(&mut self, index: usize) {
+    pub fn answer(&mut self, index: usize) {
         if let Some(prompt) = self.prompts.pop_front() {
             self.follow(prompt.then, index);
         }
@@ -323,7 +323,7 @@ impl<S: Shell> App<S> {
 
     /// The menu as it is right now, plus the oldest unanswered prompt.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
-    pub(crate) fn view(&self) -> View {
+    pub fn view(&self) -> View {
         let integrations = self
             .items
             .integrations
@@ -350,14 +350,14 @@ impl<S: Shell> App<S> {
         }
     }
 
-    pub(crate) fn refresh(&mut self, event_loop: &ActiveEventLoop) {
+    pub fn refresh(&mut self, event_loop: &ActiveEventLoop) {
         if self.tick() {
             event_loop.exit();
         }
     }
 
     /// One refresh step; true once the event loop should exit.
-    pub(crate) fn tick(&mut self) -> bool {
+    pub fn tick(&mut self) -> bool {
         if self.terminate.load(Ordering::Relaxed) && self.quitting.is_none() {
             self.quit();
         }
@@ -484,7 +484,7 @@ impl<S: Shell> App<S> {
         false
     }
 
-    pub(crate) fn quit(&mut self) {
+    pub fn quit(&mut self) {
         self.quitting.get_or_insert_with(Instant::now);
         self.shell.stop_crown(); // Invalidate display callbacks before service teardown.
         // Quit is final: unanswered prompts no longer lead anywhere.
@@ -523,7 +523,7 @@ impl<S: Shell> App<S> {
     /// (AppKit delivers LoopExiting synchronously from
     /// applicationWillTerminate), so drain here, with the same final
     /// process-exit deadline.
-    pub(crate) fn finish_termination(&mut self) {
+    pub fn finish_termination(&mut self) {
         self.shell.stop_crown();
         if let Some(task) = &self.plugin_task {
             task.cancel.store(true, Ordering::Relaxed);
@@ -947,7 +947,7 @@ impl<S: Shell> App<S> {
     }
 
     /// Handle one menu (or window) activation; the caller refreshes next.
-    pub(crate) fn on_menu(&mut self, event: MenuEvent) {
+    pub fn on_menu(&mut self, event: MenuEvent) {
         let id = event.id();
         if id == self.items.quit.id() {
             self.quit();

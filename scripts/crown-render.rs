@@ -3,9 +3,13 @@
 //! Does not create an application, window, status item, timer or network service.
 
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
-#[path = "../crates/erlkonig/src/crown.rs"]
-mod crown;
+#[path = "../crates/erlkonig/src/crown_image.rs"]
+mod crown_image;
+
+#[cfg(target_os = "macos")]
+use crown_image::TemplateImage;
+#[cfg(target_os = "macos")]
+use erlkonig_app::crown;
 
 #[cfg(target_os = "macos")]
 use objc2::{AnyThread, rc::Retained};
@@ -20,7 +24,7 @@ use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize};
 use std::{fmt::Write as _, path::Path, time::Duration};
 
 // The AppKit proof is macOS-only; on other systems the example still builds so
-// `cargo test -p erlkonig` can run the platform-neutral crown tests.
+// `cargo check --workspace --all-targets` covers every platform.
 #[cfg(not(target_os = "macos"))]
 fn main() {
     eprintln!("crown-render: the AppKit proof requires macOS");

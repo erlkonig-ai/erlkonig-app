@@ -1,6 +1,7 @@
 //! One view-bound native display link; no worker, polling timer or runtime state.
 
-use crate::crown::{self, WorkActivity};
+use crate::crown_image::TemplateImage;
+use erlkonig_app::crown::{self, WorkActivity};
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{NSCellImagePosition, NSImageScaling, NSStatusBarButton, NSWorkspace};

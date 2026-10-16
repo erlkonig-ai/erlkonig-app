@@ -2,7 +2,7 @@
 //! No application, status item, timer, service or network is created.
 
 #[allow(dead_code)]
-#[path = "../../../crates/erlkonig/src/crown.rs"]
+#[path = "../../../crates/erlkonig-app/src/crown.rs"]
 mod crown;
 
 use objc2::{AnyThread, rc::Retained};

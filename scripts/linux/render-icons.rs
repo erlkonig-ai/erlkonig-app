@@ -1,13 +1,10 @@
 //! Render the Linux app icons from the production crown geometry.
-//! cargo run --release -p erlkonig --example linux-icons -- OUTPUT_DIRECTORY
+//! cargo run --release -p erlkonig-app --example linux-icons -- OUTPUT_DIRECTORY
 //! Writes OUTPUT_DIRECTORY/<n>x<n>/apps/ai.erlkonig.app.png in the hicolor
 //! layout: a dark resting crown on a light rounded plate. No dependency; the
 //! PNG encoder below stores the pixels uncompressed.
 
-#[allow(dead_code)]
-#[path = "../../crates/erlkonig/src/crown.rs"]
-mod crown;
-
+use erlkonig_app::crown;
 use std::path::Path;
 use std::time::Duration;
 

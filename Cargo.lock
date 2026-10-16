@@ -2244,8 +2244,8 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "erlkonig-app",
  "erlkonig-core",
- "hex",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
@@ -2257,6 +2257,15 @@ dependencies = [
  "wgpu",
  "winit",
  "zbus",
+]
+
+[[package]]
+name = "erlkonig-app"
+version = "0.1.0"
+dependencies = [
+ "erlkonig-core",
+ "tray-icon",
+ "winit",
 ]
 
 [[package]]

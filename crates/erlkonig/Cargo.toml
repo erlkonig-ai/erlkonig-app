@@ -11,14 +11,10 @@ publish.workspace = true
 name = "crown-render"
 path = "../../scripts/crown-render.rs"
 
-[[example]]
-name = "linux-icons"
-path = "../../scripts/linux/render-icons.rs"
-
 [dependencies]
 erlkonig-core.workspace = true
+erlkonig-app.workspace = true
 signal-hook.workspace = true
-hex.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon.workspace = true

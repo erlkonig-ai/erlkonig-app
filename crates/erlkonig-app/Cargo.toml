@@ -1,0 +1,25 @@
+[package]
+name = "erlkonig-app"
+description = "The platform-neutral Erlkonig app: menu state, crown and CLI dispatch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[example]]
+name = "linux-icons"
+path = "../../scripts/linux/render-icons.rs"
+
+[dependencies]
+erlkonig-core.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon.workspace = true
+winit.workspace = true
+
+# tray-icon and winit refuse to compile on Linux without a backend. These are
+# the minimum for this library on its own; erlkonig-linux selects the rest.
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { workspace = true, features = ["ksni"] }
+winit = { workspace = true, features = ["x11"] }

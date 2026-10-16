@@ -6,8 +6,8 @@ mod autostart;
 mod bus;
 mod window;
 
-use crate::app::{App, Login, Shell};
-use crate::crown::{self, WorkActivity};
+use erlkonig_app::app::{App, Login, Shell};
+use erlkonig_app::crown::{self, WorkActivity};
 use erlkonig_core::paths::{self, Layout};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

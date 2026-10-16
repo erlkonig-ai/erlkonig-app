@@ -2,10 +2,10 @@
 //! that a native modal alert shows on macOS. egui in a winit window, drawn
 //! through wgpu, created only while it is shown.
 
-use crate::app::{Control, View};
 use egui::{RichText, ViewportId};
 use egui_wgpu::winit::Painter;
 use egui_wgpu::{RendererOptions, WgpuConfiguration, WgpuSetup};
+use erlkonig_app::app::{Control, View};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use tray_icon::menu::MenuId;

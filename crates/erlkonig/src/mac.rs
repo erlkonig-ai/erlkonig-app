@@ -1,9 +1,9 @@
 //! macOS shell: AppKit alerts, Login Items, LaunchServices and the status-bar
 //! crown, around the shared application in `app.rs`.
 
-use crate::app::{App, Login, Shell};
-use crate::crown::WorkActivity;
 use crate::crown_display::DisplayCrown;
+use erlkonig_app::app::{App, Login, Shell};
+use erlkonig_app::crown::WorkActivity;
 use erlkonig_core::paths::{self, Layout};
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSApplication, NSWorkspace};
