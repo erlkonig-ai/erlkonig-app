@@ -2254,6 +2254,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek 2.2.0",
  "faculties",
+ "faculties-erp",
  "getrandom 0.4.3",
  "hex",
  "hifitime",
@@ -2459,6 +2460,24 @@ dependencies = [
  "zeroize",
  "zip",
  "zmij",
+]
+
+[[package]]
+name = "faculties-erp"
+version = "0.1.0"
+dependencies = [
+ "anybytes",
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "ed25519-dalek 2.2.0",
+ "faculties",
+ "hifitime",
+ "num-rational",
+ "rayon",
+ "serde",
+ "serde_json",
+ "triblespace",
 ]
 
 [[package]]

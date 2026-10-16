@@ -63,9 +63,12 @@ fi
         printf 'binary-build-provenance binary-provenance.txt\n'
         printf 'binary-provenance-sha256 %s\n' "$(shasum -a 256 "$tmp/Contents/Resources/binary-provenance.txt" | cut -d' ' -f1)"
     else
-        for dependency in faculties triblespace-rs anybytes jerky mary GORBIE cubecl-fork burn-fork cubek-fork soma; do
+        printf 'composition private compile-time ERP prototype; not public main as-is\n'
+        for dependency in faculties faculties-erp triblespace-rs anybytes jerky mary GORBIE cubecl-fork burn-fork cubek-fork soma; do
             printf '%s %s\n' "$dependency" "$(git -C "$repo/../$dependency" rev-parse HEAD)"
         done
+        printf 'faculties-erp-tracked-tree %s\n' "$(git -C "$repo/../faculties-erp" rev-parse 'HEAD^{tree}')"
+        printf 'faculties-erp-tracked-diff-sha256 %s\n' "$(git -C "$repo/../faculties-erp" diff --binary HEAD | shasum -a 256 | cut -d' ' -f1)"
     fi
     printf 'cargo-lock-sha256 %s\n' "$(shasum -a 256 "$repo/Cargo.lock" | cut -d' ' -f1)"
     printf 'app-icon-sha256 %s\n' "$(shasum -a 256 "$tmp/Contents/Resources/Erlkonig.icns" | cut -d' ' -f1)"

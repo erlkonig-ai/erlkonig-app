@@ -28,6 +28,8 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 faculties = { path = "../faculties", default-features = false }
+# Private prototype only: this sibling is not part of the public app closure.
+faculties-erp = { path = "../faculties-erp" }
 triblespace = { path = "../triblespace-rs", default-features = false }
 triblespace-net = { path = "../triblespace-rs/triblespace-net" }
 trible = { path = "../triblespace-rs/trible", default-features = false }

@@ -5,6 +5,22 @@ use triblespace::core::metadata;
 use triblespace::core::repo::StorageFlush;
 
 #[test]
+fn private_erp_role_extends_and_preserves_the_public_role_table() {
+    let public = faculties::collection_names::table();
+    let private = roles();
+    assert_eq!(&private[..public.len()], &public);
+    assert_eq!(private.len(), public.len() + 1);
+    let erp = faculties_erp::bookkeeping::DEFAULT_SCOPE_ID;
+    assert!(!public.iter().any(|(role, name)| *role == erp || *name == "erp"));
+    assert_eq!(private.last(), Some(&(erp, "erp")));
+    assert_eq!(role_name(erp), Some("erp"));
+    for (role, name) in public {
+        assert_eq!(role_name(role), Some(name));
+    }
+    assert_eq!(role_name(genid().id), None);
+}
+
+#[test]
 fn saved_empty_bundle_roots_are_discoverable_in_another_bundle() {
     let dir = tempfile::tempdir().unwrap();
     let bootstrap = crate::config::Bootstrap::new(dir.path());
@@ -153,6 +169,11 @@ fn local_discovery_preserves_bytes_distinguishes_same_names_and_supports_exact_p
     );
     assert!(discovery.select(wiki, denied.handle()).is_err());
     assert!(discovery.select(wiki, descriptor_only.handle()).is_ok());
+    let erp = faculties_erp::bookkeeping::DEFAULT_SCOPE_ID;
+    assert!(discovery.select(erp, own.handle()).is_ok());
+    assert!(discovery.select(erp, read_only.handle()).is_ok());
+    assert!(discovery.select(erp, denied.handle()).is_err());
+    assert!(discovery.select(genid().id, own.handle()).is_err());
     assert!(
         discovery
             .select(wiki, CollectionHandle::new([95; 32]))

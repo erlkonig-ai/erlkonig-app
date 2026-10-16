@@ -220,7 +220,7 @@ fn granted_json(value: &crate::workspace_grants::GrantedCollection) -> Value {
         "descriptor": if value.descriptor_resident { "resident" } else { "pending" },
         "name": value.name,
         "reason": value.reason,
-        "role": value.role.and_then(|(role, _)| faculties::collection_names::name_for(role)),
+        "role": value.role.and_then(|(role, _)| workspace::role_name(role)),
         "role_id": value.role.map(|(role, _)| format!("{role:X}")),
         "role_source": value.role.map(|(_, source)| source.as_str()),
         "issuers": value.issuers.iter().map(hex::encode).collect::<Vec<_>>(),
@@ -265,7 +265,7 @@ pub(crate) fn workspace_json(workspace: &Workspace) -> Value {
     json!({
         "workspace": format!("{:X}", workspace.id), "label": workspace.label,
         "roles": workspace.routes.iter().map(|(role, root)| json!({
-            "role": faculties::collection_names::name_for(*role),
+            "role": workspace::role_name(*role),
             "role_id": format!("{role:X}"), "root": format!("blake3:{}", hex::encode(root.raw)),
         })).collect::<Vec<_>>(),
     })
@@ -448,7 +448,7 @@ impl ConfigMcp {
                         names.push(name.to_string());
                     }
                     names.sort(); names.dedup();
-                    collections.push(json!({"role":faculties::collection_names::name_for(*role),
+                    collections.push(json!({"role":workspace::role_name(*role),
                         "role_id":format!("{role:X}"),"root":format!("blake3:{}",hex::encode(root.raw)),"names":names}));
                 }
                 json!({"source_workspace":format!("{:X}",prepared.source),

@@ -1,5 +1,12 @@
 # Erlkonig
 
+This local branch is a **private compile-time ERP prototype**, not a public
+main candidate as-is. It requires the private sibling `faculties-erp` checkout;
+do not push this branch or copy that crate into the public application. The
+private adapter uses the existing request-selected workspace storage, signer
+and explicit `erp` collection route. It adds no backend, key, automatic import
+or production installation. Listing tools/workspaces does not set up ERP.
+
 One macOS menu-bar application, one executable, one resident backend. The
 main thread owns the menu; native Rust workers own replication, maintenance
 and the authenticated local Faculty MCP endpoint. No node executable,

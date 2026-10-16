@@ -355,6 +355,7 @@ fn sharing_read_only_enrolls_same_roots_and_reads_without_write_or_delegation() 
     let third = Fixture::new();
     let id = owner.create("Shared research");
     let original = owner.workspace(&id);
+    assert!(original.routes.contains_key(&faculties_erp::bookkeeping::DEFAULT_SCOPE_ID));
     call(&owner.dispatch, "compass_add", json!({"workspace":id,"title":"Shared evidence"})).unwrap();
     let before = owner.inspect();
     let invitation = owner.share(&id, &recipient, "read_only", None).unwrap();
@@ -390,6 +391,8 @@ fn sharing_read_only_enrolls_same_roots_and_reads_without_write_or_delegation() 
     assert_eq!(probe["collections"].as_array().unwrap().len(), original.routes.len());
     assert!(probe["collections"].as_array().unwrap().iter().any(|row|
         row["role"] == "compass" && row["names"] == json!(["Shared research · compass"])));
+    assert!(probe["collections"].as_array().unwrap().iter().any(|row|
+        row["role"] == "erp" && row["names"] == json!(["Shared research · erp"])));
     assert_eq!(before_probe, recipient.inspect(), "probe has no Config mutation");
     assert_eq!(pile_before, std::fs::read(&recipient.config.binding.pile).unwrap(), "probe imports nothing");
     let wire: Value = serde_json::from_str(invitation["bootstrap"].as_str().unwrap()).unwrap();
@@ -432,6 +435,12 @@ fn sharing_read_only_enrolls_same_roots_and_reads_without_write_or_delegation() 
     owner.replicate_to(&recipient, &original);
     assert!(call(&recipient.dispatch, "compass_list", json!({"workspace":local_id})).unwrap().contains("Shared evidence"));
     assert!(call(&recipient.dispatch, "compass_add", json!({"workspace":local_id,"title":"Denied write"})).is_err());
+    assert!(call(&recipient.dispatch, "erp_review", json!({
+        "workspace":local_id,"month":"2026-09",
+    })).is_ok());
+    assert!(call(&recipient.dispatch, "erp_account_add", json!({
+        "workspace":local_id,"label":"Denied ERP write","actor":format!("{:X}",genid().id),
+    })).is_err());
     let proof_count = recipient.proofs();
     assert!(recipient.share(local_id, &third, "read_only", None).is_err());
     assert_eq!(recipient.proofs(), proof_count, "failed delegation publishes no proof");
@@ -1033,6 +1042,8 @@ fn native_grants_list_by_workspace_anchor_and_enroll_without_bootstrap() {
     let share_of = |workspace: &Workspace| shares.iter()
         .find(|share| share["anchor"] == format!("{:X}", workspace.anchor)).unwrap().clone();
     let share_a = share_of(&original_a);
+    assert!(share_a["collections"].as_array().unwrap().iter().any(|row|
+        row["role"] == "erp" && row["role_source"] == "declared"));
     assert_eq!(share_a["label"], "Shared research");
     assert_eq!(share_a["claimed_access"], "read_only");
     assert_eq!(share_a["claimed_delegate"], false);

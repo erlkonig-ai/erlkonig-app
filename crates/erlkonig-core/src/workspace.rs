@@ -19,7 +19,18 @@ use crate::config::NodeBinding;
 
 /// Names label roles; they never resolve a collection by themselves.
 pub fn roles() -> Vec<(Id, &'static str)> {
-    faculties::collection_names::table()
+    let mut roles = faculties::collection_names::table();
+    roles.push((faculties_erp::bookkeeping::DEFAULT_SCOPE_ID, "erp"));
+    roles
+}
+
+/// App-local private role extension; the public faculty table is unchanged.
+pub(crate) fn role_name(role: Id) -> Option<&'static str> {
+    if role == faculties_erp::bookkeeping::DEFAULT_SCOPE_ID {
+        Some("erp")
+    } else {
+        faculties::collection_names::name_for(role)
+    }
 }
 
 /// One edit request / native-fact projection, not a catalog of the store.
@@ -162,7 +173,7 @@ impl Discovery {
     /// A picker selection must name a root compatible with the selected role
     /// and usable by this signer. This does not confer missing permissions.
     pub fn select(&self, role: Id, handle: CollectionHandle) -> Result<RootChoice> {
-        faculties::collection_names::name_for(role).context("unknown faculty role")?;
+        role_name(role).context("unknown faculty role")?;
         let root = self.probe(handle)?;
         if !root.read && !root.write {
             bail!("selected signer has neither READ nor WRITE admission to this exact root");

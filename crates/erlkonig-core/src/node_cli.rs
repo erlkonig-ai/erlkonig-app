@@ -138,7 +138,7 @@ pub fn run(args: &[OsString]) -> Result<bool> {
                 let workspaces = view.workspace_ids()?.into_iter().map(|id| match view.workspace(id) {
                     Ok(Some(workspace)) => json!({"revision":format!("{id:X}"),"label":workspace.label,
                         "routes":workspace.routes.into_iter().map(|(role,root)|
-                            (faculties::collection_names::name_for(role).unwrap_or("unknown").to_owned(),hex::encode(root.raw)))
+                            (crate::workspace::role_name(role).unwrap_or("unknown").to_owned(),hex::encode(root.raw)))
                             .collect::<std::collections::BTreeMap<_,_>>() }),
                     Ok(None) => json!({"revision":format!("{id:X}"),"withdrawn":true}),
                     Err(error) => json!({"revision":format!("{id:X}"),"problem":format!("{error:#}")}),
@@ -230,7 +230,7 @@ pub fn run(args: &[OsString]) -> Result<bool> {
             for workspace in &request.workspaces {
                 let mut routes = std::collections::BTreeMap::new();
                 for (role, root) in &workspace.routes {
-                    let role = faculties::collection_names::table()
+                    let role = crate::workspace::roles()
                         .into_iter()
                         .find(|(_, name)| *name == role)
                         .map(|(id, _)| id)

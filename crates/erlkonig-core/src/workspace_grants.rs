@@ -200,7 +200,7 @@ fn note(reason: &mut Option<String>, text: String) {
 
 /// The `label` of a `label · role` descriptor name, when `role` is known.
 fn label_of(name: &str, role: Option<Id>) -> String {
-    role.and_then(faculties::collection_names::name_for)
+    role.and_then(crate::workspace::role_name)
         .and_then(|suffix| name.strip_suffix(suffix))
         .and_then(|stem| stem.strip_suffix(" · "))
         .unwrap_or(name)
@@ -382,12 +382,12 @@ impl NodeStore {
             let declared: BTreeSet<Id> =
                 find!(role: Id, pattern!(&facts, [{ entity @ attrs::collection_role: ?role }])).collect();
             row.role = match declared.into_iter().collect::<Vec<_>>()[..] {
-                [role] if faculties::collection_names::name_for(role).is_some() => {
+                [role] if crate::workspace::role_name(role).is_some() => {
                     Some((role, RoleSource::Declared))
                 }
                 _ => row.name.as_deref().and_then(|name| {
                     let (_, suffix) = name.rsplit_once(" · ")?;
-                    let (role, _) = faculties::collection_names::table()
+                    let (role, _) = crate::workspace::roles()
                         .into_iter()
                         .find(|(_, candidate)| *candidate == suffix)?;
                     Some((role, RoleSource::Name))

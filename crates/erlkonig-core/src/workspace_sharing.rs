@@ -259,7 +259,7 @@ impl NodeStore {
         admitted(&mut staging, &workspace, subject, access.write())?;
         let mut routes = Fragment::empty();
         for (role, root) in &workspace.routes {
-            faculties::collection_names::name_for(*role)
+            crate::workspace::role_name(*role)
                 .context("workspace has an unknown faculty role")?;
             routes += entity! { config::anchor: *role, config::selects: *root };
         }
@@ -377,7 +377,7 @@ impl NodeStore {
             { anchor @ attrs::workspace_route: _?route },
             { _?route @ config::anchor: ?role, config::selects: ?root },
         ])) {
-            faculties::collection_names::name_for(role)
+            crate::workspace::role_name(role)
                 .context("bootstrap names an unknown faculty role")?;
             if workspace
                 .routes
