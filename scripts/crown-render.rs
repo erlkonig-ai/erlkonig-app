@@ -1,9 +1,9 @@
 //! Deterministic offscreen AppKit proof, using the production vector renderer.
-//! cargo run --release -p erlkonig --example crown-render -- OUTPUT_DIRECTORY
+//! cargo run --release -p erlkonig-mac --example crown-render -- OUTPUT_DIRECTORY
 //! Does not create an application, window, status item, timer or network service.
 
 #[cfg(target_os = "macos")]
-#[path = "../crates/erlkonig/src/crown_image.rs"]
+#[path = "../crates/erlkonig-mac/src/crown_image.rs"]
 mod crown_image;
 
 #[cfg(target_os = "macos")]

@@ -1,5 +1,5 @@
 //! macOS shell: AppKit alerts, Login Items, LaunchServices and the status-bar
-//! crown, around the shared application in `app.rs`.
+//! crown, around the shared application in `erlkonig_app::app`.
 
 use crate::crown_display::DisplayCrown;
 use erlkonig_app::app::{App, Login, Shell};

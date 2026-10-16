@@ -4,6 +4,7 @@
 set -eu
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 release=${CARGO_TARGET_DIR:-$repo/target}/release
+executable=
 out=$repo/dist.noindex
 identity=${ERLKONIG_SIGN_IDENTITY:--}
 reuse=
@@ -23,9 +24,11 @@ done
 if [ -n "$reuse" ]; then
     codesign --verify --deep --strict "$reuse"
     [ -f "$reuse/Contents/Resources/provenance.txt" ] || { echo 'bundle: reused app needs binary provenance' >&2; exit 1; }
-    release=$reuse/Contents/MacOS
+    executable=$reuse/Contents/MacOS/erlkonig
 fi
-[ -x "$release/erlkonig" ] || { echo 'bundle: missing erlkonig executable' >&2; exit 1; }
+# Cargo builds erlkonig-mac; the bundle's CFBundleExecutable is erlkonig.
+executable=${executable:-$release/erlkonig-mac}
+[ -x "$executable" ] || { echo "bundle: missing executable $executable" >&2; exit 1; }
 mkdir -p "$out"
 out=$(CDPATH= cd -- "$out" && pwd -P)
 app=$out/Erlkonig.app
@@ -34,7 +37,7 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/Contents/MacOS" "$tmp/Contents/Resources"
 cp "$repo/macos/Info.plist" "$tmp/Contents/Info.plist"
 printf 'APPL????' >"$tmp/Contents/PkgInfo"
-cp "$release/erlkonig" "$tmp/Contents/MacOS/erlkonig"
+cp "$executable" "$tmp/Contents/MacOS/erlkonig"
 chmod 755 "$tmp/Contents/MacOS/erlkonig"
 cp -R "$repo/plugin" "$tmp/Contents/Resources/plugin"
 if [ -n "$icon_renderer" ]; then

@@ -31,8 +31,9 @@ done
 # Never inherit live collection/pile/persona test settings.
 for name in $(env | sed -n 's/^\(TRIBLESPACE_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$name"; done
 unset PILE PERSONA DRIVE_ENDPOINT RUSTFLAGS RUSTC_WRAPPER
-nice -n 10 cargo build --release --locked --offline -p erlkonig --example crown-render -j4
+nice -n 10 cargo build --release --locked --offline -p erlkonig-mac --example crown-render -j4
 "$CARGO_TARGET_DIR/release/examples/crown-render" "$CARGO_TARGET_DIR/crown-render"
 nice -n 10 cargo test --release --locked --offline -p erlkonig-core --lib --test lifecycle -j4 -- --test-threads=1
-nice -n 10 cargo test --release --locked --offline -p erlkonig --bin erlkonig -j4 -- --test-threads=1
-nice -n 10 cargo build --release --locked --offline -p erlkonig --bin erlkonig -j4
+nice -n 10 cargo test --release --locked --offline -p erlkonig-app --lib -j4 -- --test-threads=1
+nice -n 10 cargo test --release --locked --offline -p erlkonig-mac --bin erlkonig-mac -j4 -- --test-threads=1
+nice -n 10 cargo build --release --locked --offline -p erlkonig-mac --bin erlkonig-mac -j4

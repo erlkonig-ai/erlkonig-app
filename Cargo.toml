@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/erlkonig-core", "crates/erlkonig-app", "crates/erlkonig-linux", "crates/erlkonig"]
+members = ["crates/erlkonig-core", "crates/erlkonig-app", "crates/erlkonig-linux", "crates/erlkonig-mac", "crates/erlkonig"]
 
 [workspace.package]
 version = "0.1.0"
