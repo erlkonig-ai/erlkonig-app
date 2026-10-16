@@ -21,3 +21,6 @@ egui-wgpu.workspace = true
 wgpu.workspace = true
 zbus.workspace = true
 pollster.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

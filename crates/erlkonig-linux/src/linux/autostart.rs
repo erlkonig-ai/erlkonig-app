@@ -80,16 +80,16 @@ pub(crate) fn set(dir: &Path, on: bool, executable: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("erlkonig-autostart-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    // A fresh randomly named directory that removes itself when dropped, so
+    // no test deletes a path it computed.
+    fn scratch() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
     }
 
     #[test]
     fn enable_disable_round_trip_in_an_injected_config_dir() {
-        let dir = scratch("round-trip").join("autostart");
+        let scratch = scratch();
+        let dir = scratch.path().join("autostart");
         let exe = Path::new("/home/someone/.local/bin/erlkonig");
         assert!(!enabled(&dir));
         set(&dir, true, exe).unwrap();
@@ -109,12 +109,12 @@ mod tests {
             0,
             "no partial file left"
         );
-        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
     #[test]
     fn a_hidden_entry_counts_as_disabled() {
-        let dir = scratch("hidden");
+        let scratch = scratch();
+        let dir = scratch.path().join("autostart");
         set(&dir, true, Path::new("/usr/bin/erlkonig")).unwrap();
         let file = dir.join(FILE_NAME);
         let text = std::fs::read_to_string(&file).unwrap();
@@ -122,7 +122,6 @@ mod tests {
         assert!(!enabled(&dir));
         std::fs::write(&file, format!("{text}Hidden=false\n")).unwrap();
         assert!(enabled(&dir));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
