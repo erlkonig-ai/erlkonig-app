@@ -10,13 +10,13 @@ target=${CARGO_TARGET_DIR:-$root/target}
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml" | head -n 1)
 name="erlkonig-$version-linux-$(uname -m)"
 
-cargo build --release --locked -p erlkonig --manifest-path "$root/Cargo.toml"
+cargo build --release --locked -p erlkonig-linux --manifest-path "$root/Cargo.toml"
 
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/$name"
-cp "$target/release/erlkonig" "$stage/$name/erlkonig"
-cargo run --release --locked -p erlkonig --example linux-icons \
+cp "$target/release/erlkonig-linux" "$stage/$name/erlkonig"
+cargo run --release --locked -p erlkonig-app --example linux-icons \
     --manifest-path "$root/Cargo.toml" -- "$stage/$name/icons"
 cp "$root/scripts/linux/install-user.sh" "$stage/$name/install-user.sh"
 cp "$root/scripts/linux/ai.erlkonig.app.desktop.in" "$stage/$name/"

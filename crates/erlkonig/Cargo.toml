@@ -25,13 +25,3 @@ objc2-foundation.workspace = true
 objc2-app-kit.workspace = true
 objc2-service-management.workspace = true
 objc2-quartz-core.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-tray-icon = { workspace = true, features = ["ksni"] }
-winit = { workspace = true, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
-egui.workspace = true
-egui-winit.workspace = true
-egui-wgpu.workspace = true
-wgpu.workspace = true
-zbus.workspace = true
-pollster.workspace = true

@@ -1,6 +1,6 @@
 //! Linux shell: a StatusNotifierItem tray (pure-Rust KSNI), an egui status
 //! window that also carries every prompt, XDG autostart, and the desktop's
-//! session-bus services, around the shared application in `app.rs`.
+//! session-bus services, around the shared application in `erlkonig_app::app`.
 
 mod autostart;
 mod bus;

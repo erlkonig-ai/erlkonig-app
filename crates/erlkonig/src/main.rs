@@ -7,9 +7,6 @@
 #[cfg(target_os = "macos")]
 mod mac;
 
-#[cfg(target_os = "linux")]
-mod linux;
-
 #[cfg(target_os = "macos")]
 mod crown_display;
 
@@ -27,11 +24,9 @@ fn main() {
     }
     #[cfg(target_os = "macos")]
     mac::main();
-    #[cfg(target_os = "linux")]
-    linux::main();
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "macos"))]
     {
-        eprintln!("erlkonig: the menu-bar application requires macOS or Linux");
+        eprintln!("erlkonig: the menu-bar application requires macOS; on Linux use erlkonig-linux");
         std::process::exit(1);
     }
 }
