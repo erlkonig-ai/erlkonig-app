@@ -517,7 +517,7 @@ impl ConfigMcp {
                 let id = node.put_settings(&view, &value)?;
                 json!({"revision":format!("{id:X}"), "settings":settings_json(&value),
                     "mcp_url":self.mcp_url, "port_restart_required":value.mcp_port != self.startup_port,
-                    "port_activation":"The running endpoint is unchanged. MCP port changes require app restart, then Integrations > your client > Refresh package and client reload; an old-port profile cannot reconnect. Cowork requires a refreshed archive."})
+                    "port_activation":"The running endpoint is unchanged. MCP port changes require app restart; the app then reinstalls installed plugins for the new port, and the client must be reloaded. An old-port profile cannot reconnect. Cowork requires a refreshed archive."})
             }
             _ => bail!("unknown node configuration tool {name:?}"),
         };

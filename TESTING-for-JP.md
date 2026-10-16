@@ -43,12 +43,16 @@ These are pending interactive checks, not an already-passed checklist:
    a real profile during validation. A scratch launch must isolate HOME as well
    as CODEX_HOME/CLAUDE_CONFIG_DIR. Check the two local plugin rows: installed,
    installed-but-disabled, not installed and unavailable must remain distinct.
-   Cancel a dialog and confirm AppKit's temporary check toggle is restored.
-   During a CLI operation the menu/crown must remain responsive; Quit must
-   cancel/reap its own child. Remove must preserve unrelated plugins/settings.
-   Move the candidate and Refresh package; verify the cached command points to
-   the new absolute executable path. Test failure between remove and reinstall
-   without mistaking it for rollback. Existing direct MCP settings remain
+   Clicking a row installs or removes with no dialog; confirm AppKit's
+   temporary check toggle shows the observed state until the client confirms,
+   and that success shows nothing while a client failure shows one short
+   message. During a CLI operation the menu/crown must remain responsive; Quit
+   must cancel/reap its own child. Remove must preserve unrelated
+   plugins/settings. Move the candidate and relaunch it: the installed plugin
+   must be reinstalled without a prompt and the cached command must point to
+   the new absolute executable path; an unchecked plugin must stay absent.
+   Test failure between remove and reinstall without mistaking it for
+   rollback. Existing direct MCP settings remain
    untouched and are warned about rather than silently creating duplicate tools.
 6. In a fresh scratch HOME/store, call `config_inspect` before a workspace
    exists. It must return the public node identity, settings and observation.

@@ -31,11 +31,30 @@ plugin…** account action; detecting the app proves neither Cowork entitlement
 nor account installation. Installing locally in Claude Code does not install
 the account plugin. Account-synced-only inventory routes to account management.
 
-An installed but disabled plugin remains checked and says “disabled.” An
-inventory failure remains visible, disabled, and says “status unavailable,”
-retaining the last observed check. Not detecting any supported client leaves
-a small “No supported clients detected” entry and the refresh action. Detection
-never removes an integration or changes client settings.
+The check mark is the consent: clicking an unchecked row runs the client's
+own install command and clicking a checked row runs its remove command, with
+no dialog. The mark follows the client's inventory, not the click. An installed
+but disabled plugin remains checked and says “disabled.” An inventory failure
+remains visible, disabled, and says “status unavailable,” retaining the last
+observed check. Not detecting any supported client leaves a small “No
+supported clients detected” entry and the refresh action. Detection never
+removes an integration or changes client settings.
+
+What the app installs is this computer's copy only: Claude Code at user scope,
+the OpenAI package through the Codex CLI. A check is the CLI's inventory; it is
+not proof that a desktop UI refreshed or that an MCP connection is active.
+Removal runs only `claude plugin uninstall erlkonig@erlkonig-local --scope user`
+or `codex plugin remove erlkonig@erlkonig-local --json`; other plugins, the
+marketplace registration and unrelated settings are left alone, and the app
+deletes no file or directory to do it. No credential is copied into a package.
+
+A client installs a copy of the generated package, so a moved or updated app
+(or a new MCP port) would leave the installed copy pointing at the old one.
+After every inventory the app compares its staged package with what the
+running executable would stage, and when they differ it re-stages and
+reinstalls the plugin for each client that reports it installed. Unchecked
+plugins are never reinstalled. Reload the client afterwards. The Cowork ZIP is
+uploaded by hand, so after moving the app prepare and upload it again.
 
 Node-scoped `config_*` tools share the same authenticated local endpoint and
 remain available with zero workspaces. They inspect the public identity and
@@ -66,8 +85,8 @@ or unselect native roots. Maintenance remains independently all-accessible and
 may acquire exact missing bodies outside sync selection while sync is enabled.
 This is not global fetch isolation or a synchronization-completion receipt.
 Typed service settings are port/sync/maintenance only. Old requests containing
-`peers` are unsupported; historical peer facts remain inert. Refresh the client
-package/schema and reload the client at the coordinated upgrade.
+`peers` are unsupported; historical peer facts remain inert. The app refreshes
+installed packages itself; reload the client at the coordinated upgrade.
 The bundled skill describes the handoff and limits. Ordinary faculties still require an exact workspace on
 each call. Other configuration operations grant no sharing authority; no tool
 exposes a private key, token or arbitrary path editor. The app must be open;

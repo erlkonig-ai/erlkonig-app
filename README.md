@@ -135,12 +135,12 @@ stay inert in the append-only pile; old JSON requests containing `peers` are
 unsupported, not silently accepted as no-ops. At the coordinated upgrade,
 refresh the client package/schema and reload the client (or upload the refreshed
 Cowork archive) before using the new settings tools.
-Port changes require an app restart and client integration refresh; service
-settings apply while running. Responses report the actual running `mcp_url`
-and whether restart is required. After restart, choose **Integrations → your
-client → Refresh package**, then reload the client (or refresh the Cowork
-archive); an old-port profile cannot reconnect. Port zero is ephemeral and
-requires refreshed integration after every restart. Conflicting service
+Port changes require an app restart; service settings apply while running.
+Responses report the actual running `mcp_url` and whether restart is
+required. After the restart Erlkonig reinstalls installed plugins for the new
+port by itself (see [Integrations](#integrations)); reload the client, and
+upload a fresh Cowork archive. An old-port profile cannot reconnect. Port zero
+is ephemeral, so every restart refreshes the installed plugins. Conflicting service
 settings leave the configuration endpoint available on the agreed current
 port; if the port itself is missing or conflicting, the app uses local port
 41773 for recovery. This does not select or save a settings fork, and node
@@ -296,46 +296,6 @@ require a machine-local bearer token. The stdio transport reads the existing
 private token only when connecting; no credential is put in a plugin or client
 profile. Quit disconnects the transports, which never relaunch the app.
 
-The **Integrations** submenu shows detected clients: one OpenAI row labelled
-for the installed ChatGPT/Codex clients, a **Claude Code plugin** row when its
-CLI is available, and a separate Cowork action when Claude Desktop is found.
-Desktop detection uses public macOS bundle lookup, not running processes or
-account state. An OpenAI app without a management CLI gets a plain “CLI
-unavailable…” action. See [detection policy](plugin/README.md) for details.
-The local controls' checkmarks mean installed, not enabled or connected. Disabled
-and load-error states are labelled separately; unavailable status preserves
-the last-known check and disables mutation until a successful refresh.
-Inventory runs on startup, after changes, or on **Refresh plugin status**—not
-on the crown's display timer. CLI commands run off the main thread, with a
-30-second limit each, bounded output and cancellation/child cleanup on Quit.
-
-The OpenAI package targets supported ChatGPT Work/Codex local hosts; its status
-is read from the selected Codex CLI and does not certify ChatGPT UI refresh.
-Claude Code installation is user-scoped. Neither is an account-install claim.
-Removal verifies our exact marketplace source and plugin ID, leaves other
-plugins/settings untouched, and keeps the marketplace registered. Existing
-direct MCP settings named `erlkonig` are warned about, never removed by guess.
-
-After moving or updating the app, select an installed row and **Refresh
-package** to reinstall the current absolute executable path, then enable/reload
-the plugin in the client if needed. Refresh is a remove/install sequence; if a
-client step fails, the menu reports uncertainty, not a successful rollback.
-
-**Manage Cowork plugin** creates a ZIP of the same Claude package used by Code
-and opens the documented account Plugins page after confirmation. Upload and
-remove it there manually; there is no checked Cowork state or private account
-API. A synced Claude plugin is identified as account-managed and routes here.
-This is not a standalone Desktop Chat extension. Cowork's local plugin server
-runs through Claude Desktop, not in its shell VM; cloud Cowork can also access
-local connectors through the open Desktop app. Actual interactive Cowork
-loading remains a validation gate, not a claim made by an installed checkbox.
-See [Claude's cross-platform guide](https://support.claude.com/en/articles/15520349-use-claude-cowork-on-web-desktop-and-mobile)
-and [plugin lifecycle reference](https://code.claude.com/docs/en/plugins/cli-reference).
-
-Package staging allows only the intended manifest, shared skill and `.mcp.json`;
-unexpected files or symlinks are refused rather than executed or distributed.
-The ZIP contains exactly those three files and no top-level `bin/` directory.
-
 A stored MCP-port change takes effect on the next launch. Metrics contain cumulative
 observed bytes/publications/failures by node, worker and session;
 absent counters remain unknown. Measurements are coalesced at a ten-second
@@ -366,6 +326,89 @@ work shares one activity count; enabling services, idle waits, status sampling
 and rendering do not count. It is an activity indicator, not a bytes-per-second
 meter. Payload counters still report measured bytes, and local-only workspace
 reads add no network traffic. There is no animation-preview mode.
+
+## Integrations
+
+The **Integrations** submenu lists the clients Erlkonig found: one OpenAI row
+labelled for the installed ChatGPT/Codex clients, a **Claude Code plugin** row
+when its CLI is available, and a separate Cowork action when Claude Desktop is
+found. Desktop detection uses public macOS bundle lookup, not running
+processes or account state. See [detection policy](plugin/README.md).
+
+**The check mark is the consent.** Clicking an unchecked row installs the
+plugin; clicking a checked row removes it. There is no confirmation dialog.
+The mark shows what the client's own CLI reports after the change, so it
+flips only once the client confirms; until then the row keeps its previous
+state. Nothing pops up on success. If the client refuses, one short message
+says so, and the client's error text is kept in Erlkonig's status details
+(the **Plugin problem** item in the menu, or the details in the Linux status
+window).
+
+What a check mark does and does not mean:
+
+- It is **this computer's** plugin only. For Claude Code it is the
+  user-scope plugin (`claude plugin install --scope user`); it neither
+  installs nor removes a Cowork plugin on your Claude account. For the OpenAI
+  row it is the local package for ChatGPT Work/Codex clients, read from the
+  Codex CLI.
+- It is the CLI's **inventory**, not proof that a desktop app has refreshed
+  its UI, and not proof of an active MCP connection. Reload or restart the
+  client to pick up a newly installed plugin; disabled and load-error states
+  are labelled separately.
+- If the status cannot be read, the row keeps its last-known mark, says
+  "status unavailable" and cannot be clicked until **Refresh plugin status**
+  succeeds.
+- **Keep Erlkonig open.** The plugin's tools forward to the running app and
+  never start a backend themselves.
+- **No credentials are copied.** The plugin names the app's executable, data
+  directory and local endpoint; the private token stays in the app's folder.
+- **Removing touches only Erlkonig's plugin.** Erlkonig runs the client's own
+  remove command for the exact plugin ID `erlkonig@erlkonig-local` at user
+  scope. Other plugins, the marketplace registration and unrelated settings
+  are left alone, and Erlkonig itself deletes no file or directory to do it.
+  An existing direct MCP server named `erlkonig` in a client's settings is
+  reported in the status details, never removed or rewritten.
+
+Inventory runs at startup, after a change, and on **Refresh plugin status**,
+never on the crown's display timer. CLI commands run off the main thread, with
+a 30-second limit each, bounded output, and cancellation and child cleanup on
+Quit.
+
+**Moving or updating the app refreshes the plugin by itself.** A client
+installs a copy of the plugin package, and that copy names the app's absolute
+executable path, data directory and local endpoint. After each inventory,
+Erlkonig compares the package it staged earlier with what the running copy
+would stage. If anything differs (the app was moved or updated, the package
+version changed, or the MCP port changed), it re-stages the package and
+reinstalls it, quietly, for every client that reports the plugin installed.
+A plugin you unchecked is never reinstalled, and one that was never installed
+is never installed. Reload the client afterwards. A refresh is a
+remove-then-install sequence; if a client step fails, you get one short
+message and the row shows the uncertain state rather than a rollback. If one
+client's refresh fails while another's succeeds, the next startup sees the
+package as current and does not retry it: uncheck and check that row.
+
+**Manage Cowork plugin** prepares a ZIP of the same Claude package used by
+Claude Code and opens the account Plugins page. Cowork plugins live on your
+Claude account, separately from local Claude Code installs: upload the ZIP
+there (Customize → Plugins → Add → Upload plugin) and remove it there too.
+Erlkonig cannot see or check the account installation, so this action has no
+check mark. The package contains no secret and works on this computer only
+while Erlkonig is open; after moving the app, prepare and upload the ZIP
+again. A synced Claude plugin is identified as account-managed and routes
+here. This is a Cowork/Code plugin, not a standalone Desktop Chat extension.
+Cowork's local plugin server runs through Claude Desktop, not in its shell VM;
+cloud Cowork can also reach local connectors through the open Desktop app.
+Actual interactive Cowork loading remains a validation gate. See
+[Claude's cross-platform guide](https://support.claude.com/en/articles/15520349-use-claude-cowork-on-web-desktop-and-mobile)
+and the [plugin lifecycle reference](https://code.claude.com/docs/en/plugins/cli-reference).
+
+An OpenAI desktop app without the Codex CLI gets a plain "CLI unavailable…"
+row; Erlkonig manages that plugin only through the CLI.
+
+Package staging allows only the intended manifest, shared skill and `.mcp.json`;
+unexpected files or symlinks are refused rather than executed or distributed.
+The ZIP contains exactly those three files and no top-level `bin/` directory.
 
 ## Validation and packaging
 

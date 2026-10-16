@@ -206,10 +206,11 @@ goal, not a wiki page.
   missing. Tell the user in one sentence and continue; do not retry the same
   call in a loop.
 - **Keep Erlkonig open.** The plugin forwards to the already-running app; it
-  never opens the pile or starts a background backend itself. If the connection
-  fails, ask the user to open Erlkonig on this computer. After the app is moved
-  or updated, use its plugin menu's Refresh package action (or upload the new
-  Cowork ZIP), then reload the client. Never start another service to repair it.
+  never opens the pile or starts a background backend itself, and it holds no
+  credentials. If the connection fails, ask the user to open Erlkonig on this
+  computer. After the app is moved or updated, Erlkonig reinstalls this plugin
+  by itself when it starts; the user only reloads the client (a Cowork upload
+  needs a freshly prepared ZIP). Never start another service to repair it.
 - **Shared spaces are shared.** Content written to a team space reaches
   everyone in it. Do not copy local files or private notes into a shared
   space unless the user asked for exactly that.
