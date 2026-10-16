@@ -50,9 +50,11 @@ deletes no file or directory to do it. No credential is copied into a package.
 
 A client installs a copy of the generated package, so a moved or updated app
 (or a new MCP port) would leave the installed copy pointing at the old one.
-After every inventory the app compares its staged package with what the
-running executable would stage, and when they differ it re-stages and
-reinstalls the plugin for each client that reports it installed. Unchecked
+Each confirmed install records a digest of that client's package in the app's
+data directory. After every inventory the app compares each record with what
+the running executable would stage, and when they differ it re-stages and
+reinstalls the plugin for that client if the client reports it installed; a
+failed reinstall keeps the old record and is retried next time. Unchecked
 plugins are never reinstalled. Reload the client afterwards. The Cowork ZIP is
 uploaded by hand, so after moving the app prepare and upload it again.
 

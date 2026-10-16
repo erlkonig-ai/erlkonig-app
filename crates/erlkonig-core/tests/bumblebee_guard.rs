@@ -220,13 +220,12 @@ fn install_refresh_and_uninstall_touch_nothing_but_their_own_data() {
             ]
         );
     }
-    assert!(install::staged_is_current(&layout, first, URL));
-    assert!(!install::staged_is_current(&layout, moved, URL));
-    assert!(!install::staged_is_current(
-        &layout,
-        first,
-        "http://127.0.0.1:1/"
-    ));
+    for host in [Host::ClaudeCode, Host::OpenAi] {
+        assert!(install::installed_is_current(&layout, host, first, URL));
+        assert!(!install::installed_is_current(&layout, host, moved, URL));
+        let port = "http://127.0.0.1:1/";
+        assert!(!install::installed_is_current(&layout, host, first, port));
+    }
 
     // A current package is left alone: no client is even asked.
     let installed = [
@@ -237,10 +236,31 @@ fn install_refresh_and_uninstall_touch_nothing_but_their_own_data() {
     assert!(take_argv(&claude).is_empty() && take_argv(&codex).is_empty());
 
     // The app moved: both installed plugins are reinstalled for the new path.
+    // Codex refuses the first time; only Claude Code is then current.
+    fs::write(codex.with_file_name("fail"), "1\n").unwrap();
     let refreshed = install::refresh_if_stale(&installed, &layout, moved, URL, &cancel);
     assert_eq!(refreshed.len(), 2);
-    assert!(refreshed.iter().all(|(_, r)| r.as_ref().unwrap().installed));
-    assert!(install::staged_is_current(&layout, moved, URL));
+    assert!(refreshed[0].1.as_ref().unwrap().installed);
+    assert!(refreshed[1].1.is_err());
+    assert!(install::installed_is_current(
+        &layout,
+        Host::ClaudeCode,
+        moved,
+        URL
+    ));
+    assert!(!install::installed_is_current(
+        &layout,
+        Host::OpenAi,
+        moved,
+        URL
+    ));
+    let codex_reinstall = [
+        list(Host::OpenAi),
+        markets.clone(),
+        argv(&["plugin", "remove", PLUGIN_ID, "--json"]),
+        argv(&["plugin", "add", PLUGIN_ID, "--json"]),
+        list(Host::OpenAi),
+    ];
     assert_eq!(
         take_argv(&claude),
         [
@@ -258,16 +278,17 @@ fn install_refresh_and_uninstall_touch_nothing_but_their_own_data() {
             list(Host::ClaudeCode),
         ]
     );
-    assert_eq!(
-        take_argv(&codex),
-        [
-            list(Host::OpenAi),
-            markets.clone(),
-            argv(&["plugin", "remove", PLUGIN_ID, "--json"]),
-            argv(&["plugin", "add", PLUGIN_ID, "--json"]),
-            list(Host::OpenAi),
-        ]
-    );
+    assert_eq!(take_argv(&codex), codex_reinstall[..3]);
+    // The next refresh retries Codex alone, although the package is staged.
+    fs::write(codex.with_file_name("fail"), "0\n").unwrap();
+    let refreshed = install::refresh_if_stale(&installed, &layout, moved, URL, &cancel);
+    assert_eq!(refreshed.len(), 1);
+    assert_eq!(refreshed[0].0, Host::OpenAi);
+    assert!(refreshed[0].1.as_ref().unwrap().installed);
+    assert!(take_argv(&claude).is_empty());
+    assert_eq!(take_argv(&codex), codex_reinstall);
+    assert!(install::refresh_if_stale(&installed, &layout, moved, URL, &cancel).is_empty());
+    assert!(take_argv(&claude).is_empty() && take_argv(&codex).is_empty());
     let mcp: serde_json::Value = serde_json::from_slice(
         &fs::read(data.join("plugins/erlkonig-local/claude/.mcp.json")).unwrap(),
     )
@@ -295,7 +316,12 @@ fn install_refresh_and_uninstall_touch_nothing_but_their_own_data() {
 
     // A stale package never installs a plugin that is not installed, even
     // when a caller names it: the client is asked, and that is all.
-    assert!(!install::staged_is_current(&layout, first, URL));
+    assert!(!install::installed_is_current(
+        &layout,
+        Host::ClaudeCode,
+        first,
+        URL
+    ));
     let refreshed = install::refresh_if_stale(&installed, &layout, first, URL, &cancel);
     assert!(
         refreshed

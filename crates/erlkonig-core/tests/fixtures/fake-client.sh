@@ -1,8 +1,8 @@
 #!/bin/sh
 # A fake `claude` or `codex` plugin CLI for tests. It appends its argv to
 # argv.log next to itself (fields end in \037, one line per call) and keeps
-# its plugin state in files beside it. It never deletes anything. A file
-# named `fail` beside it makes every mutating command fail.
+# its plugin state in files beside it. It never deletes anything. While a
+# file named `fail` beside it holds 1, every mutating command fails.
 D=${0%/*}
 N=${0##*/}
 {
@@ -13,8 +13,10 @@ installed=0
 [ -f "$D/installed" ] && read -r installed <"$D/installed"
 root=
 [ -f "$D/market" ] && read -r root <"$D/market"
+fail=0
+[ -f "$D/fail" ] && read -r fail <"$D/fail"
 mutate() {
-    [ -f "$D/fail" ] && exit 3
+    [ "$fail" = 1 ] && exit 3
     printf '%s\n' "$2" >"$D/$1"
 }
 case "$N:$*" in

@@ -41,6 +41,13 @@ impl Host {
             Self::ClaudeCode => "Claude Code",
         }
     }
+    /// The staged package directory this client installs from.
+    fn provider(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::ClaudeCode => "claude",
+        }
+    }
     fn program(self) -> &'static str {
         match self {
             Self::OpenAi => "codex",
@@ -330,11 +337,14 @@ pub fn inventory_with_client(
     read_inventory(host, program, &layout.dir, cancel)
 }
 
+/// Whether the client's own settings name a separate MCP server `erlkonig`.
 /// Diagnostic only: a legacy server may be user-authored. Never remove or
 /// rewrite it, even when its name or URL looks like an old Erlkonig install.
-pub fn legacy_config_notice(host: Host) -> Option<String> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-    let present = match host {
+pub fn manual_config(host: Host) -> bool {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    match host {
         Host::OpenAi => {
             let dir = std::env::var_os("CODEX_HOME")
                 .map(PathBuf::from)
@@ -364,13 +374,15 @@ pub fn legacy_config_notice(host: Host) -> Option<String> {
                     })
             })
         }
-    };
-    present.then(|| {
-        format!(
-            "{}: a separate MCP server named erlkonig is also configured and may duplicate the plugin's tools; Erlkonig leaves it alone.",
-            host.client()
-        )
-    })
+    }
+}
+
+/// The status-details line for a [`manual_config`] client.
+pub fn manual_config_note(host: Host) -> String {
+    format!(
+        "{}: a separate MCP server named erlkonig is also configured and may duplicate the plugin's tools; Erlkonig leaves it alone.",
+        host.client()
+    )
 }
 
 fn read_inventory(
@@ -525,29 +537,52 @@ pub fn prepare(layout: &Layout, executable: &Path, url: &str) -> Result<PathBuf,
     Ok(root)
 }
 
-/// Whether both staged packages are exactly what this executable would stage
-/// now: the same executable path, data directory, endpoint, manifests and
-/// skill. Clients install a copy, so a moved or updated app (or a new port)
-/// leaves an installed plugin pointing at the old one until it is refreshed.
-pub fn staged_is_current(layout: &Layout, executable: &Path, url: &str) -> bool {
-    let Ok(mcp) = mcp_json(layout, executable, url) else {
-        return false;
-    };
-    let root = marketplace_root(layout);
-    PROVIDERS.iter().all(|(provider, manifest_dir, manifest)| {
-        let plugin = root.join(provider);
-        let same = |path: PathBuf, bytes: &[u8]| fs::read(path).is_ok_and(|b| b == bytes);
-        same(plugin.join(".mcp.json"), &mcp)
-            && same(
-                plugin.join(manifest_dir).join("plugin.json"),
-                manifest.as_bytes(),
-            )
-            && same(plugin.join("skills/faculties/SKILL.md"), SKILL)
+/// A digest of exactly what this executable stages for `host`: the
+/// executable path, data directory, endpoint, manifest and skill.
+fn package_identity(
+    layout: &Layout,
+    host: Host,
+    executable: &Path,
+    url: &str,
+) -> Result<String, String> {
+    let (_, _, manifest) = PROVIDERS
+        .iter()
+        .find(|(provider, _, _)| *provider == host.provider())
+        .ok_or("Unknown plugin provider")?;
+    let mut digest = blake3::Hasher::new();
+    for part in [
+        &mcp_json(layout, executable, url)?[..],
+        manifest.as_bytes(),
+        SKILL,
+    ] {
+        digest.update(&(part.len() as u64).to_le_bytes());
+        digest.update(part);
+    }
+    Ok(digest.finalize().to_hex().to_string())
+}
+
+/// Where the identity of the package a client last confirmed installing is
+/// recorded: inside the app's own plugin staging directory, nowhere else.
+fn installed_record(layout: &Layout, host: Host) -> PathBuf {
+    layout
+        .dir
+        .join("plugins")
+        .join(format!("installed-{}", host.provider()))
+}
+
+/// Whether `host` last confirmed installing exactly the package this
+/// executable would stage now. Clients install a copy, so a moved or updated
+/// app (or a new port) leaves an installed plugin pointing at the old one
+/// until it is reinstalled. A failed reinstall leaves the record behind, so
+/// the next refresh retries that client.
+pub fn installed_is_current(layout: &Layout, host: Host, executable: &Path, url: &str) -> bool {
+    package_identity(layout, host, executable, url).is_ok_and(|identity| {
+        fs::read_to_string(installed_record(layout, host)).is_ok_and(|text| text == identity)
     })
 }
 
-/// Quietly bring installed plugins up to date with this executable. While the
-/// staged package is current nothing runs at all. Otherwise each named host
+/// Quietly bring installed plugins up to date with this executable. A host
+/// whose recorded package is current is not even asked. Any other named host
 /// whose client still reports our plugin installed is re-staged and
 /// reinstalled; one the client reports absent is left absent.
 pub fn refresh_if_stale(
@@ -557,11 +592,9 @@ pub fn refresh_if_stale(
     url: &str,
     cancel: &AtomicBool,
 ) -> Vec<(Host, Result<Inventory, String>)> {
-    if installed.is_empty() || staged_is_current(layout, executable, url) {
-        return Vec::new();
-    }
     installed
         .iter()
+        .filter(|(host, _)| !installed_is_current(layout, *host, executable, url))
         .map(|(host, program)| {
             let result = change_with_client(
                 *host,
@@ -749,6 +782,13 @@ pub fn change_with_client(
         return Err(
             "Client did not confirm the requested state; refresh its plugin inventory".into(),
         );
+    }
+    if wanted {
+        // Only a confirmed install records its package. If recording fails,
+        // the next inventory merely reinstalls once more.
+        if let Ok(identity) = package_identity(layout, host, executable, url) {
+            let _ = write_atomic(&installed_record(layout, host), identity.as_bytes());
+        }
     }
     Ok(after)
 }

@@ -335,6 +335,15 @@ when its CLI is available, and a separate Cowork action when Claude Desktop is
 found. Desktop detection uses public macOS bundle lookup, not running
 processes or account state. See [detection policy](plugin/README.md).
 
+**At startup**, once the first plugin inventory is in, Erlkonig asks one
+question if it can connect a client and nothing is connected yet (no Erlkonig
+plugin in any client, no account-managed Cowork plugin, no separate MCP server
+named `erlkonig` in a client's settings): "Connect Erlkonig to Claude Code and
+Codex?", naming only the clients it found. **Install** does exactly what
+checking those rows does; **Not now** does nothing. The answer is not stored:
+an Erlkonig without any integration has no purpose, so the next start asks
+again while nothing is connected. It asks at most once per run.
+
 **The check mark is the consent.** Clicking an unchecked row installs the
 plugin; clicking a checked row removes it. There is no confirmation dialog.
 The mark shows what the client's own CLI reports after the change, so it
@@ -376,17 +385,19 @@ Quit.
 
 **Moving or updating the app refreshes the plugin by itself.** A client
 installs a copy of the plugin package, and that copy names the app's absolute
-executable path, data directory and local endpoint. After each inventory,
-Erlkonig compares the package it staged earlier with what the running copy
+executable path, data directory and local endpoint. Each confirmed install
+records a digest of the package in the app's data directory
+(`plugins/installed-claude`, `plugins/installed-openai`). After each
+inventory, Erlkonig compares each client's record with what the running copy
 would stage. If anything differs (the app was moved or updated, the package
 version changed, or the MCP port changed), it re-stages the package and
 reinstalls it, quietly, for every client that reports the plugin installed.
 A plugin you unchecked is never reinstalled, and one that was never installed
 is never installed. Reload the client afterwards. A refresh is a
 remove-then-install sequence; if a client step fails, you get one short
-message and the row shows the uncertain state rather than a rollback. If one
-client's refresh fails while another's succeeds, the next startup sees the
-package as current and does not retry it: uncheck and check that row.
+message and the row shows the uncertain state rather than a rollback. A
+client whose refresh failed keeps its old record, so the next start (or
+**Refresh plugin status**) tries that client again.
 
 **Manage Cowork plugin** prepares a ZIP of the same Claude package used by
 Claude Code and opens the account Plugins page. Cowork plugins live on your
