@@ -42,6 +42,7 @@ pub struct Runtime {
     node: SharedNode,
     stop: watch::Sender<bool>,
     services: ServiceControl,
+    secret_entry: crate::secret_entry::SecretEntry,
     workers: Vec<JoinHandle<Result<()>>>,
     lock: Option<File>,
 }
@@ -163,6 +164,7 @@ impl Runtime {
             node,
             stop,
             services,
+            secret_entry: crate::secret_entry::SecretEntry::default(),
             workers: Vec::new(),
             lock: Some(lock),
         };
@@ -172,6 +174,7 @@ impl Runtime {
         let node = app.node.clone();
         let binding = app.binding.clone();
         let services = app.services.clone();
+        let secret_entry = app.secret_entry.clone();
         let mcp_url = app.status().mcp_url.context("local MCP address")?;
         app.workers.push(
             thread::Builder::new()
@@ -181,7 +184,7 @@ impl Runtime {
                         let config = ConfigMcp::new(binding.clone(), node.clone(), mcp_url, port, services);
                         let dispatch = WorkspaceDispatch::new(binding, move || {
                             with_node(&node, NodeStore::config)
-                        })?;
+                        })?.with_secret_entry(secret_entry);
                         dispatch.finish(endpoint.serve_until(
                             &[&activity.faculty(&dispatch), &activity.faculty(&config)],
                             stopping(http_stop),
@@ -292,7 +295,13 @@ impl Runtime {
         self.services.retry()
     }
     pub fn begin_shutdown(&self) {
+        // Release a queued/visible local-entry waiter before the HTTP drain.
+        self.secret_entry.close();
         self.stop.send_replace(true);
+    }
+
+    pub fn take_secret_prompt(&self) -> Option<crate::secret_entry::SecretPrompt> {
+        self.secret_entry.take_prompt()
     }
     pub fn is_finished(&self) -> bool {
         self.workers.iter().all(JoinHandle::is_finished)

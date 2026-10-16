@@ -50,6 +50,15 @@ pub trait Shell {
     fn stop_crown(&mut self);
     /// Ask for the status window to be shown (a no-op where none exists).
     fn show_window(&mut self);
+    /// Called only on the shell's event-loop thread. Unsupported platforms
+    /// return Unavailable, never collect credentials through an ordinary alert.
+    fn enter_secret(
+        &mut self,
+        _prompt: &erlkonig_core::secret_entry::SecretPrompt,
+        _terminate: &Arc<AtomicBool>,
+    ) -> erlkonig_core::secret_entry::EntryAnswer {
+        erlkonig_core::secret_entry::EntryAnswer::Unavailable
+    }
 }
 
 /// The menu as plain data: what every entry shows, which optional entries
@@ -497,6 +506,19 @@ impl<S: Shell> App<S> {
         // Image-caused events neither redraw nor slide this deadline forward.
         if Instant::now() < self.next_refresh {
             return false;
+        }
+        if let Some(prompt) = self.runtime.as_ref().and_then(Runtime::take_secret_prompt) {
+            let answer = self.shell.enter_secret(&prompt, &self.terminate);
+            // A signal may have arrived inside a native modal loop. Close the
+            // bridge before sending its answer, so even a stale Save is discarded.
+            if self.terminate.load(Ordering::Relaxed) {
+                self.quit();
+            }
+            prompt.answer(answer);
+            if self.quitting.is_some() {
+                self.next_refresh = Instant::now();
+                return false;
+            }
         }
         self.finish_plugin_task();
         let status = self.runtime.as_ref().map(Runtime::status);

@@ -20,12 +20,19 @@ use triblespace::core::id::Id;
 
 use crate::config::NodeBinding;
 use crate::node_store::ConfigView;
+use crate::secret_entry::{EntryAnswer, EntryKind, EntryRequest, SecretEntry};
 use crate::workspace::Workspace;
 
 const LIST: Tool = Tool {
     name: "list_workspaces",
     description: "List explicitly configured Erlkonig workspaces, exact revision IDs, collection roles, alongside unavailable revisions. This reads app configuration only; it does not open the store or key. Pass one returned workspace ID on every faculty tool call. Names are labels, never selectors; each call resolves and freezes the current binding value.",
     input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+};
+
+const ENTER_LOCAL: Tool = Tool {
+    name: "secrets_enter_local",
+    description: "Ask the running app to show one local secure-entry dialog for the exact workspace, service and secret name. Never put credentials in these arguments. The person enters a login (encrypted JSON username/password) or a generic secret (UTF-8 bytes) locally. Save returns only an immutable secret version ID; Cancel saves nothing. Only one prompt may be active. This synchronous call waits for the person; keep the connection open. Disconnect/cancellation does not undo an admitted Save; an unknown outcome must not be retried automatically. Creates no grants; collection sharing and secret delivery authority are unchanged.",
+    input_schema: r#"{"type":"object","properties":{"service":{"type":"string","minLength":1,"maxLength":160},"name":{"type":"string","minLength":1,"maxLength":160},"kind":{"type":"string","enum":["login","secret"],"default":"login"}},"required":["service","name"],"additionalProperties":false}"#,
 };
 
 pub struct WorkspaceDispatch {
@@ -35,11 +42,13 @@ pub struct WorkspaceDispatch {
     schemas: BTreeMap<&'static str, String>,
     // Handles and their adapters, never a materialized dataset or config cache.
     owners: RefCell<BTreeMap<Id, Owner>>,
+    secret_entry: Option<SecretEntry>,
 }
 
 struct Owner {
     binding: Workspace,
     catalog: NativeFaculties,
+    storage: Storage,
 }
 
 /// Fixed private composition, not a runtime plugin registry. Both adapters
@@ -87,13 +96,20 @@ impl WorkspaceDispatch {
                 register_tool(&mut tools, &mut schemas, tool, faculty.input_schema(tool))?;
             }
         }
+        register_tool(&mut tools, &mut schemas, &ENTER_LOCAL, ENTER_LOCAL.input_schema)?;
         Ok(Self {
             node,
             config: Box::new(config),
             tools,
             schemas,
             owners: RefCell::new(BTreeMap::new()),
+            secret_entry: None,
         })
+    }
+
+    pub fn with_secret_entry(mut self, secret_entry: SecretEntry) -> Self {
+        self.secret_entry = Some(secret_entry);
+        self
     }
 
     /// Stop owners whose binding was removed or superseded. HTTP dispatch is
@@ -135,6 +151,7 @@ impl WorkspaceDispatch {
         config.key = Some(self.node.key.clone());
         Ok(Owner {
             binding: workspace,
+            storage: storage.clone(),
             catalog: NativeFaculties::with_storage(config, storage),
         })
     }
@@ -254,6 +271,9 @@ impl Faculty for WorkspaceDispatch {
         let workspace = resolved?.ok_or_else(|| {
             mcp::invalid_arguments("unknown, removed, or superseded workspace binding; call list_workspaces and explicitly choose a current ID")
         })?;
+        if name == ENTER_LOCAL.name && !workspace.routes.contains_key(&faculties::secrets::DEFAULT_SCOPE_ID) {
+            return Err(mcp::invalid_arguments("workspace collection role secrets is unconfigured; no local entry was requested"));
+        }
         // Even a tool without a storage entrypoint must not run under a
         // silently replaced binding. Storage repeats this at its own opening
         // boundary, so a replacement between these checks cannot retarget it.
@@ -267,6 +287,52 @@ impl Faculty for WorkspaceDispatch {
             entry.insert(self.open(workspace.clone())?);
         }
         let owner = &owners[&workspace.id];
+        if name == ENTER_LOCAL.name {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Entry {
+                service: String,
+                name: String,
+                #[serde(default)]
+                kind: EntryKind,
+            }
+            let args: Entry = mcp::decode_arguments(selected.arguments)?;
+            for text in [&args.service, &args.name] {
+                if text.trim().is_empty() || text.chars().count() > 160 || text.chars().any(char::is_control) {
+                    return Err(mcp::invalid_arguments("service and name must be 1–160 visible characters"));
+                }
+            }
+            let Some(bridge) = &self.secret_entry else {
+                return out.text(r#"{"status":"unavailable"}"#);
+            };
+            // A read-only admission preflight on the same owner, before asking
+            // for plaintext. Rechecked by Secrets::add at its write boundary.
+            owner.storage.with_store(|store, signer, runtime| {
+                owner.storage.open_collection_write(store, faculties::secrets::DEFAULT_SCOPE_ID,
+                    signer.verifying_key(), runtime).map(|_| ())
+            })?;
+            let answer = bridge.request(EntryRequest {
+                workspace: format!("{:X}", owner.binding.id),
+                workspace_label: owner.binding.label.chars().filter(|c| !c.is_control()).take(160).collect(),
+                service: args.service,
+                name: args.name.clone(),
+                kind: args.kind,
+            })?;
+            let response = match answer {
+                EntryAnswer::Cancelled => json!({"status": "cancelled"}),
+                EntryAnswer::Unavailable => json!({"status": "unavailable"}),
+                EntryAnswer::Submit(value) => {
+                    let plaintext = value.encode(args.kind)?;
+                    // Only this worker touches the request-bound storage. An
+                    // error may follow commit, so never claim that it rolled back.
+                    match faculties::secrets::Secrets::with_storage(owner.storage.clone()).add(&args.name, &plaintext) {
+                        Ok(id) => json!({"status": "saved", "secret": format!("{id:X}")}),
+                        Err(_) => json!({"status": "outcome_unknown", "message": "Saving did not report success; it may have committed. Inspect secret metadata before any new entry; nothing was retried."}),
+                    }
+                }
+            };
+            return out.text(serde_json::to_string(&response)?);
+        }
         let faculty = owner
             .catalog
             .registrations()

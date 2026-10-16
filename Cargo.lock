@@ -2273,6 +2273,7 @@ dependencies = [
  "trible",
  "triblespace",
  "triblespace-net",
+ "zeroize",
 ]
 
 [[package]]
@@ -2308,6 +2309,7 @@ dependencies = [
  "signal-hook",
  "tray-icon",
  "winit",
+ "zeroize",
 ]
 
 [[package]]

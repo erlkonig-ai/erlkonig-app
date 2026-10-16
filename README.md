@@ -14,6 +14,39 @@ LaunchAgent or KeepAlive restarter is bundled. A client may start the same
 executable in `mcp-stdio` mode: this connection-scoped transport only forwards
 to the running app, and never owns a pile or starts a backend.
 
+## Local secret entry (private prototype)
+
+`secrets_enter_local` takes the exact `workspace` ID from `list_workspaces`,
+`service` and `name` (each 1–160 visible characters), and optional `kind`
+(`login`, the default, or `secret`). These are presentation metadata, not
+credentials. Do not put a username, password, token or seed in tool arguments
+or chat. On macOS the running app shows the selected workspace label and exact
+ID, service and storage name, with local Save/Cancel fields. The selected
+Secrets route and native WRITE admission are checked before collecting input.
+
+Login uses a username field and a native secure password field. Its encrypted
+UTF-8 payload is JSON with exactly `username` and `password` string fields.
+Generic secret entry uses one native secure field and encrypts its UTF-8 bytes
+without JSON framing. No TOTP generation, password change, credential registry
+or grant operation is added. Existing collection and Secrets delivery semantics
+are unchanged; keep credentials out of an invoice-only shared workspace bundle.
+
+The call waits on the existing app connection. Keep it open until the person
+answers. A successful response is only `{"status":"saved","secret":"<ID>"}`;
+Cancel returns `{"status":"cancelled"}` and publishes nothing. An unsupported
+shell or stopped bridge returns `{"status":"unavailable"}`. The in-process
+bridge accepts one prompt at a time; another simultaneous entry fails busy.
+The HTTP worker remains sequential and can queue calls behind that prompt.
+No prompt job or receipt is persisted, and nothing is retried automatically.
+
+Shutdown closes queued and visible entry before HTTP drain. A Save already
+admitted before shutdown may complete. Disconnecting or sending MCP cancellation
+does not undo an admitted call; if the response is lost, its outcome is unknown.
+`outcome_unknown` likewise means storage did not report success, possibly after
+commit. Inspect `secrets_list` metadata before deciding whether to enter again.
+Owned Rust input buffers are zeroized where feasible and controls are cleared;
+AppKit/editor/intermediate copies are not guaranteed to be erased.
+
 ## One node, named workspaces
 
 One node identity, one logical pile and one local MCP endpoint serve every
