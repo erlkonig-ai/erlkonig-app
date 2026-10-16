@@ -338,8 +338,8 @@ processes or account state. See [detection policy](plugin/README.md).
 **At startup**, once the first plugin inventory is in, Erlkonig asks one
 question if it can connect a client and nothing is connected yet (no Erlkonig
 plugin in any client, no account-managed Cowork plugin, no separate MCP server
-named `erlkonig` in a client's settings): "Connect Erlkonig to Claude Code and
-Codex?", naming only the clients it found. **Install** does exactly what
+named `erlkonig` in a client's settings): "Integrate Erlkonig", listing only
+the clients it found. **Install** does exactly what
 checking those rows does; **Not now** does nothing. The answer is not stored:
 an Erlkonig without any integration has no purpose, so the next start asks
 again while nothing is connected. It asks at most once per run.

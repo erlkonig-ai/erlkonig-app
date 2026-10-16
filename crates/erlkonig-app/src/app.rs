@@ -962,8 +962,8 @@ impl<S: Shell> App<S> {
         }
         let names = hosts.iter().map(|h| h.client()).collect::<Vec<_>>();
         self.ask(
-            "Connect Erlkonig",
-            &format!("Connect Erlkonig to {}?", names.join(" and ")),
+            "Integrate Erlkonig",
+            &names.join(" and "),
             &["Install", "Not now"],
             Then::Connect(hosts),
         );
@@ -1604,14 +1604,14 @@ mod tests {
         let (mut app, claude, codex) = unconnected(temp.path(), &log);
         inventory(&mut app, claude.clone(), codex.clone());
         let prompt = app.view().prompt.expect("onboarding prompt");
-        assert_eq!(prompt.title, "Connect Erlkonig");
-        assert_eq!(prompt.text, "Connect Erlkonig to Claude Code and Codex?");
+        assert_eq!(prompt.title, "Integrate Erlkonig");
+        assert_eq!(prompt.text, "Claude Code and Codex");
         assert_eq!(prompt.buttons, ["Install", "Not now"]);
         app.answer(1);
         // A second inventory in the same run does not ask again.
         inventory(&mut app, claude, codex);
         assert_eq!(app.view().prompt, None);
-        assert_eq!(alerts(&log), ["alert Connect Erlkonig"]);
+        assert_eq!(alerts(&log), ["alert Integrate Erlkonig"]);
     }
 
     #[test]
@@ -1629,7 +1629,7 @@ mod tests {
         };
         report(&mut app, clients, [None, Some(Ok(absent()))], Vec::new());
         let prompt = app.view().prompt.expect("onboarding prompt");
-        assert_eq!(prompt.text, "Connect Erlkonig to Claude Code?");
+        assert_eq!(prompt.text, "Claude Code");
     }
 
     #[test]
@@ -1732,7 +1732,7 @@ mod tests {
             ]
         );
         assert!(app.items.claude.is_checked() && app.items.chatgpt.is_checked());
-        assert_eq!(alerts(&log), ["alert Connect Erlkonig"]);
+        assert_eq!(alerts(&log), ["alert Integrate Erlkonig"]);
         assert_eq!(app.view().prompt, None);
     }
 
@@ -1756,11 +1756,11 @@ mod tests {
         inventory(&mut next, claude, codex);
         assert_eq!(
             next.view().prompt.map(|p| p.title),
-            Some("Connect Erlkonig".into())
+            Some("Integrate Erlkonig".into())
         );
         assert_eq!(
             alerts(&log),
-            ["alert Connect Erlkonig", "alert Connect Erlkonig"]
+            ["alert Integrate Erlkonig", "alert Integrate Erlkonig"]
         );
     }
 
