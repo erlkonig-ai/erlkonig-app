@@ -135,44 +135,49 @@ impl Shell for MacShell {
     fn show_window(&mut self) {}
 }
 
-impl ApplicationHandler<MenuEvent> for App<MacShell> {
+/// The shared application as this binary's own type: winit's
+/// `ApplicationHandler` and `App` both live in other crates, so the orphan
+/// rule needs a local type to implement one for the other.
+struct Mac(App<MacShell>);
+
+impl ApplicationHandler<MenuEvent> for Mac {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         if cause == StartCause::Init {
             match TrayIconBuilder::new()
-                .with_menu(Box::new(self.menu.clone()))
+                .with_menu(Box::new(self.0.menu.clone()))
                 .with_autosave_name("ai.erlkonig.app.status")
                 .build()
             {
                 Ok(tray) => {
-                    let mtm = self.shell.mtm;
+                    let mtm = self.0.shell.mtm;
                     if let Some(button) = tray.ns_status_item().and_then(|item| item.button(mtm)) {
-                        self.shell.crown = Some(DisplayCrown::new(button, self.origin(), mtm));
+                        self.0.shell.crown = Some(DisplayCrown::new(button, self.0.origin(), mtm));
                     } else {
-                        self.problem = Some("Cannot create crown display".into());
+                        self.0.problem = Some("Cannot create crown display".into());
                     }
                     // tray-icon also fits its click-target view when setting
                     // the tooltip. Do this after installing our native image,
                     // so its hit area includes the full, wider crown.
                     let _ = tray.set_tooltip(Some("Erlkonig"));
-                    self.shell.tray = Some(tray);
+                    self.0.shell.tray = Some(tray);
                 }
-                Err(error) => self.problem = Some(format!("Cannot create menu: {error}")),
+                Err(error) => self.0.problem = Some(format!("Cannot create menu: {error}")),
             }
-            self.start();
+            self.0.start();
         }
-        self.refresh(event_loop);
+        self.0.refresh(event_loop);
     }
     fn resumed(&mut self, _: &ActiveEventLoop) {}
     fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: MenuEvent) {
-        self.on_menu(event);
-        self.refresh(event_loop);
+        self.0.on_menu(event);
+        self.0.refresh(event_loop);
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_refresh));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.0.next_refresh));
     }
     fn exiting(&mut self, _: &ActiveEventLoop) {
-        self.finish_termination();
+        self.0.finish_termination();
     }
 }
 
@@ -197,10 +202,10 @@ pub fn main() {
     };
     let layout = Layout::application(paths::default_data_dir().expect("data directory"))
         .expect("node bootstrap location");
-    let mut app = App::new(shell, layout, terminate);
-    if let Err(error) = event_loop.run_app(&mut app) {
+    let mut mac = Mac(App::new(shell, layout, terminate));
+    if let Err(error) = event_loop.run_app(&mut mac) {
         eprintln!("Erlkonig: {error}");
     }
     // Idempotent fallback for event-loop construction/execution errors.
-    app.finish_termination();
+    mac.0.finish_termination();
 }
