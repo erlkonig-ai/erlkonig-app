@@ -53,10 +53,16 @@ entry before deciding whether to enter again; never decrypt values to verify Sav
 Owned Rust input buffers are zeroized where feasible and controls are cleared;
 AppKit/editor/intermediate copies are not guaranteed to be erased.
 
-Native item reads select an exact version and ciphertext body. Explicit child
-export additionally selects an exact ciphertext child handle and encoding; it
-reveals that child's plaintext to the caller. Unknown/repeated roles and body
-alternatives remain native relations, not a single chosen login or JSON export.
+For metadata-only inspection, use `secrets_item_inspect` with an exact version
+and ciphertext body; `secrets_item_open` without a body lists body alternatives
+only. With an exact body, `secrets_item_open` exports a PRIVATE FACTS archive,
+including plaintext inline integer/flag values. That is an explicitly authorized
+body disclosure, not metadata-only inspection. Out-of-line text and attachment
+children remain ciphertext handles. Explicit `secrets_item_export` additionally
+selects an exact ciphertext child handle and encoding and reveals that child's
+plaintext to the caller. Never export private facts or values to verify Save.
+Unknown/repeated roles and body alternatives remain native relations, not a
+single chosen login or JSON export.
 Legacy consumers of raw `secrets_get` continue to receive the original bytes,
 but must explicitly adopt native item APIs to consume new local login entries.
 
