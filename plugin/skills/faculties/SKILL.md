@@ -193,13 +193,21 @@ goal, not a wiki page.
   For requested local credential entry, use `secrets_enter_local` with the exact
   selected workspace, service, storage name and `kind` (`login` or `secret`).
   Those arguments are metadata only: the person types the value in the app,
-  never here. Login stores encrypted JSON `username`/`password`; generic entry
-  stores UTF-8 bytes. Keep the call/connection open for Save or Cancel. Report
-  only status/version ID, never call `secrets_get` to verify the value. Cancel
-  saves nothing; a lost response or `outcome_unknown` requires metadata inspection
-  before any new entry, never an automatic retry. No sharing grant is created;
+  never here. Login creates a native structured encrypted item with separate
+  username/password semantic roles, not JSON; generic entry keeps its exact raw
+  UTF-8 bytes. The storage name is a public label. Keep the call/connection open
+  for Save or Cancel. Report only status/version ID, never decrypt to verify Save.
+  Cancel saves nothing; a lost response or `outcome_unknown` requires metadata
+  inspection (`secrets_items` for login, `secrets_list` for generic entry) before
+  any new entry, never an automatic retry. No sharing grant is created;
   keep the Secrets route separate from an invoice-only shared bundle. If local
   entry is unavailable, continue without it. Do not ask them to paste a key here.
+  For an explicitly authorized native disclosure, select the exact version and
+  body; `secrets_item_open` without a body lists alternatives, while an exact body
+  exports native facts whose child values remain encrypted. `secrets_item_export`
+  additionally requires the exact child handle and encoding and reveals plaintext
+  to the caller. Do not silently choose a body alternative or collapse repeated
+  or unknown roles. Old raw versions retain the `secrets_get` byte contract.
 - **Read before you write.** Search the wiki and list goals before creating
   an entry, so you add to existing work instead of duplicating it.
 - **First use.** Empty results describe the selected roots, not the entire

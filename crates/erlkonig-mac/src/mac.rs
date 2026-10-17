@@ -11,7 +11,10 @@ use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSApplication, NSWorkspac
 use objc2_foundation::{NSBundle, NSString, NSURL};
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tray_icon::menu::MenuEvent;
 use tray_icon::{TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
@@ -151,7 +154,7 @@ impl Shell for MacShell {
         let alert = NSAlert::new(self.mtm);
         alert.setMessageText(&NSString::from_str("Save a local secret"));
         alert.setInformativeText(&NSString::from_str(&format!(
-            "Workspace: {}\nID: {}\nService: {}\nSecret name: {}\n\nSaved encrypted in this workspace. This does not create sharing grants. Cancel saves nothing.",
+            "Workspace: {}\nID: {}\nService: {}\nSecret name: {}\n\nEnter the credentials in the fields below, then choose Save. Never put them in chat. Saved encrypted in this workspace; no sharing grants are created. Cancel saves nothing.",
             request.workspace_label, request.workspace, request.service, request.name,
         )));
         alert.addButtonWithTitle(&NSString::from_str("Save"));
@@ -159,22 +162,34 @@ impl Shell for MacShell {
         cancel.setKeyEquivalent(&NSString::from_str("\u{1b}"));
         let login = request.kind == EntryKind::Login;
         let rect = |y, height| NSRect::new(NSPoint::new(0.0, y), NSSize::new(380.0, height));
-        let fields = NSView::initWithFrame(NSView::alloc(self.mtm), rect(0.0, if login { 120.0 } else { 60.0 }));
-        let password = NSSecureTextField::initWithFrame(NSSecureTextField::alloc(self.mtm), rect(0.0, 24.0));
-        let password_label = NSTextField::labelWithString(&NSString::from_str(if login { "Password" } else { "Secret value" }), self.mtm);
+        let fields = NSView::initWithFrame(
+            NSView::alloc(self.mtm),
+            rect(0.0, if login { 120.0 } else { 60.0 }),
+        );
+        let password =
+            NSSecureTextField::initWithFrame(NSSecureTextField::alloc(self.mtm), rect(0.0, 24.0));
+        let password_label = NSTextField::labelWithString(
+            &NSString::from_str(if login { "Password" } else { "Secret value" }),
+            self.mtm,
+        );
         password_label.setFrame(rect(28.0, 20.0));
         fields.addSubview(&password_label);
         fields.addSubview(&password);
         let username = if login {
-            let label = NSTextField::labelWithString(&NSString::from_str("Username or email"), self.mtm);
+            let label =
+                NSTextField::labelWithString(&NSString::from_str("Username or email"), self.mtm);
             label.setFrame(rect(88.0, 20.0));
             let field = NSTextField::initWithFrame(NSTextField::alloc(self.mtm), rect(60.0, 24.0));
             fields.addSubview(&label);
             fields.addSubview(&field);
             // Both views are retained by the accessory throughout this modal.
-            unsafe { field.setNextKeyView(Some(&password)); }
+            unsafe {
+                field.setNextKeyView(Some(&password));
+            }
             Some(field)
-        } else { None };
+        } else {
+            None
+        };
         alert.setAccessoryView(Some(&fields));
         let window = alert.window();
         if let Some(username) = &username {
@@ -196,20 +211,29 @@ impl Shell for MacShell {
             }
         });
         let timer = unsafe { NSTimer::timerWithTimeInterval_repeats_block(0.1, true, &check) };
-        unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSModalPanelRunLoopMode); }
+        unsafe {
+            NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSModalPanelRunLoopMode);
+        }
         let result = alert.runModal();
         timer.invalidate();
         let answer = if result == NSAlertFirstButtonReturn
-            && !prompt.is_cancelled() && !terminate.load(Ordering::Relaxed)
+            && !prompt.is_cancelled()
+            && !terminate.load(Ordering::Relaxed)
         {
             let value = Zeroizing::new(password.stringValue().to_string());
             EntryAnswer::Submit(if let Some(username) = &username {
                 EntryValue::login(Zeroizing::new(username.stringValue().to_string()), value)
-            } else { EntryValue::secret(value) })
-        } else { EntryAnswer::Cancelled };
+            } else {
+                EntryValue::secret(value)
+            })
+        } else {
+            EntryAnswer::Cancelled
+        };
         // Clear controls promptly; AppKit/editor copies are not guaranteed erased.
         password.setStringValue(&NSString::from_str(""));
-        if let Some(username) = username { username.setStringValue(&NSString::from_str("")); }
+        if let Some(username) = username {
+            username.setStringValue(&NSString::from_str(""));
+        }
         window.orderOut(None);
         answer
     }
@@ -273,7 +297,9 @@ pub fn main() {
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
         // Native menu callbacks may arrive inside NSAlert's nested loop before
         // winit can dispatch its event. Let the modal's timer observe Quit too.
-        if e.id == "erlkonig.quit" { modal_terminate.store(true, Ordering::Relaxed); }
+        if e.id == "erlkonig.quit" {
+            modal_terminate.store(true, Ordering::Relaxed);
+        }
         let _ = proxy.send_event(e);
     }));
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {

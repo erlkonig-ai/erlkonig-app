@@ -24,8 +24,10 @@ or chat. On macOS the running app shows the selected workspace label and exact
 ID, service and storage name, with local Save/Cancel fields. The selected
 Secrets route and native WRITE admission are checked before collecting input.
 
-Login uses a username field and a native secure password field. Its encrypted
-UTF-8 payload is JSON with exactly `username` and `password` string fields.
+Login uses a username field and a native secure password field. Save creates a
+native structured encrypted item with separate username/password semantic roles,
+not a JSON body. The storage name is its explicit public label; field values
+stay encrypted. Existing raw secret versions are not rewritten or reinterpreted.
 Generic secret entry uses one native secure field and encrypts its UTF-8 bytes
 without JSON framing. Both login fields, or the generic value, must contain at
 least one character. An empty-field Save returns a fixed error asking for a new
@@ -46,9 +48,17 @@ Shutdown closes queued and visible entry before HTTP drain. A Save already
 admitted before shutdown may complete. Disconnecting or sending MCP cancellation
 does not undo an admitted call; if the response is lost, its outcome is unknown.
 `outcome_unknown` likewise means storage did not report success, possibly after
-commit. Inspect `secrets_list` metadata before deciding whether to enter again.
+commit. Inspect `secrets_items` metadata for login or `secrets_list` for generic
+entry before deciding whether to enter again; never decrypt values to verify Save.
 Owned Rust input buffers are zeroized where feasible and controls are cleared;
 AppKit/editor/intermediate copies are not guaranteed to be erased.
+
+Native item reads select an exact version and ciphertext body. Explicit child
+export additionally selects an exact ciphertext child handle and encoding; it
+reveals that child's plaintext to the caller. Unknown/repeated roles and body
+alternatives remain native relations, not a single chosen login or JSON export.
+Legacy consumers of raw `secrets_get` continue to receive the original bytes,
+but must explicitly adopt native item APIs to consume new local login entries.
 
 ## One node, named workspaces
 
@@ -483,6 +493,20 @@ against its disposable authenticated HTTP owner. No model request or account
 credential is required. See the probe's own output for the precise evidence;
 mock transport results are not native binary acceptance. No validation step
 requires changing real client profiles or opening the GUI.
+
+For an explicitly approved candidate-only GUI lifecycle check, build
+`cargo build -p erlkonig-core --example accept-fixture` from the same frozen
+source/dependency closure, then run `python3 scripts/accept/isolated_app.py
+/absolute/candidate/Erlkonig.app --fixture-binary /absolute/target/debug/examples/accept-fixture
+--root /absolute/new-fixture-directory`. This directly executes the candidate,
+never `open -n` or an installed app. The new fixture has its own HOME, client
+profiles, temporary directory and inventory-only fake CLIs; native settings are
+port 0, sync off and maintenance off before launch. It checks authenticated MCP,
+explicit workspace routing, forwarding without another owner, Quit/drain and
+relaunch with the same fixture identity, then stops all fixture processes.
+It does not open credential-entry UI: invented native Save/Cancel and plaintext
+output guards belong to the core local-entry/dispatch tests. Do not reuse a
+previous app executable or fixture directory as evidence for a new candidate.
 
 To package an already signed candidate without rebuilding or changing it:
 

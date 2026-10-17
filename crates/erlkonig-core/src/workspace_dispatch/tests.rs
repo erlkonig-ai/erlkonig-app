@@ -108,8 +108,13 @@ fn local_entry_args(workspace: &Workspace) -> Value {
 fn take_local_prompt(bridge: &SecretEntry) -> crate::secret_entry::SecretPrompt {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if let Some(prompt) = bridge.take_prompt() { return prompt; }
-        assert!(std::time::Instant::now() < deadline, "local prompt was not delivered");
+        if let Some(prompt) = bridge.take_prompt() {
+            return prompt;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "local prompt was not delivered"
+        );
         std::thread::yield_now();
     }
 }
@@ -118,15 +123,28 @@ fn take_local_prompt(bridge: &SecretEntry) -> crate::secret_entry::SecretPrompt 
 fn local_entry_missing_route_rejects_before_key_or_pile_io() {
     let f = Fixture::new();
     let mut workspace = f.workspace("No secrets");
-    workspace.routes.remove(&faculties::secrets::DEFAULT_SCOPE_ID);
+    workspace
+        .routes
+        .remove(&faculties::secrets::DEFAULT_SCOPE_ID);
     f.configure(&mut workspace);
     let view = f.node.lock().unwrap().as_mut().unwrap().config().unwrap();
     let absent = f.dir.path().join("absent");
     let bridge = SecretEntry::default();
-    let dispatch = WorkspaceDispatch::new(NodeBinding {
-        pile: absent.join("node.pile"), key: absent.join("node.key"), signer: f.dispatch.node.signer,
-    }, move || Ok(view.clone())).unwrap().with_secret_entry(bridge.clone());
-    let error = rpc_call(&mut session(&dispatch), ENTER_LOCAL.name, local_entry_args(&workspace));
+    let dispatch = WorkspaceDispatch::new(
+        NodeBinding {
+            pile: absent.join("node.pile"),
+            key: absent.join("node.key"),
+            signer: f.dispatch.node.signer,
+        },
+        move || Ok(view.clone()),
+    )
+    .unwrap()
+    .with_secret_entry(bridge.clone());
+    let error = rpc_call(
+        &mut session(&dispatch),
+        ENTER_LOCAL.name,
+        local_entry_args(&workspace),
+    );
     assert!(error.to_string().contains("secrets is unconfigured"));
     assert!(dispatch.owners.borrow().is_empty());
     assert!(bridge.take_prompt().is_none());
@@ -145,14 +163,28 @@ fn local_entry_cancel_publishes_nothing_and_never_accepts_secret_arguments() {
         assert_eq!(prompt.request.kind, EntryKind::Login);
         prompt.answer(EntryAnswer::Cancelled);
     });
-    let response = f.call(ENTER_LOCAL.name, local_entry_args(&workspace)).unwrap();
+    let response = f
+        .call(ENTER_LOCAL.name, local_entry_args(&workspace))
+        .unwrap();
     worker.join().unwrap();
-    assert_eq!(serde_json::from_str::<Value>(&response).unwrap(), json!({"status":"cancelled"}));
+    assert_eq!(
+        serde_json::from_str::<Value>(&response).unwrap(),
+        json!({"status":"cancelled"})
+    );
     assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
     let mut arguments = local_entry_args(&workspace);
     arguments["value"] = json!("invented input that must be rejected");
     assert!(f.call(ENTER_LOCAL.name, arguments).is_err());
-    assert!(f.call("secrets_list", selection(&workspace)).unwrap().contains("(no secrets)"));
+    assert!(
+        f.call("secrets_list", selection(&workspace))
+            .unwrap()
+            .contains("(no secrets)")
+    );
+    assert!(
+        f.call("secrets_items", selection(&workspace))
+            .unwrap()
+            .contains("(no structured items)")
+    );
 }
 
 #[test]
@@ -165,7 +197,12 @@ fn local_entry_empty_save_returns_fixed_error_and_publishes_nothing() {
     let secret_error = "Local secret entry requires a nonempty value. No secret was saved. Request a new local entry.";
     for (kind, username, value, expected) in [
         (EntryKind::Login, "", "", login_error),
-        (EntryKind::Login, "invented@example.invalid", "", login_error),
+        (
+            EntryKind::Login,
+            "invented@example.invalid",
+            "",
+            login_error,
+        ),
         (EntryKind::Login, "", "invented-password", login_error),
         (EntryKind::Secret, "", "", secret_error),
     ] {
@@ -177,19 +214,31 @@ fn local_entry_empty_save_returns_fixed_error_and_publishes_nothing() {
             assert_eq!(prompt.request.kind, kind);
             prompt.answer(EntryAnswer::Submit(match kind {
                 EntryKind::Login => EntryValue::login(
-                    Zeroizing::new(username.into()), Zeroizing::new(value.into()),
+                    Zeroizing::new(username.into()),
+                    Zeroizing::new(value.into()),
                 ),
                 EntryKind::Secret => EntryValue::secret(Zeroizing::new(value.into())),
             }));
         });
         let mut args = local_entry_args(&workspace);
-        if kind == EntryKind::Secret { args["kind"] = json!("secret"); }
+        if kind == EntryKind::Secret {
+            args["kind"] = json!("secret");
+        }
         let error = f.call(ENTER_LOCAL.name, args).unwrap_err();
         worker.join().unwrap();
         assert_eq!(error.to_string(), expected);
         assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
     }
-    assert!(f.call("secrets_list", selection(&workspace)).unwrap().contains("(no secrets)"));
+    assert!(
+        f.call("secrets_list", selection(&workspace))
+            .unwrap()
+            .contains("(no secrets)")
+    );
+    assert!(
+        f.call("secrets_items", selection(&workspace))
+            .unwrap()
+            .contains("(no structured items)")
+    );
 }
 
 #[test]
@@ -201,16 +250,28 @@ fn local_entry_write_denied_route_never_requests_plaintext() {
         // Reuse the existing node owner, not another opener alongside it.
         let mut guard = f.node.lock().unwrap();
         let node = guard.as_mut().unwrap();
-        let root = node.pile.collection("Synthetic denied Secrets", CollectionPolicy::new(
-            AdmissionPolicy::Open, AdmissionPolicy::direct(other.verifying_key()),
-        )).unwrap().handle();
-        workspace.routes.insert(faculties::secrets::DEFAULT_SCOPE_ID, root);
+        let root = node
+            .pile
+            .collection(
+                "Synthetic denied Secrets",
+                CollectionPolicy::new(
+                    AdmissionPolicy::Open,
+                    AdmissionPolicy::direct(other.verifying_key()),
+                ),
+            )
+            .unwrap()
+            .handle();
+        workspace
+            .routes
+            .insert(faculties::secrets::DEFAULT_SCOPE_ID, root);
     }
     f.configure(&mut workspace);
     let bridge = SecretEntry::default();
     f.dispatch.secret_entry = Some(bridge.clone());
     let before = fs::read(&f.dispatch.node.pile).unwrap();
-    let error = f.call(ENTER_LOCAL.name, local_entry_args(&workspace)).unwrap_err();
+    let error = f
+        .call(ENTER_LOCAL.name, local_entry_args(&workspace))
+        .unwrap_err();
     assert!(error.to_string().contains("not admitted to WRITE"));
     assert!(bridge.take_prompt().is_none());
     assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
@@ -219,6 +280,11 @@ fn local_entry_write_denied_route_never_requests_plaintext() {
 #[test]
 fn local_entry_keeps_the_original_workspace_if_configuration_changes_during_input() {
     use crate::secret_entry::EntryValue;
+    use faculties::secrets::item::PrivateText;
+    use faculties::secrets::schema::{
+        KIND_ITEM, ROLE_PASSWORD, ROLE_USERNAME, field_role, field_text, item_field,
+    };
+    use triblespace::core::metadata;
     use zeroize::Zeroizing;
     let mut f = Fixture::new();
     let a = f.workspace("Same label");
@@ -248,16 +314,52 @@ fn local_entry_keeps_the_original_workspace_if_configuration_changes_during_inpu
     });
     let response = f.call(ENTER_LOCAL.name, local_entry_args(&a)).unwrap();
     worker.join().unwrap();
+    assert!(!response.contains("invented@example.invalid"));
+    assert!(!response.contains("invented-password"));
     let response: Value = serde_json::from_str(&response).unwrap();
     assert_eq!(response.as_object().unwrap().len(), 2);
     assert_eq!(response["status"], "saved");
     let secret = Id::from_hex(response["secret"].as_str().unwrap()).unwrap();
     let storage = f.dispatch.owners.borrow()[&a.id].storage.clone();
     let secrets = faculties::secrets::Secrets::with_storage(storage);
-    let stored = secrets.get(secret).unwrap();
-    assert_eq!(stored.as_slice(), br#"{"username":"invented@example.invalid","password":"invented-password"}"#);
-    assert_eq!(secrets.list().unwrap().len(), 1);
-    assert!(!f.call("secrets_list", selection(&b)).unwrap().contains(&format!("{secret:x}")));
+    let items = secrets.list_items().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, secret);
+    assert_eq!(items[0].name.as_deref(), Some("fixture login"));
+    let body = items[0].body;
+    let facts = secrets.open_item_body(secret, body).unwrap();
+    for (role, expected) in [
+        (ROLE_USERNAME, "invented@example.invalid"),
+        (ROLE_PASSWORD, "invented-password"),
+    ] {
+        let children: Vec<_> = find!(child: PrivateText, pattern!(&facts, [
+            {metadata::tag: KIND_ITEM, item_field: _?field},
+            {_?field @ field_role: role, field_text: ?child},
+        ]))
+        .collect();
+        assert_eq!(children.len(), 1);
+        let opened = secrets.open_item_child(secret, body, children[0]).unwrap();
+        assert_eq!(&*opened.bytes, expected.as_bytes());
+        let pile = fs::read(&f.dispatch.node.pile).unwrap();
+        assert!(
+            !pile
+                .windows(expected.len())
+                .any(|window| window == expected.as_bytes())
+        );
+    }
+    // Structured logins do not silently become raw bodies or legacy JSON.
+    assert!(secrets.list().unwrap().is_empty());
+    assert!(secrets.get(secret).is_err());
+    // The old workspace request ID was superseded during entry, so inspect
+    // the captured owner's metadata directly rather than reselecting it.
+    let metadata = format!("{items:?}");
+    assert!(!metadata.contains("invented@example.invalid"));
+    assert!(!metadata.contains("invented-password"));
+    assert!(
+        !f.call("secrets_items", selection(&b))
+            .unwrap()
+            .contains(&format!("{secret:x}"))
+    );
 }
 
 #[test]
@@ -272,21 +374,80 @@ fn local_entry_closed_bridge_is_unavailable_and_generic_success_returns_id_only(
     let worker = std::thread::spawn(move || {
         let prompt = take_local_prompt(&worker_bridge);
         assert_eq!(prompt.request.kind, EntryKind::Secret);
-        prompt.answer(EntryAnswer::Submit(EntryValue::secret(Zeroizing::new("invented generic value".into()))));
+        prompt.answer(EntryAnswer::Submit(EntryValue::secret(Zeroizing::new(
+            "  invented generic value\n{\"password\":\"not a login\"} 🗝\r\n".into(),
+        ))));
     });
     let mut args = local_entry_args(&workspace);
     args["kind"] = json!("secret");
-    let response: Value = serde_json::from_str(&f.call(ENTER_LOCAL.name, args).unwrap()).unwrap();
+    let response = f.call(ENTER_LOCAL.name, args).unwrap();
+    assert!(!response.contains("invented generic value"));
+    assert!(!response.contains("not a login"));
+    let response: Value = serde_json::from_str(&response).unwrap();
     worker.join().unwrap();
     assert_eq!(response.as_object().unwrap().len(), 2);
     assert_eq!(response["status"], "saved");
     let id = Id::from_hex(response["secret"].as_str().unwrap()).unwrap();
     let storage = f.dispatch.owners.borrow()[&workspace.id].storage.clone();
-    assert_eq!(faculties::secrets::Secrets::with_storage(storage).get(id).unwrap().as_slice(), b"invented generic value");
+    let secrets = faculties::secrets::Secrets::with_storage(storage);
+    assert_eq!(
+        secrets.get(id).unwrap().as_slice(),
+        "  invented generic value\n{\"password\":\"not a login\"} 🗝\r\n".as_bytes()
+    );
+    assert!(secrets.list_items().unwrap().is_empty());
+    assert!(secrets.open_item(id).is_err());
     bridge.close();
-    let response = f.call(ENTER_LOCAL.name, local_entry_args(&workspace)).unwrap();
-    assert_eq!(serde_json::from_str::<Value>(&response).unwrap(), json!({"status":"unavailable"}));
+    let response = f
+        .call(ENTER_LOCAL.name, local_entry_args(&workspace))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&response).unwrap(),
+        json!({"status":"unavailable"})
+    );
     assert!(bridge.take_prompt().is_none());
+}
+
+#[test]
+fn secure_entry_output_never_contains_plaintext() {
+    // Capture actual stdout/stderr, including dependency logs, from isolated
+    // synthetic-only success cases. This never invokes an app or live endpoint.
+    for name in [
+        "local_entry_keeps_the_original_workspace_if_configuration_changes_during_input",
+        "local_entry_closed_bridge_is_unavailable_and_generic_success_returns_id_only",
+    ] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args([
+            "--exact",
+            &format!("workspace_dispatch::tests::{name}"),
+            "--nocapture",
+        ]);
+        for (key, _) in std::env::vars_os() {
+            if key == "PILE"
+                || key == "TRIBLESPACE_KEY"
+                || key.to_string_lossy().starts_with("TRIBLESPACE_COLLECTION_")
+            {
+                child.env_remove(key);
+            }
+        }
+        let output = child.output().unwrap();
+        assert!(output.status.success(), "synthetic entry subprocess failed");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        for stream in [&output.stdout, &output.stderr] {
+            for private in [
+                "invented@example.invalid",
+                "invented-password",
+                "invented generic value",
+                "not a login",
+            ] {
+                assert!(
+                    !stream
+                        .windows(private.len())
+                        .any(|window| window == private.as_bytes()),
+                    "local entry logged plaintext"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -313,24 +474,42 @@ fn schema_registration_does_not_open_a_pile_key_or_configuration() {
     assert_eq!(
         erp_tools,
         BTreeSet::from([
-            "erp_account_add", "erp_amex_import", "erp_invoice_add",
-            "erp_review", "erp_classify", "erp_match",
+            "erp_account_add",
+            "erp_amex_import",
+            "erp_invoice_add",
+            "erp_review",
+            "erp_classify",
+            "erp_match",
         ])
     );
     let mut server = session(&dispatch);
-    let response = server.dispatch(Bytes::from(
-        br#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#.to_vec(),
-    )).unwrap().unwrap();
+    let response = server
+        .dispatch(Bytes::from(
+            br#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#.to_vec(),
+        ))
+        .unwrap()
+        .unwrap();
     let response: Value = serde_json::from_str(&response).unwrap();
     let listed_erp: BTreeSet<_> = response["result"]["tools"]
-        .as_array().unwrap().iter()
+        .as_array()
+        .unwrap()
+        .iter()
         .filter(|tool| tool["name"].as_str().unwrap().starts_with("erp_"))
         .map(|tool| {
-            assert!(tool["inputSchema"]["required"].as_array().unwrap().contains(&json!("workspace")));
+            assert!(
+                tool["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("workspace"))
+            );
             tool["name"].as_str().unwrap()
-        }).collect();
+        })
+        .collect();
     assert_eq!(listed_erp, erp_tools);
-    assert_eq!(rpc_call(&mut server, "erp_review", json!({"month":"2026-09"}))["error"]["code"], -32602);
+    assert_eq!(
+        rpc_call(&mut server, "erp_review", json!({"month":"2026-09"}))["error"]["code"],
+        -32602
+    );
     assert!(dispatch.owners.borrow().is_empty());
     dispatch.close().unwrap();
     assert!(!pile.exists());
@@ -347,9 +526,16 @@ fn private_erp_tools_and_files_stay_in_the_exact_request_workspace() {
     let a = f.workspace("Same label");
     let b = f.workspace("Same label");
     let actor = format!("{:X}", genid().id);
-    let account: Value = serde_json::from_str(&f.call("erp_account_add", json!({
-        "workspace": format!("{:X}", a.id), "label": "Synthetic account", "actor": actor,
-    })).unwrap()).unwrap();
+    let account: Value = serde_json::from_str(
+        &f.call(
+            "erp_account_add",
+            json!({
+                "workspace": format!("{:X}", a.id), "label": "Synthetic account", "actor": actor,
+            }),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let import = json!({
         "workspace": format!("{:X}", a.id), "data": ERP_CSV_BASE64,
         "name": "synthetic-statement.csv", "account": account["account"],
@@ -360,14 +546,19 @@ fn private_erp_tools_and_files_stay_in_the_exact_request_workspace() {
     assert_eq!(imported["rows"], 1);
     assert_eq!(imported["activities"].as_array().unwrap().len(), 1);
     let review = |workspace: &Workspace| {
-        f.call("erp_review", json!({
-            "workspace": format!("{:X}", workspace.id), "month": "2026-09",
-        })).unwrap()
+        f.call(
+            "erp_review",
+            json!({
+                "workspace": format!("{:X}", workspace.id), "month": "2026-09",
+            }),
+        )
+        .unwrap()
     };
     let before_review = fs::read(&f.dispatch.node.pile).unwrap();
     let only_a = review(&a);
     assert!(
-        only_a.contains("Synthetic shop") && only_a.contains("synthetic-ref")
+        only_a.contains("Synthetic shop")
+            && only_a.contains("synthetic-ref")
             && only_a.contains("Original FX USD 8.19 / rate 1.162"),
         "{only_a}"
     );
@@ -377,12 +568,25 @@ fn private_erp_tools_and_files_stay_in_the_exact_request_workspace() {
         "{only_b}"
     );
     assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before_review);
-    assert!(f.call("files_show", json!({
-        "workspace":format!("{:X}", a.id),"id":imported["file"],
-    })).unwrap().contains("synthetic-statement.csv"));
-    assert!(f.call("files_show", json!({
-        "workspace":format!("{:X}", b.id),"id":imported["file"],
-    })).is_err());
+    assert!(
+        f.call(
+            "files_show",
+            json!({
+                "workspace":format!("{:X}", a.id),"id":imported["file"],
+            })
+        )
+        .unwrap()
+        .contains("synthetic-statement.csv")
+    );
+    assert!(
+        f.call(
+            "files_show",
+            json!({
+                "workspace":format!("{:X}", b.id),"id":imported["file"],
+            })
+        )
+        .is_err()
+    );
     let mut wrong_workspace = import;
     wrong_workspace["workspace"] = json!(format!("{:X}", b.id));
     assert!(
@@ -390,14 +594,30 @@ fn private_erp_tools_and_files_stay_in_the_exact_request_workspace() {
         "an account in A is not an account in B"
     );
     assert_eq!(review(&b), only_b);
-    assert!(!f.call("files_list", selection(&b)).unwrap().contains("synthetic-statement.csv"));
+    assert!(
+        !f.call("files_list", selection(&b))
+            .unwrap()
+            .contains("synthetic-statement.csv")
+    );
     assert!(f.call("erp_review", json!({"month":"2026-09"})).is_err());
-    assert!(f.call("erp_review", json!({
-        "workspace":"Same label","month":"2026-09",
-    })).is_err());
-    assert!(f.call("erp_review", json!({
-        "workspace":format!("{:X}",genid().id),"month":"2026-09",
-    })).is_err());
+    assert!(
+        f.call(
+            "erp_review",
+            json!({
+                "workspace":"Same label","month":"2026-09",
+            })
+        )
+        .is_err()
+    );
+    assert!(
+        f.call(
+            "erp_review",
+            json!({
+                "workspace":format!("{:X}",genid().id),"month":"2026-09",
+            })
+        )
+        .is_err()
+    );
     assert!(f.call("erp_unregistered", selection(&a)).is_err());
 }
 
@@ -411,13 +631,19 @@ fn private_erp_missing_role_keeps_the_catalog_and_older_workspace_available() {
     f.configure(&mut workspace);
     let before = fs::read(&f.dispatch.node.pile).unwrap();
     for (tool, arguments) in [
-        ("erp_review", json!({
-            "workspace":format!("{:X}",workspace.id),"month":"2026-09",
-        })),
-        ("erp_account_add", json!({
-            "workspace":format!("{:X}",workspace.id),"label":"must not exist",
-            "actor":format!("{:X}",genid().id),
-        })),
+        (
+            "erp_review",
+            json!({
+                "workspace":format!("{:X}",workspace.id),"month":"2026-09",
+            }),
+        ),
+        (
+            "erp_account_add",
+            json!({
+                "workspace":format!("{:X}",workspace.id),"label":"must not exist",
+                "actor":format!("{:X}",genid().id),
+            }),
+        ),
     ] {
         let error = f.call(tool, arguments).unwrap_err();
         assert!(
@@ -426,10 +652,21 @@ fn private_erp_missing_role_keeps_the_catalog_and_older_workspace_available() {
         );
     }
     assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
-    assert!(f.dispatch.tools().iter().any(|tool| tool.name == "erp_review"));
-    assert!(f.call("compass_add", json!({
-        "workspace":format!("{:X}",workspace.id),"title":"Public tools still work",
-    })).is_ok());
+    assert!(
+        f.dispatch
+            .tools()
+            .iter()
+            .any(|tool| tool.name == "erp_review")
+    );
+    assert!(
+        f.call(
+            "compass_add",
+            json!({
+                "workspace":format!("{:X}",workspace.id),"title":"Public tools still work",
+            })
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -437,20 +674,35 @@ fn private_erp_import_does_not_supply_a_missing_files_role() {
     let f = Fixture::new();
     let mut workspace = f.workspace("No Files route");
     let actor = format!("{:X}", genid().id);
-    let account: Value = serde_json::from_str(&f.call("erp_account_add", json!({
-        "workspace":format!("{:X}",workspace.id),"label":"Synthetic account","actor":actor,
-    })).unwrap()).unwrap();
+    let account: Value = serde_json::from_str(
+        &f.call(
+            "erp_account_add",
+            json!({
+                "workspace":format!("{:X}",workspace.id),"label":"Synthetic account","actor":actor,
+            }),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     workspace
         .routes
         .remove(&faculties::schemas::files::DEFAULT_SCOPE_ID);
     f.configure(&mut workspace);
     let before = fs::read(&f.dispatch.node.pile).unwrap();
-    let error = f.call("erp_amex_import", json!({
-        "workspace":format!("{:X}",workspace.id),"data":ERP_CSV_BASE64,
-        "name":"must-not-import.csv","account":account["account"],
-        "currency":"EUR","month":"2026-09","actor":actor,
-    })).unwrap_err();
-    assert!(format!("{error:#}").contains("is unconfigured"), "{error:#}");
+    let error = f
+        .call(
+            "erp_amex_import",
+            json!({
+                "workspace":format!("{:X}",workspace.id),"data":ERP_CSV_BASE64,
+                "name":"must-not-import.csv","account":account["account"],
+                "currency":"EUR","month":"2026-09","actor":actor,
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("is unconfigured"),
+        "{error:#}"
+    );
     assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
 }
 
