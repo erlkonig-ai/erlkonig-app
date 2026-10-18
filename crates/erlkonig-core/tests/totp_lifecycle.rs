@@ -49,7 +49,8 @@ struct Fixture {
     layout: Layout,
     selected: Value,
     omitted: Id,
-    denied: Value,
+    held_without_read: Value,
+    other_holder: Value,
 }
 
 impl Fixture {
@@ -116,7 +117,8 @@ impl Fixture {
 
         // This is a resident, signer-decryptable version, not an absent-handle
         // lookup. Its source grants WRITE to this node but READ only to another
-        // synthetic identity. Native routing must still refuse READ.
+        // synthetic identity. Secrets deliberately preserves already-delivered
+        // local-wrap possession; current collection READ does not revoke it.
         let other = ed25519_dalek::SigningKey::from_bytes(&[91; 32]);
         let mut pile =
             faculties::storage::open_pile_strict_as(&layout.default_pile(), signer.verifying_key())
@@ -165,6 +167,54 @@ impl Fixture {
         );
         let denied_child = children[0];
         drop(opened);
+
+        // Same admitted source, but this item was sealed only to the other
+        // holder. Establish residency and valid opening there; this node has
+        // no delivered local wrap and must not obtain a code through routing.
+        let foreign = secrets::item::prepare(
+            restricted.handle(),
+            &other,
+            "public other-holder TOTP",
+            secrets::item::ItemInput {
+                fields: &input(),
+                attachments: &[],
+            },
+            (epoch, epoch).try_to_inline().unwrap(),
+        )
+        .unwrap();
+        let foreign_id = foreign.secret;
+        let foreign_facts = foreign.fragment.facts().clone();
+        let bodies: Vec<_> = find!(body: secrets::item::ItemBody, pattern!(&foreign_facts, [{foreign_id @ structured_body: ?body}])).collect();
+        assert_eq!(bodies.len(), 1);
+        let foreign_body = bodies[0];
+        pile.commit(restricted.source(), &signer, foreign.fragment)
+            .unwrap();
+        let opened = secrets::item::open_exact(
+            pile.snapshot().unwrap(),
+            &foreign_facts,
+            foreign_id,
+            foreign_body,
+            &other,
+        )
+        .unwrap();
+        let children: Vec<_> = find!(child: PrivateText, pattern!(opened.facts(), [{field_role: ROLE_CUSTOM, field_text: ?child}])).collect();
+        assert_eq!(children.len(), 1);
+        let foreign_child = children[0];
+        assert_eq!(
+            opened.totp_at(foreign_child, 59).unwrap().code.as_str(),
+            "287082"
+        );
+        assert!(
+            secrets::item::open_exact(
+                pile.snapshot().unwrap(),
+                &foreign_facts,
+                foreign_id,
+                foreign_body,
+                &signer
+            )
+            .is_err()
+        );
+        drop(opened);
         pile.close().unwrap();
 
         let mut node = NodeStore::open(&layout.default_pile(), signer).unwrap();
@@ -189,8 +239,10 @@ impl Fixture {
             layout,
             selected,
             omitted,
-            denied: json!({"workspace":format!("{denied_id:X}"), "secret":format!("{denied_secret:x}"),
+            held_without_read: json!({"workspace":format!("{denied_id:X}"), "secret":format!("{denied_secret:x}"),
                 "body":hex::encode(denied_body.raw), "child":hex::encode(denied_child.raw)}),
+            other_holder: json!({"workspace":format!("{denied_id:X}"), "secret":format!("{foreign_id:x}"),
+                "body":hex::encode(foreign_body.raw), "child":hex::encode(foreign_child.raw)}),
         }
     }
 }
@@ -289,7 +341,10 @@ fn code(response: &Value) -> Value {
 }
 
 fn refused(response: Value, reason: Option<&str>) {
-    assert!(response.get("error").is_some() || response["result"]["isError"] == true);
+    assert!(
+        response.get("error").is_some() || response["result"]["isError"] == true,
+        "negative case reason={reason:?}; synthetic response={response}"
+    );
     let encoded = response.to_string();
     assert!(
         !encoded.contains(SEED)
@@ -302,7 +357,7 @@ fn refused(response: Value, reason: Option<&str>) {
 }
 
 #[test]
-fn authenticated_totp_dispatch_preserves_exact_workspace_read_and_signer_boundaries() {
+fn authenticated_totp_dispatch_preserves_exact_workspace_possession_and_signer_boundaries() {
     let fixture = Fixture::new();
     let mut native = Native::start(&fixture);
     let listed = native
@@ -323,18 +378,24 @@ fn authenticated_totp_dispatch_preserves_exact_workspace_read_and_signer_boundar
     code(&native.call("secrets_item_totp", fixture.selected.clone()));
     let mut no_workspace = fixture.selected.clone();
     no_workspace.as_object_mut().unwrap().remove("workspace");
+    eprintln!("negative case: missing workspace");
     refused(native.call("secrets_item_totp", no_workspace), None);
     let mut omitted = fixture.selected.clone();
     omitted["workspace"] = json!(format!("{:X}", fixture.omitted));
+    eprintln!("negative case: omitted Secrets route");
     refused(
         native.call("secrets_item_totp", omitted),
         Some("unconfigured"),
     );
+    // A delivered local wrap remains usable without current collection READ.
+    code(&native.call("secrets_item_totp", fixture.held_without_read.clone()));
+    eprintln!("negative case: resident item delivered only to the other holder");
     refused(
-        native.call("secrets_item_totp", fixture.denied.clone()),
-        Some("READ"),
+        native.call("secrets_item_totp", fixture.other_holder.clone()),
+        Some("no resident decryptable structured item"),
     );
     for name in ["body", "child"] {
+        eprintln!("negative case: wrong exact {name}");
         let mut wrong = fixture.selected.clone();
         wrong[name] = json!("00".repeat(32));
         refused(native.call("secrets_item_totp", wrong), None);
@@ -343,6 +404,7 @@ fn authenticated_totp_dispatch_preserves_exact_workspace_read_and_signer_boundar
     let saved = fixture.layout.default_key().with_extension("original");
     fs::rename(fixture.layout.default_key(), &saved).unwrap();
     signing_key_file::init(&fixture.layout.default_key()).unwrap();
+    eprintln!("negative case: replaced synthetic signer");
     refused(
         native.call("secrets_item_totp", fixture.selected.clone()),
         Some("signing identity changed"),
