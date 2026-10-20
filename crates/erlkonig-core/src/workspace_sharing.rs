@@ -243,7 +243,6 @@ impl NodeStore {
                     let snapshot = staging.snapshot()?;
                     if child.validate_delegation(&snapshot).is_ok()
                         && descriptor::validate_proof_evidence(
-                            &snapshot,
                             *root,
                             &snapshot.get(*root)?,
                             &child,

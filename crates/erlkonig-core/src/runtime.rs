@@ -860,7 +860,7 @@ fn node_session(
                         received += progress.received_bytes as u128;
                         let health = peer.health();
                         let sent = health.blob_serving.sent_bytes;
-                        let waiting = health.available.iter().map(|root| format!("blake3:{}", hex::encode(root.raw))).collect::<Vec<_>>();
+                        let waiting = health.named_unselected.iter().map(|root| format!("blake3:{}", hex::encode(root.raw))).collect::<Vec<_>>();
                         update(status, |s| if s.node.grants_waiting != waiting { s.node.grants_waiting = waiting; });
                         let delta = progress.received_bytes.saturating_add(sent.saturating_sub(previous_sent));
                         previous_sent = sent;
