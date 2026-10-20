@@ -8589,6 +8589,7 @@ dependencies = [
  "file_type",
  "getrandom 0.4.3",
  "hex",
+ "hex-literal",
  "hifitime",
  "iroh-base",
  "libc",

@@ -134,7 +134,6 @@ impl Fixture {
         .unwrap();
         let epoch = hifitime::Epoch::from_unix_seconds(0.0);
         let sealed = secrets::item::prepare(
-            restricted.handle(),
             &signer,
             "public denied TOTP",
             secrets::item::ItemInput {
@@ -172,7 +171,6 @@ impl Fixture {
         // holder. Establish residency and valid opening there; this node has
         // no delivered local wrap and must not obtain a code through routing.
         let foreign = secrets::item::prepare(
-            restricted.handle(),
             &other,
             "public other-holder TOTP",
             secrets::item::ItemInput {
