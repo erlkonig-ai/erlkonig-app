@@ -306,6 +306,53 @@ User-invoked Habit shell predicates remain an explicit subprocess exception.
 They are not resident app sidecars, but arbitrary descendants are outside the
 native shutdown guarantee.
 
+### Bounded FD failure evidence (macOS)
+
+Maintenance failures matching the fixed EMFILE/ENFILE messages now capture
+diagnostics before the app handler formats status or sends ordinary metrics.
+This is **handler-time evidence**, not the failed allocation's syscall snapshot:
+the upstream error is already a string and temporary descriptors may already
+have closed. Matching examines at most 8 KiB of its prefix/causal suffix, accepts
+wrapped `tempfile` errors without relying on the outer `raw_os_error`, and stores
+neither error text nor paths, descriptor numbers, contents, or handles.
+
+Capture reads this process's actual `getrlimit(RLIMIT_NOFILE)`, realtime and
+monotonic clocks, and `proc_pidinfo(PROC_PIDLISTFDS)` into a fixed 8192-entry
+stack buffer. Returned descriptors are counted by allowlisted native type,
+including an unknown-type bucket. A full buffer is incomplete and its count a
+lower bound. A failed/malformed census is absent, never zero; clocks and limits
+also remain absent when unavailable. The list, limit and clock calls are not
+one atomic observation. Other platforms currently retain limits/clocks but
+report the FD census as unavailable.
+
+The controller keeps at most 60 in-memory samples at a nominal one-second
+cadence; store work can delay that cadence. A failure carries the maximum
+**complete** sample no older than 60 monotonic seconds and its timestamp, plus
+the number of eligible samples. Stale, partial, future and unknown-clock samples
+do not qualify. This is a recent sampled high-water mark, never an exact peak;
+sampling alone creates no durable writes.
+
+Sixteen preallocated occurrence slots use a nonblocking capture lock. Full or
+contended capture increments a saturating loss count; a cumulative loss fact is
+published even without a subsequent successful capture. Capture opens no file,
+allocates no dynamic buffer, takes no node lock and never calls the writer.
+The existing controller publishes bounded batches to the private
+`erlkonig-metrics` collection at most once per ten seconds (plus shutdown).
+Commit/flush failure retains the same occurrence identities and clocks for
+retry, including commit-success/flush-failure ambiguity. Writer failure does
+not recursively trigger capture. Pending memory is not crash-durable; final
+shutdown failure or process exit can lose it. The ordinary UI `metrics_problem`
+is not a durable failure latch and may be replaced by other metrics outcomes.
+Ordinary metric cadence and detailed error reporting are unchanged.
+
+The facts use the public typed attributes in `erlkonig_core::node_metrics::fd`,
+joining occurrence -> handler/recent-sample snapshot -> type/count aggregates
+inside the existing metrics collection. There is no new JSON body, secondary
+store, dedicated UI or MCP reader. `node_metrics` tests demonstrate direct
+`find!` queries, sparse/unknown values, reopening and idempotent retry.
+Attribute anchors and event-kind IDs were minted with `trible genid` on
+2026-10-21 and are recorded verbatim beside their declarations.
+
 ## Workspace requests
 
 Tell your assistant the workspace to use. Clients call `list_workspaces` to
