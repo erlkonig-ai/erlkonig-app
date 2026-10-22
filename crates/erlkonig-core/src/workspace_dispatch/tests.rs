@@ -476,6 +476,7 @@ fn schema_registration_does_not_open_a_pile_key_or_configuration() {
         BTreeSet::from([
             "erp_account_add",
             "erp_amex_import",
+            "erp_amex_migrate",
             "erp_invoice_add",
             "erp_review",
             "erp_classify",
