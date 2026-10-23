@@ -119,6 +119,145 @@ fn take_local_prompt(bridge: &SecretEntry) -> crate::secret_entry::SecretPrompt 
     }
 }
 
+fn take_protected_prompt(bridge: &ProtectedAccessBridge) -> crate::protected_access::ProtectedPrompt {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(prompt) = bridge.take_prompt() {
+            return prompt;
+        }
+        assert!(std::time::Instant::now() < deadline, "protected prompt was not delivered");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn protected_local_secret_prompts_for_exact_workspace_each_time_and_cancel_emits_nothing() {
+    use crate::secret_entry::EntryValue;
+    use faculties::secrets::protected::Purpose;
+    use zeroize::Zeroizing;
+    let mut f = Fixture::new();
+    let workspace = f.workspace("Protected fixture");
+    let other = f.workspace("Other fixture");
+    let unlock = ProtectedAccessBridge::default();
+    f.dispatch.protected_access = Some(unlock.clone());
+    let entry = SecretEntry::default();
+    f.dispatch.secret_entry = Some(entry.clone());
+    let worker = std::thread::spawn(move || {
+        let prompt = take_local_prompt(&entry);
+        assert!(prompt.request.protected);
+        prompt.answer(EntryAnswer::Submit(
+            EntryValue::secret(Zeroizing::new("synthetic protected bytes".into()))
+                .with_protection(Zeroizing::new("synthetic protection passphrase".into())),
+        ));
+    });
+    let mut args = local_entry_args(&workspace);
+    args["kind"] = json!("secret");
+    args["protected"] = json!(true);
+    let saved: Value = serde_json::from_str(&f.call(ENTER_LOCAL.name, args).unwrap()).unwrap();
+    worker.join().unwrap();
+    assert_eq!(saved["status"], "saved");
+    assert_eq!(saved.as_object().unwrap().len(), 2);
+    let secret = Id::from_hex(saved["secret"].as_str().unwrap()).unwrap();
+    assert!(f.call("secrets_list", selection(&workspace)).unwrap().contains("fixture login"));
+    assert!(unlock.take_prompt().is_none(), "metadata must not unlock");
+    let storage = f.dispatch.owners.borrow()[&workspace.id].storage.clone();
+    let secrets = faculties::secrets::Secrets::with_storage(storage);
+    let ordinary = secrets.add("ordinary", b"ordinary fixture").unwrap();
+    assert_eq!(secrets.get(ordinary).unwrap().as_slice(), b"ordinary fixture");
+    assert!(unlock.take_prompt().is_none(), "ordinary values must not prompt");
+    let mut get = selection(&other);
+    get["secret"] = json!(format!("{secret:X}"));
+    assert!(f.call("secrets_get", get).is_err());
+    assert!(unlock.take_prompt().is_none(), "another collection cannot request this secret");
+    let mut get = selection(&workspace);
+    get["secret"] = json!(format!("{secret:X}"));
+    for approve in [true, false, true] {
+        let bridge = unlock.clone();
+        let expected = workspace.clone();
+        let worker = std::thread::spawn(move || {
+            let prompt = take_protected_prompt(&bridge);
+            assert_eq!(prompt.workspace, format!("{:X}", expected.id));
+            assert_eq!(prompt.workspace_label, expected.label);
+            assert_eq!(prompt.request.secret(), secret);
+            assert_eq!(prompt.request.collection(), expected.routes[&faculties::secrets::DEFAULT_SCOPE_ID]);
+            assert!(matches!(prompt.request.purpose(), Purpose::Get));
+            if approve {
+                let unlocked = prompt.request.unlock_password(b"synthetic protection passphrase");
+                prompt.answer(unlocked);
+            } else {
+                drop(prompt);
+            }
+        });
+        let mut parts = Vec::new();
+        let result = f.dispatch.call(
+            "secrets_get",
+            Bytes::from(serde_json::to_vec(&get).unwrap()),
+            &mut Out::new(&mut |part| { parts.push(part); Ok(()) }),
+        );
+        worker.join().unwrap();
+        if approve {
+            result.unwrap();
+            assert_eq!(parts.len(), 1);
+            let Part::Blob { bytes, .. } = &parts[0] else { panic!("expected exact binary export") };
+            assert_eq!(bytes.as_ref(), b"synthetic protected bytes");
+        } else {
+            assert!(result.is_err());
+            assert!(parts.is_empty());
+        }
+        assert!(unlock.take_prompt().is_none());
+    }
+    let pile = fs::read(&f.dispatch.node.pile).unwrap();
+    for plaintext in ["synthetic protected bytes", "synthetic protection passphrase"] {
+        assert!(!pile.windows(plaintext.len()).any(|window| window == plaintext.as_bytes()));
+    }
+}
+
+#[test]
+fn protected_local_login_stays_structured_and_requires_unlock() {
+    use crate::secret_entry::EntryValue;
+    use faculties::secrets::protected::Purpose;
+    use zeroize::Zeroizing;
+    let mut f = Fixture::new();
+    let workspace = f.workspace("Protected login fixture");
+    let unlock = ProtectedAccessBridge::default();
+    f.dispatch.protected_access = Some(unlock.clone());
+    let entry = SecretEntry::default();
+    f.dispatch.secret_entry = Some(entry.clone());
+    let worker = std::thread::spawn(move || {
+        let prompt = take_local_prompt(&entry);
+        assert!(prompt.request.protected);
+        assert_eq!(prompt.request.kind, EntryKind::Login);
+        prompt.answer(EntryAnswer::Submit(
+            EntryValue::login(
+                Zeroizing::new("synthetic@example.invalid".into()),
+                Zeroizing::new("synthetic login password".into()),
+            ).with_protection(Zeroizing::new("synthetic protection passphrase".into())),
+        ));
+    });
+    let mut args = local_entry_args(&workspace);
+    args["protected"] = json!(true);
+    let saved: Value = serde_json::from_str(&f.call(ENTER_LOCAL.name, args).unwrap()).unwrap();
+    worker.join().unwrap();
+    assert_eq!(saved["status"], "saved");
+    let secret = Id::from_hex(saved["secret"].as_str().unwrap()).unwrap();
+    let storage = f.dispatch.owners.borrow()[&workspace.id].storage.clone();
+    let secrets = faculties::secrets::Secrets::with_storage(storage);
+    let items = secrets.list_items().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, secret);
+    assert!(secrets.list().unwrap().is_empty());
+    assert!(unlock.take_prompt().is_none());
+    let worker = std::thread::spawn(move || {
+        let prompt = take_protected_prompt(&unlock);
+        assert_eq!(prompt.request.secret(), secret);
+        assert!(matches!(prompt.request.purpose(), Purpose::OpenFacts));
+        let unlocked = prompt.request.unlock_password(b"synthetic protection passphrase");
+        prompt.answer(unlocked);
+    });
+    secrets.open_item_body(secret, items[0].body).unwrap();
+    worker.join().unwrap();
+}
+
 #[test]
 fn local_entry_missing_route_rejects_before_key_or_pile_io() {
     let f = Fixture::new();
@@ -161,6 +300,7 @@ fn local_entry_cancel_publishes_nothing_and_never_accepts_secret_arguments() {
     let worker = std::thread::spawn(move || {
         let prompt = take_local_prompt(&bridge);
         assert_eq!(prompt.request.kind, EntryKind::Login);
+        assert!(!prompt.request.protected);
         prompt.answer(EntryAnswer::Cancelled);
     });
     let response = f
@@ -175,6 +315,9 @@ fn local_entry_cancel_publishes_nothing_and_never_accepts_secret_arguments() {
     let mut arguments = local_entry_args(&workspace);
     arguments["value"] = json!("invented input that must be rejected");
     assert!(f.call(ENTER_LOCAL.name, arguments).is_err());
+    let mut arguments = local_entry_args(&workspace);
+    arguments["passphrase"] = json!("never a protocol argument");
+    assert!(f.call(ENTER_LOCAL.name, arguments).is_err());
     assert!(
         f.call("secrets_list", selection(&workspace))
             .unwrap()
@@ -185,6 +328,40 @@ fn local_entry_cancel_publishes_nothing_and_never_accepts_secret_arguments() {
             .unwrap()
             .contains("(no structured items)")
     );
+}
+
+#[test]
+fn local_entry_protection_schema_is_optional_and_mismatch_never_downgrades() {
+    use crate::secret_entry::EntryValue;
+    use zeroize::Zeroizing;
+    let mut f = Fixture::new();
+    let workspace = f.workspace("Protection mismatch fixture");
+    let schema: Value = serde_json::from_str(f.dispatch.input_schema(&ENTER_LOCAL)).unwrap();
+    assert_eq!(schema["properties"]["protected"]["default"], false);
+    assert!(!schema["required"].as_array().unwrap().contains(&json!("protected")));
+    for protected in [true, false] {
+        let bridge = SecretEntry::default();
+        f.dispatch.secret_entry = Some(bridge.clone());
+        let before = fs::read(&f.dispatch.node.pile).unwrap();
+        let worker = std::thread::spawn(move || {
+            let prompt = take_local_prompt(&bridge);
+            assert_eq!(prompt.request.protected, protected);
+            let value = EntryValue::secret(Zeroizing::new("synthetic value".into()));
+            let value = if protected {
+                value
+            } else {
+                value.with_protection(Zeroizing::new("synthetic passphrase".into()))
+            };
+            prompt.answer(EntryAnswer::Submit(value));
+        });
+        let mut args = local_entry_args(&workspace);
+        args["kind"] = json!("secret");
+        args["protected"] = json!(protected);
+        let error = f.call(ENTER_LOCAL.name, args).unwrap_err();
+        worker.join().unwrap();
+        assert_eq!(error.to_string(), "local entry protection mismatch; no secret was saved");
+        assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
+    }
 }
 
 #[test]

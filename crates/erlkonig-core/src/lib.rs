@@ -16,6 +16,7 @@ pub mod paths;
 mod resource_guard;
 pub mod runtime;
 pub mod secret_entry;
+pub mod protected_access;
 pub mod status;
 pub mod transport;
 pub mod words;
