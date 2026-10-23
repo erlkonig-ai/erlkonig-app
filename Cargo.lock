@@ -2300,6 +2300,7 @@ dependencies = [
  "triblespace",
  "triblespace-net",
  "zeroize",
+ "zip",
 ]
 
 [[package]]
@@ -2340,11 +2341,13 @@ dependencies = [
  "objc2-quartz-core 0.3.2",
  "objc2-security",
  "objc2-service-management",
+ "serde_json",
  "signal-hook",
  "tray-icon",
  "triblespace",
  "winit",
  "zeroize",
+ "zip",
 ]
 
 [[package]]

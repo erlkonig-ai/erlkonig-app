@@ -1,6 +1,9 @@
 //! Explicit synthetic-only trial; never launch the ordinary application.
 //! --help and --self-test do not initialize AppKit. --interactive is opt-in.
-//! No pile, configuration, keychain, listener, Runtime, plugins, or file I/O.
+//! Original password modes have no pile/configuration/file I/O. The explicit
+//! --interactive-import NEW_ROOT mode creates only a fresh synthetic export,
+//! key and store under NEW_ROOT, requiring HOME=NEW_ROOT/home and TMPDIR=NEW_ROOT/tmp.
+//! No mode starts a keychain, listener, Runtime, plugins or normal application.
 //! Only the fixed public fixture below is encrypted; entered passwords and
 //! opened bytes are zeroizing and never printed. AppKit's own buffers have the
 //! same limitations as the unchanged production passphrase implementation.
@@ -8,6 +11,13 @@
 #[cfg(target_os = "macos")]
 #[path = "../crates/erlkonig-mac/src/protected_access.rs"]
 mod protected_access;
+
+#[cfg(target_os = "macos")]
+#[path = "../crates/erlkonig-mac/src/local_import.rs"]
+mod local_import;
+
+#[cfg(target_os = "macos")]
+mod protected_import_trial;
 
 #[cfg(target_os = "macos")]
 mod trial {
@@ -214,6 +224,7 @@ fn main() {
         // Do not use the normal application's argument parser or initialization.
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         let result = match args.as_slice() {
+            [arg, root] if arg == "--interactive-import" => protected_import_trial::interactive(std::path::Path::new(root)),
             [arg] if arg == "--interactive" => trial::interactive(),
             [arg] if arg == "--self-test" => trial::self_test(),
             [] => { trial::report("help", true); return; }

@@ -7,6 +7,40 @@ the app deliberately refuses to share its data-owner lock with it.
 
 These are pending interactive checks, not an already-passed checklist:
 
+Protected local 1Password importer (synthetic-only, isolated candidate):
+
+The source-only helper extension is `protected-secrets-trial --interactive-import
+NEW_ABSOLUTE_ROOT`. Launch only after explicit coordination: set
+`HOME=NEW_ABSOLUTE_ROOT/home` and `TMPDIR=NEW_ABSOLUTE_ROOT/tmp` in a clean
+environment; the root must not exist yet. The helper creates public synthetic
+export/key/store files there, starts no normal runtime/services, and only returns
+its pre-opened synthetic source when that exact fixture is selected. Other paths
+are never opened. Five deliberate UI phases test picker Cancel, passphrase Cancel,
+new Save, wrong-passphrase verification and correct receipt reuse. The entire
+helper is bounded to 15 minutes; prompt admission remains 120 seconds. This is
+not an automatically passed check, and it does not replace production deployment
+acceptance. Existing `--interactive` password-trial mode is unchanged.
+
+- Call `secrets_import_1password_local` with an exact workspace. Only the
+  local picker may select the invented `.1pux`; no file path or data goes in
+  the tool call. Cancel the picker, then separately Cancel the passphrase
+  confirmation; neither publishes an import.
+- Verify the bounded confirmation names the workspace, explicitly says NEW
+  import (or prior receipt verification), no ordinary node-key access, older
+  readable copies NOT revoked, no Touch ID/recovery, and once-only work after
+  Save. Confirm it fits the screen without the long-details modal path.
+- Wrong extension/non-regular file, changed source, empty/mismatched passphrase,
+  shutdown and expiry before admission must save nothing. After admission a
+  long import can drain beyond the UI deadline; never infer rollback from a
+  closed connection. Check metadata only, not secret exports, for completion.
+- Successful synthetic import returns an opaque receipt and counts only.
+  Explicitly verify that receipt with the same local export/passphrase, then
+  test wrong passphrase and wrong export: neither may create a replacement.
+  Omitting the receipt intentionally requests another new import.
+- Ordinary node-key reads of original/items/attachments/receipt must fail;
+  titles, export path, values and passphrase must not appear in results/logs.
+  Do not perform these checks with the real company export.
+
 Protected Secrets candidate checks (only with invented data in an isolated
 store/HOME; do not run against an existing credential):
 

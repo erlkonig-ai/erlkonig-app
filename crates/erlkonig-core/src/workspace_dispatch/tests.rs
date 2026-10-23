@@ -130,6 +130,195 @@ fn take_protected_prompt(bridge: &ProtectedAccessBridge) -> crate::protected_acc
     }
 }
 
+fn take_import_prompt(bridge: &LocalImport) -> crate::local_import::ImportPrompt {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(prompt) = bridge.take_prompt() { return prompt; }
+        assert!(std::time::Instant::now() < deadline, "import prompt was not delivered");
+        std::thread::yield_now();
+    }
+}
+
+fn synthetic_import_file(path: &std::path::Path) {
+    use std::io::Write;
+    let mut archive = zip::ZipWriter::new(fs::File::create(path).unwrap());
+    for (name, bytes) in [
+        ("export.attributes", br#"{"version":3}"#.as_slice()),
+        ("export.data", br#"{"accounts":[{"vaults":[{"items":[{"uuid":"synthetic-id","overview":{"title":"SYNTHETIC-PRIVATE-title"},"details":{"notesPlain":"SYNTHETIC-PRIVATE-value"}}]}]}]}"#.as_slice()),
+    ] {
+        archive.start_file(name, zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored)).unwrap();
+        archive.write_all(bytes).unwrap();
+    }
+    archive.finish().unwrap();
+}
+
+#[test]
+fn local_import_arguments_cancel_and_unavailable_never_save() {
+    let mut f = Fixture::new();
+    let workspace = f.workspace("Synthetic import");
+    let bridge = LocalImport::default();
+    f.dispatch.local_import = Some(bridge.clone());
+    let schema: Value = serde_json::from_str(f.dispatch.input_schema(&IMPORT_LOCAL)).unwrap();
+    assert_eq!(schema["required"], json!(["workspace"]));
+    assert_eq!(schema["properties"].as_object().unwrap().len(), 2);
+    let before = fs::read(&f.dispatch.node.pile).unwrap();
+    for key in ["password", "passphrase", "data", "bytes", "path", "protected", "kind", "SYNTHETIC-PRIVATE-key"] {
+        let mut args = selection(&workspace);
+        args[key] = json!("SYNTHETIC-PRIVATE-value");
+        let error = f.call(IMPORT_LOCAL.name, args).unwrap_err().to_string();
+        assert!(!error.contains("SYNTHETIC-PRIVATE"));
+        assert!(bridge.take_prompt().is_none());
+    }
+    for args in [json!({}), json!({"workspace":"wrong-kind"}), json!({"workspace":format!("{:X}", workspace.id),"previous_import":42}), json!({"workspace":format!("{:X}", workspace.id),"previous_import":null})] {
+        assert!(f.call(IMPORT_LOCAL.name, args).is_err());
+        assert!(bridge.take_prompt().is_none());
+    }
+    let duplicate = format!(r#"{{"workspace":"{:X}","SYNTHETIC-PRIVATE-key":1,"SYNTHETIC-PRIVATE-key":2}}"#, workspace.id);
+    assert!(!f.raw(IMPORT_LOCAL.name, &duplicate).unwrap_err().to_string().contains("SYNTHETIC-PRIVATE"));
+    let worker_bridge = bridge.clone();
+    let worker = std::thread::spawn(move || {
+        let prompt = take_import_prompt(&worker_bridge);
+        assert!(prompt.request.previous_import.is_none());
+        prompt.answer(ImportAnswer::Cancelled);
+    });
+    assert_eq!(f.call(IMPORT_LOCAL.name, selection(&workspace)).unwrap(), r#"{"status":"cancelled"}"#);
+    worker.join().unwrap();
+    bridge.close();
+    assert_eq!(f.call(IMPORT_LOCAL.name, selection(&workspace)).unwrap(), r#"{"status":"unavailable"}"#);
+    assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
+}
+
+#[test]
+fn local_import_frozen_binding_and_metadata_only_success() {
+    use crate::local_import::ImportSource;
+    use zeroize::Zeroizing;
+    let mut f = Fixture::new();
+    let a = f.workspace("Same label");
+    let b = f.workspace("Same label");
+    let path = f.dir.path().join("SYNTHETIC-PRIVATE-filename.1pux");
+    synthetic_import_file(&path);
+    let source = ImportSource::open(&path).unwrap();
+    let bridge = LocalImport::default();
+    f.dispatch.local_import = Some(bridge.clone());
+    let node = f.node.clone();
+    let original = a.clone();
+    let other = b.clone();
+    let worker = std::thread::spawn(move || {
+        let prompt = take_import_prompt(&bridge);
+        assert_eq!(prompt.request.workspace, format!("{:X}", original.id));
+        assert!(prompt.request.previous_import.is_none());
+        // This also proves no store lease is held while UI is active.
+        let mut guard = node.lock().unwrap();
+        let node = guard.as_mut().unwrap();
+        let view = node.config().unwrap();
+        let mut changed = original;
+        changed.routes = other.routes;
+        node.put_workspace(&view, &changed).unwrap();
+        prompt.answer(ImportAnswer::Submit { source, passphrase: Zeroizing::new("SYNTHETIC-PRIVATE-passphrase".into()) });
+    });
+    let result = f.call(IMPORT_LOCAL.name, selection(&a)).unwrap();
+    worker.join().unwrap();
+    assert!(!result.contains("SYNTHETIC-PRIVATE"));
+    assert!(!result.contains("source"));
+    assert!(!result.contains("archive\""));
+    let result: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(result["status"], "saved");
+    assert_eq!(result["protected"], true);
+    assert_eq!(result["reused"], false);
+    assert_eq!(result["counts"]["items"], 1);
+    let receipt = Id::from_hex(result["receipt"].as_str().unwrap()).unwrap();
+    let storage = f.dispatch.owners.borrow()[&a.id].storage.clone();
+    let secrets = faculties::secrets::Secrets::with_storage(storage);
+    assert!(secrets.get(receipt).is_err());
+    let items = secrets.list_items().unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(!format!("{items:?}").contains("SYNTHETIC-PRIVATE"));
+    assert!(secrets.open_item_body(items[0].id, items[0].body).is_err());
+    assert!(f.call("secrets_items", selection(&b)).unwrap().contains("(no structured items)"));
+    let pile = fs::read(&f.dispatch.node.pile).unwrap();
+    assert!(!pile.windows(b"SYNTHETIC-PRIVATE".len()).any(|part| part == b"SYNTHETIC-PRIVATE"));
+}
+
+#[test]
+fn local_import_invalid_source_is_not_saved_and_does_not_echo_content() {
+    use crate::local_import::ImportSource;
+    use zeroize::Zeroizing;
+    let mut f = Fixture::new();
+    let workspace = f.workspace("Synthetic invalid import");
+    let path = f.dir.path().join("synthetic.1pux");
+    fs::write(&path, b"SYNTHETIC-PRIVATE-invalid-archive").unwrap();
+    let source = ImportSource::open(&path).unwrap();
+    fs::write(&path, b"SYNTHETIC-PRIVATE-changed-source").unwrap();
+    let bridge = LocalImport::default();
+    f.dispatch.local_import = Some(bridge.clone());
+    let before = fs::read(&f.dispatch.node.pile).unwrap();
+    let worker = std::thread::spawn(move || {
+        take_import_prompt(&bridge).answer(ImportAnswer::Submit { source, passphrase: Zeroizing::new("synthetic".into()) });
+    });
+    let result = f.call(IMPORT_LOCAL.name, selection(&workspace)).unwrap();
+    worker.join().unwrap();
+    assert!(!result.contains("SYNTHETIC-PRIVATE"));
+    assert_eq!(serde_json::from_str::<Value>(&result).unwrap()["status"], "not_saved");
+    assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
+}
+
+#[test]
+fn local_import_explicit_receipt_verifies_without_replay_or_downgrade() {
+    use crate::local_import::ImportSource;
+    use zeroize::Zeroizing;
+    let mut f = Fixture::new();
+    let workspace = f.workspace("Synthetic receipt verification");
+    let path = f.dir.path().join("synthetic.1pux");
+    synthetic_import_file(&path);
+    let mut receipt: Option<String> = None;
+    for (password, expected) in [("synthetic passphrase", "saved"), ("wrong synthetic passphrase", "not_saved"), ("synthetic passphrase", "saved")] {
+        let source = ImportSource::open(&path).unwrap();
+        let bridge = LocalImport::default();
+        f.dispatch.local_import = Some(bridge.clone());
+        let previous_import = receipt.clone();
+        let worker = std::thread::spawn(move || {
+            let prompt = take_import_prompt(&bridge);
+            assert_eq!(prompt.request.previous_import, previous_import);
+            prompt.answer(ImportAnswer::Submit { source, passphrase: Zeroizing::new(password.into()) });
+        });
+        let mut arguments = selection(&workspace);
+        if let Some(receipt) = &receipt { arguments["previous_import"] = json!(receipt); }
+        let before = fs::read(&f.dispatch.node.pile).unwrap();
+        let result = f.call(IMPORT_LOCAL.name, arguments).unwrap();
+        worker.join().unwrap();
+        assert!(!result.contains(password));
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["status"], expected);
+        if receipt.is_some() {
+            assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
+            if expected == "saved" {
+                assert_eq!(result["reused"], true);
+                assert_eq!(result["receipt"], receipt.as_ref().unwrap().as_str());
+            }
+        } else {
+            receipt = Some(result["receipt"].as_str().unwrap().to_owned());
+        }
+    }
+}
+
+#[test]
+fn local_import_missing_route_never_opens_a_prompt_or_node_key() {
+    let f = Fixture::new();
+    let mut workspace = f.workspace("No import route");
+    workspace.routes.remove(&faculties::secrets::DEFAULT_SCOPE_ID);
+    f.configure(&mut workspace);
+    let view = f.node.lock().unwrap().as_mut().unwrap().config().unwrap();
+    let absent = f.dir.path().join("absent");
+    let bridge = LocalImport::default();
+    let dispatch = WorkspaceDispatch::new(NodeBinding {
+        pile: absent.join("node.pile"), key: absent.join("node.key"), signer: f.dispatch.node.signer,
+    }, move || Ok(view.clone())).unwrap().with_local_import(bridge.clone());
+    let response = rpc_call(&mut session(&dispatch), IMPORT_LOCAL.name, selection(&workspace));
+    assert!(response.to_string().contains("secrets is unconfigured"));
+    assert!(bridge.take_prompt().is_none());
+    assert!(!absent.exists());
+}
+
 #[test]
 fn protected_local_secret_prompts_for_exact_workspace_each_time_and_cancel_emits_nothing() {
     use crate::secret_entry::EntryValue;

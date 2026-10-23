@@ -256,6 +256,14 @@ impl Shell for MacShell {
             } else { answer }
         } else { answer }
     }
+
+    fn import_1password(
+        &mut self,
+        prompt: &erlkonig_core::local_import::ImportPrompt,
+        terminate: &Arc<AtomicBool>,
+    ) -> erlkonig_core::local_import::ImportAnswer {
+        crate::local_import::import(self.mtm, prompt, terminate)
+    }
 }
 
 /// The shared application as this binary's own type: winit's
