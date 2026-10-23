@@ -320,6 +320,91 @@ fn local_import_missing_route_never_opens_a_prompt_or_node_key() {
 }
 
 #[test]
+fn local_import_rejections_report_only_static_classification_and_positive_errno() {
+    use faculties::secrets::onepassword::{ProtectedImportCode as Code, ProtectedImportRejection, ProtectedImportStage as Stage};
+    for (stage, code, stage_name, code_name) in [
+        (Stage::Parse, Code::ArchiveByteLimit, "parse", "archive_byte_limit"),
+        (Stage::Parse, Code::ArchiveEntryLimit, "parse", "archive_entry_limit"),
+        (Stage::Parse, Code::MemberByteLimit, "parse", "member_byte_limit"),
+        (Stage::Parse, Code::ExpandedByteLimit, "parse", "expanded_byte_limit"),
+        (Stage::Parse, Code::ItemCountLimit, "parse", "item_count_limit"),
+        (Stage::Parse, Code::ProjectedByteLimit, "parse", "projected_byte_limit"),
+        (Stage::Parse, Code::InvalidFormat, "parse", "invalid_format"),
+        (Stage::Parse, Code::ZipDirectory, "parse", "zip_directory"),
+        (Stage::Parse, Code::ZipArchive, "parse", "zip_archive"),
+        (Stage::Parse, Code::ZipLayout, "parse", "zip_layout"),
+        (Stage::Parse, Code::ZipMember, "parse", "zip_member"),
+        (Stage::Parse, Code::InvalidMemberPath, "parse", "invalid_member_path"),
+        (Stage::Parse, Code::UnsafeMember, "parse", "unsafe_member"),
+        (Stage::Parse, Code::ZipIntegrity, "parse", "zip_integrity"),
+        (Stage::Parse, Code::MemberSizeMismatch, "parse", "member_size_mismatch"),
+        (Stage::Parse, Code::MissingAttributes, "parse", "missing_attributes"),
+        (Stage::Parse, Code::UnsupportedVersion, "parse", "unsupported_version"),
+        (Stage::Parse, Code::MissingData, "parse", "missing_data"),
+        (Stage::Parse, Code::MalformedJson, "parse", "malformed_json"),
+        (Stage::Parse, Code::InvalidStructure, "parse", "invalid_structure"),
+        (Stage::DestinationObservation, Code::DestinationUnavailable, "destination_observation", "destination_unavailable"),
+        (Stage::Encryption, Code::EncryptionFailed, "encryption", "encryption_failed"),
+        (Stage::ReceiptVerification, Code::ReceiptRejected, "receipt_verification", "receipt_rejected"),
+        (Stage::Preparation, Code::PreparationFailed, "preparation", "preparation_failed"),
+    ] {
+        for errno in [None, Some(0), Some(-1), Some(libc::EACCES)] {
+            let error = anyhow::Error::new(ProtectedImportRejection { stage, code, os_error_code: errno })
+                .context("SYNTHETIC-PRIVATE path/name/value/passphrase must never cross the result boundary");
+            let result = local_import_failure(&error);
+            let mut expected = json!({"status":"not_saved", "stage":stage_name, "code":code_name});
+            if let Some(errno) = errno.filter(|code| *code > 0) { expected["os_error_code"] = json!(errno); }
+            assert_eq!(result, expected);
+            assert!(!result.to_string().contains("SYNTHETIC-PRIVATE"));
+            assert!(result.get("receipt").is_none());
+        }
+    }
+}
+
+#[test]
+fn local_import_publication_unknown_keeps_receipt_and_never_becomes_rejection() {
+    use faculties::secrets::onepassword::ProtectedImportPublicationError;
+    let receipt = genid().id;
+    let error = anyhow::Error::new(ProtectedImportPublicationError { receipt })
+        .context("SYNTHETIC-PRIVATE publication error details");
+    let result = local_import_failure(&error);
+    assert_eq!(result["status"], "outcome_unknown");
+    assert_eq!(result["code"], "publication_uncertain");
+    assert_eq!(result["receipt"], format!("{receipt:X}"));
+    assert!(result.get("stage").is_none());
+    assert!(result.get("os_error_code").is_none());
+    assert!(!result.to_string().contains("SYNTHETIC-PRIVATE"));
+    let unknown = local_import_failure(&anyhow::anyhow!("SYNTHETIC-PRIVATE unclassified error"));
+    assert_eq!(unknown["status"], "not_saved");
+    assert_eq!(unknown["code"], "import_rejected");
+    assert!(!unknown.to_string().contains("SYNTHETIC-PRIVATE"));
+}
+
+#[test]
+fn local_import_malformed_synthetic_archive_reports_parse_without_publication_or_echo() {
+    use crate::local_import::ImportSource;
+    use zeroize::Zeroizing;
+    let mut f = Fixture::new();
+    let workspace = f.workspace("Synthetic malformed import");
+    let path = f.dir.path().join("SYNTHETIC-PRIVATE-file.1pux");
+    fs::write(&path, b"SYNTHETIC-PRIVATE-malformed-export").unwrap();
+    let source = ImportSource::open(&path).unwrap();
+    let bridge = LocalImport::default();
+    f.dispatch.local_import = Some(bridge.clone());
+    let before = fs::read(&f.dispatch.node.pile).unwrap();
+    let worker = std::thread::spawn(move || {
+        take_import_prompt(&bridge).answer(ImportAnswer::Submit {
+            source, passphrase: Zeroizing::new("SYNTHETIC-PRIVATE-passphrase".into()),
+        });
+    });
+    let result = f.call(IMPORT_LOCAL.name, selection(&workspace)).unwrap();
+    worker.join().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&result).unwrap(), json!({"status":"not_saved", "stage":"parse", "code":"zip_directory"}));
+    assert!(!result.contains("SYNTHETIC-PRIVATE"));
+    assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
+}
+
+#[test]
 fn protected_local_secret_prompts_for_exact_workspace_each_time_and_cancel_emits_nothing() {
     use crate::secret_entry::EntryValue;
     use faculties::secrets::protected::Purpose;

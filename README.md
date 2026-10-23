@@ -144,6 +144,14 @@ automatically retried. The source-read buffer and passphrase are zeroizing;
 complete erasure of parser, AppKit and OS copies is not promised, and the original
 local export is untouched.
 
+Prepublication rejection reports `not_saved` with a static `stage` and `code`
+(format/limit validation, destination observation, encryption, receipt
+verification or other preparation), and optional positive numeric `os_error_code`.
+These are classifications, not raw parser/IO messages: no archive names, paths,
+field labels, values or passphrases are returned. An unclassified prepublication
+error retains the generic `import_rejected` code. Publication uncertainty still
+returns `outcome_unknown` and its receipt, never a no-publication claim.
+
 ## One node, named workspaces
 
 One node identity, one logical pile and one local MCP endpoint serve every
