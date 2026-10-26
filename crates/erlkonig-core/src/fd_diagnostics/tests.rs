@@ -220,6 +220,35 @@ fn classification_handles_wrapped_errors_without_retaining_text() {
     assert_eq!(exhaustion(&long), Some(Exhaustion::Process));
 }
 
+#[test]
+fn handler_attribution_is_not_inferred_from_error_text_or_socket_counts() {
+    let diagnostics = Diagnostics::new();
+    diagnostics.maintenance_failure(genid().id,
+        "http secret-endpoint-canary: Too many open files (os error 24)");
+    diagnostics.publish_pending(|batch| {
+        let event = batch.events[0].unwrap();
+        assert_eq!(event.error_site, ErrorSite::Maintenance);
+        assert_eq!(event.handler.mcp_http_accepted_streams, None);
+        assert!(!format!("{event:?}").contains("secret-endpoint-canary"));
+        Ok::<_, ()>(())
+    }).unwrap();
+}
+
+#[test]
+fn instrumented_endpoint_zero_is_distinct_from_unknown_and_survives_endpoint_drop() {
+    use faculties::mcp::http::{BearerToken, Config, Endpoint};
+    let endpoint = Endpoint::bind(Config::new("127.0.0.1:0".parse().unwrap(),
+        BearerToken::new("test-only-token-0123456789abcdef0123456789").unwrap())).unwrap();
+    let diagnostics = Diagnostics::new().with_http(endpoint.connection_metrics());
+    drop(endpoint);
+    assert_eq!(diagnostics.snapshot().mcp_http_accepted_streams, Some(0));
+    diagnostics.maintenance_failure(genid().id, "Too many open files (os error 24)");
+    diagnostics.publish_pending(|batch| {
+        assert_eq!(batch.events[0].unwrap().handler.mcp_http_accepted_streams, Some(0));
+        Ok::<_, ()>(())
+    }).unwrap();
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn own_process_reports_limits_and_known_descriptor_types() {

@@ -1,5 +1,6 @@
 //! Typed, private node metrics for bounded FD exhaustion diagnostics.
-//! Every literal below was minted with installed `trible genid` on 2026-10-21.
+//! Anchors were minted with installed `trible genid` on 2026-10-21, with
+//! subsystem additions on 2026-10-26 as marked below.
 //! These are attribute anchors, not manually invented or reconstructed IDs.
 
 use super::*;
@@ -12,6 +13,13 @@ pub const KIND_FD_EXHAUSTION: Id = id_hex!("E46B35F4FCEFEB58C3940AC16CA0FB58");
 pub const KIND_FD_CAPTURE_LOSS: Id = id_hex!("391CF649FDAB35582A0480D562DEB444");
 
 attributes! {
+    /// Error-handler subsystem, not the owner of descriptors causing pressure.
+    /// Anchor minted with installed trible genid on 2026-10-26.
+    "0B58D7745C062B3B8C683BB9B0B2BCFB" as pub error_site: inlineencodings::Handle<blobencodings::UTF8String>;
+    /// Live accepted stream wrappers of this app's MCP HTTP endpoint; not
+    /// atomic with census and not requests, permits, backlog or all sockets.
+    /// Anchor minted with installed trible genid on 2026-10-26.
+    "FF56A3D4AD9759C01D80159F1FE63FD8" as pub mcp_http_accepted_streams: inlineencodings::U256BE;
     /// Occurrence sequence within this diagnostic collector lifetime.
     "8AA5061CBA0DFF2F49090BE0D4425141" as pub sequence: inlineencodings::U256BE;
     /// Error-handler snapshot, after upstream error conversion/unwinding.
@@ -78,6 +86,7 @@ impl NodeStore {
                 metadata::created_at?: wall_time(event.handler.wall_unix_ns),
                 monotonic_ns?: event.handler.monotonic_ns,
                 metadata::name: event.code.name(),
+                error_site: event.error_site.name(),
                 recent_sample_count: event.samples as u128,
                 captures_dropped: event.dropped as u128,
             };
@@ -100,6 +109,7 @@ impl NodeStore {
                     fd_count?: snapshot.census.map(|census| census.count as u128),
                     census_complete?: snapshot.census.map(|census| census.complete),
                     census_capacity: FD_CAPACITY as u128,
+                    mcp_http_accepted_streams?: snapshot.mcp_http_accepted_streams.map(|count| count as u128),
                 };
                 if let Some(census) = snapshot.census {
                     for (label, count) in TYPE_NAMES.iter().zip(census.types) {

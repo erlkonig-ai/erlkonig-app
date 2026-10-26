@@ -44,6 +44,9 @@ pub(crate) struct Event {
     session: String,
     sequence: u128,
     codes: Vec<&'static str>,
+    error_site_subsystems: Vec<&'static str>,
+    /// No descriptor provenance is inferred from a handler or separate gauge.
+    pressure_owner: &'static str,
     // Exact decimal strings avoid JSON-client rounding of nanoseconds.
     wall_tai_ns_intervals: Values<(String, String)>,
     monotonic_ns: Values<u128>,
@@ -64,6 +67,7 @@ struct Census {
     census_complete: Values<bool>,
     census_capacity: Values<u128>,
     types: Vec<TypeCount>,
+    mcp_http_accepted_streams: Values<u128>,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,7 +134,7 @@ pub(crate) fn inspect(
     Ok(Report::Events {
         collection: hex::encode(handle.raw),
         selection: "at most 64 rows per list, query order; not latest or chronological; empty lists mean no understood facts",
-        producer_contract: "maintenance handler after upstream unwinding; best-effort 1s samples over 60 monotonic seconds; sampled high-water is not a peak; deferred publication; absent wall clock stays absent; incomplete census is a lower bound; capture losses are cumulative, not additive",
+        producer_contract: "maintenance handler after upstream unwinding; error site is not pressure owner; OS census has no subsystem ownership; MCP HTTP gauge counts only this endpoint's accepted stream wrappers, not listener/backlog/outbound sockets or requests; gauge and census are non-atomic, never subtract them; absent gauge is uninstrumented, not zero; best-effort 1s samples over 60 monotonic seconds; sampled high-water is not a peak; deferred publication; absent wall clock stays absent; incomplete census is a lower bound; capture losses are cumulative, not additive",
         events: bounded(find!((event: Id, session: Id, ordinal: u128), pattern!(&facts, [
             { ?event @ metadata::tag: KIND_FD_EXHAUSTION,
                 health_record::attrs::session: ?session, sequence: ?ordinal,
@@ -144,6 +148,14 @@ pub(crate) fn inspect(
             codes: ["fd-limit-process", "fd-limit-system"].into_iter()
                 .filter(|code| exists!(pattern!(&facts, [{ event @ metadata::name: *code }])))
                 .collect(),
+            error_site_subsystems: {
+                let sites: Vec<_> = crate::fd_diagnostics::ErrorSite::ALL.into_iter()
+                    .map(|site| site.name())
+                    .filter(|site| exists!(pattern!(&facts, [{ event @ error_site: *site }])))
+                    .collect();
+                if sites.is_empty() { vec!["unknown"] } else { sites }
+            },
+            pressure_owner: "unknown",
             wall_tai_ns_intervals: bounded(find!(time: (i128, i128),
                 pattern!(&facts, [{ event @ metadata::created_at: ?time }]))
                 .map(|(start, end)| (start.to_string(), end.to_string()))),
@@ -187,6 +199,8 @@ fn census(facts: &TribleSet, observation: Id) -> Census {
         fd_count: bounded(find!(value: u128, pattern!(facts, [{ observation @ fd_count: ?value }]))),
         census_complete: bounded(find!(value: bool, pattern!(facts, [{ observation @ census_complete: ?value }]))),
         census_capacity: bounded(find!(value: u128, pattern!(facts, [{ observation @ census_capacity: ?value }]))),
+        mcp_http_accepted_streams: bounded(find!(value: u128,
+            pattern!(facts, [{ observation @ mcp_http_accepted_streams: ?value }]))),
         types: TYPE_NAMES.into_iter().map(|kind| TypeCount {
             kind,
             counts: bounded(find!(count: u128, pattern!(facts, [

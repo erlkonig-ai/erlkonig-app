@@ -145,6 +145,7 @@ impl Runtime {
         config.body_timeout = Duration::from_secs(5);
         let endpoint = http::Endpoint::bind(config)
             .context("cannot open the local authenticated MCP service")?;
+        let fd_diagnostics = Arc::new(Diagnostics::new().with_http(endpoint.connection_metrics()));
         let status = Arc::new(Mutex::new(Status {
             running: true,
             node_id: Some(hex::encode(signer.verifying_key().as_bytes())),
@@ -229,6 +230,7 @@ impl Runtime {
                         port,
                         retries,
                         guard,
+                        fd_diagnostics,
                     );
                     if let Err(error) = &result {
                         update(&state, |s| {
@@ -486,9 +488,9 @@ fn controller(
     initial_port: u16,
     retries: mpsc::Receiver<()>,
     guard: ResourceCheck,
+    fd_diagnostics: Arc<Diagnostics>,
 ) -> Result<()> {
     let (reports, receiver) = mpsc::channel();
-    let fd_diagnostics = Arc::new(Diagnostics::new());
     let mut last_fd_sample = Instant::now() - Duration::from_secs(1);
     let mut last_fd_publish = Instant::now();
     let mut task: Option<Task> = None;
@@ -1442,6 +1444,7 @@ mod tests {
             assert_eq!(events[0].session, session);
             assert_eq!(events[0].code, crate::fd_diagnostics::Exhaustion::Process);
             assert_eq!(events[1].code, crate::fd_diagnostics::Exhaustion::System);
+            assert!(events.iter().all(|event| event.error_site == crate::fd_diagnostics::ErrorSite::Maintenance));
             assert!(events.iter().all(|event| event.handler.monotonic_ns.is_some()));
             Ok::<_, ()>(())
         }).unwrap();
