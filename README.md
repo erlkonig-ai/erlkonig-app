@@ -104,6 +104,39 @@ profile or signing account was created during implementation. Apple references:
 [macOS keychains](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains),
 [authentication context reuse](https://developer.apple.com/documentation/security/ksecuseauthenticationcontext).
 
+## Protected local 1Password import (candidate, not deployed)
+
+`secrets_import_1password_local` requires an exact `workspace` ID. The only
+other argument is optional `previous_import`, an opaque receipt ID returned by
+a previous protected import. No path, export bytes, credentials, passphrase or
+ordinary-protection option is accepted. The native file picker selects one
+regular `.1pux` file; the app opens it once and locally collects and confirms an
+independent app passphrase. Export contents never go through chat/tool arguments,
+logs, clipboard or temporary plaintext files. Existing importer limits apply.
+
+Omitting `previous_import` explicitly creates a **new** import, without global
+content deduplication. Supplying it verifies only that exact previous protected
+import against the locally selected export and passphrase; failure never falls
+back to creating a replacement. Keep the returned receipt ID for this purpose.
+The whole original archive, imported items/attachments and receipt have user-only
+protection, not node-key recipient wraps. Public labels are neutral, not imported
+titles: model metadata listing cannot discover account/vendor titles before
+approval. This is not yet a named account search/catalog or local selection UX.
+Older ordinary node-readable copies are **not revoked or converted**.
+Touch ID, recovery and signing/keychain enrollment remain disabled.
+
+The workspace route is frozen for the call. No store lease is held during file
+selection or passphrase entry; expensive parsing/encryption also runs outside
+the publication lease. Cancel/shutdown/120-second expiry before Save admission
+publishes nothing. An admitted batch runs once and may take longer than the
+prompt deadline; disconnection or shutdown does not promise rollback. Results
+contain only status, receipt ID, counts and maintenance/reuse flags. A typed
+uncertain publication returns `outcome_unknown` plus its planned receipt ID;
+keep it and inspect metadata before any explicit verification. No operation is
+automatically retried. The source-read buffer and passphrase are zeroizing;
+complete erasure of parser, AppKit and OS copies is not promised, and the original
+local export is untouched.
+
 ## One node, named workspaces
 
 One node identity, one logical pile and one local MCP endpoint serve every

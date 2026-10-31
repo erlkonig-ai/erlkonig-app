@@ -68,6 +68,13 @@ pub trait Shell {
     ) -> erlkonig_core::protected_access::AccessResult {
         erlkonig_core::protected_access::unavailable()
     }
+    fn import_1password(
+        &mut self,
+        _prompt: &erlkonig_core::local_import::ImportPrompt,
+        _terminate: &Arc<AtomicBool>,
+    ) -> erlkonig_core::local_import::ImportAnswer {
+        erlkonig_core::local_import::ImportAnswer::Unavailable
+    }
 }
 
 /// The menu as plain data: what every entry shows, which optional entries
@@ -532,6 +539,15 @@ impl<S: Shell> App<S> {
             if self.terminate.load(Ordering::Relaxed) {
                 self.quit();
             }
+            prompt.answer(answer);
+            if self.quitting.is_some() {
+                self.next_refresh = Instant::now();
+                return false;
+            }
+        }
+        if let Some(prompt) = self.runtime.as_ref().and_then(Runtime::take_import_prompt) {
+            let answer = self.shell.import_1password(&prompt, &self.terminate);
+            if self.terminate.load(Ordering::Relaxed) { self.quit(); }
             prompt.answer(answer);
             if self.quitting.is_some() {
                 self.next_refresh = Instant::now();

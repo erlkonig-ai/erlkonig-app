@@ -45,6 +45,7 @@ pub struct Runtime {
     services: ServiceControl,
     secret_entry: crate::secret_entry::SecretEntry,
     protected_access: crate::protected_access::ProtectedAccessBridge,
+    local_import: crate::local_import::LocalImport,
     workers: Vec<JoinHandle<Result<()>>>,
     lock: Option<File>,
 }
@@ -168,6 +169,7 @@ impl Runtime {
             services,
             secret_entry: crate::secret_entry::SecretEntry::default(),
             protected_access: crate::protected_access::ProtectedAccessBridge::default(),
+            local_import: crate::local_import::LocalImport::default(),
             workers: Vec::new(),
             lock: Some(lock),
         };
@@ -179,6 +181,7 @@ impl Runtime {
         let services = app.services.clone();
         let secret_entry = app.secret_entry.clone();
         let protected_access = app.protected_access.clone();
+        let local_import = app.local_import.clone();
         let mcp_url = app.status().mcp_url.context("local MCP address")?;
         app.workers.push(
             thread::Builder::new()
@@ -188,7 +191,7 @@ impl Runtime {
                         let config = ConfigMcp::new(binding.clone(), node.clone(), mcp_url, port, services);
                         let dispatch = WorkspaceDispatch::new(binding, move || {
                             with_node(&node, NodeStore::config)
-                        })?.with_secret_entry(secret_entry).with_protected_access(protected_access);
+                        })?.with_secret_entry(secret_entry).with_protected_access(protected_access).with_local_import(local_import);
                         dispatch.finish(endpoint.serve_until(
                             &[&activity.faculty(&dispatch), &activity.faculty(&config)],
                             stopping(http_stop),
@@ -302,11 +305,15 @@ impl Runtime {
         // Release a queued/visible local-entry waiter before the HTTP drain.
         self.secret_entry.close();
         self.protected_access.close();
+        self.local_import.close();
         self.stop.send_replace(true);
     }
 
     pub fn take_secret_prompt(&self) -> Option<crate::secret_entry::SecretPrompt> {
         self.secret_entry.take_prompt()
+    }
+    pub fn take_import_prompt(&self) -> Option<crate::local_import::ImportPrompt> {
+        self.local_import.take_prompt()
     }
     pub fn take_protected_prompt(&self) -> Option<crate::protected_access::ProtectedPrompt> {
         self.protected_access.take_prompt()

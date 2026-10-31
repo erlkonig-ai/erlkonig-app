@@ -20,6 +20,8 @@ name = "protected-secrets-trial"
 path = "../../scripts/protected-secrets-trial.rs"
 
 [dev-dependencies]
+serde_json.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
 faculties.workspace = true
 triblespace.workspace = true
 hifitime.workspace = true
