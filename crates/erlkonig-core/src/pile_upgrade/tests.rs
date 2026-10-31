@@ -9,6 +9,8 @@ use std::{thread, time::Instant};
 use triblespace::core::{collection::CollectionStoreExt, metadata, signing_key_file};
 use triblespace::prelude::*;
 
+#[path = "../../../../scripts/accept/legacy32_input.rs"]
+mod legacy32_input;
 #[path = "../../../../scripts/accept/old_framing.rs"]
 mod old_framing;
 
@@ -395,5 +397,140 @@ fn malformed_storage_fails_without_opening_services_or_changing_the_locator() {
             .verifying_key(),
         key
     );
+    assert!(!f.layout.dir.join("mcp.token").exists());
+}
+
+/// The fixture is signed/serialized by an independently built historical
+/// library. No test helper here constructs old assertions or signatures.
+fn historical_app_fixture(f: &mut Fixture) -> crate::workspace::Workspace {
+    let workspace = f.configured();
+    let historical = f.binding.pile.with_file_name("historical.pile");
+    legacy32_input::export(
+        f._dir.path(),
+        &f.binding.pile,
+        &f.binding.key,
+        &hex::encode(f.binding.signer),
+        &historical,
+    );
+    let writer = std::env::var_os("ERLKONIG_LEGACY32_WRITER")
+        .expect("explicit independent historical writer binary is required");
+    let output = std::process::Command::new(writer)
+        .arg(f._dir.path())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "historical writer: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        receipt["historical_core"],
+        "3ca5c1cb5504d8ff60730edfe5bf641b01f44913"
+    );
+    assert_eq!(receipt["node_id"], hex::encode(f.binding.signer));
+    f.binding.pile = historical;
+    fs::write(
+        f.layout.dir.join("node.json"),
+        serde_json::to_vec(&NodeLocator {
+            pile: f.binding.pile.clone(),
+            key: f.binding.key.clone(),
+            expected_signer: hex::encode(f.binding.signer),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        migration::inspect(&f.binding.pile)
+            .unwrap()
+            .requirements
+            .iter()
+            .any(|r| matches!(r, Requirement::Canonical { .. }))
+    );
+    workspace
+}
+
+#[test]
+#[ignore = "requires ERLKONIG_LEGACY32_WRITER built against independent historical core 3ca5c1cb"]
+fn historical_writer_config_and_workspace_survive_canonical_startup_and_restart() {
+    let mut f = Fixture::new();
+    let workspace = historical_app_fixture(&mut f);
+    let original = fs::read(&f.binding.pile).unwrap();
+    let key = fs::read(&f.binding.key).unwrap();
+    let control = StartupControl::new(true);
+    let worker_control = control.clone();
+    let layout = f.layout.clone();
+    let worker = thread::spawn(move || Runtime::start_controlled(&layout, &worker_control));
+    let consent = prompt(&control);
+    assert_eq!(consent.title, "Update local data?");
+    consent.answer(true);
+    let mut runtime = worker.join().unwrap().unwrap();
+    let selected = runtime.binding().clone();
+    assert_ne!(selected.pile, f.binding.pile);
+    assert_eq!(selected.signer, f.binding.signer);
+    assert_eq!(
+        runtime.config().unwrap().workspace(workspace.id).unwrap(),
+        Some(workspace.clone())
+    );
+    assert_eq!(
+        runtime.config().unwrap().settings().unwrap(),
+        NodeSettings {
+            mcp_port: 0,
+            sync_enabled: false,
+            maintenance_enabled: false,
+        }
+    );
+    runtime.finish().unwrap();
+    assert_eq!(fs::read(&f.binding.pile).unwrap(), original);
+    assert_eq!(fs::read(&f.binding.key).unwrap(), key);
+    let locator = f.locator();
+    let mut restarted = Runtime::start(&f.layout).unwrap();
+    assert_eq!(restarted.binding(), &selected);
+    assert_eq!(
+        restarted.config().unwrap().workspace(workspace.id).unwrap(),
+        Some(workspace)
+    );
+    restarted.finish().unwrap();
+    assert_eq!(f.locator(), locator);
+}
+
+#[test]
+#[ignore = "requires ERLKONIG_LEGACY32_WRITER built against independent historical core 3ca5c1cb"]
+fn historical_foreign_author_is_not_replaced_by_the_nodes_signer() {
+    let mut f = Fixture::new();
+    historical_app_fixture(&mut f);
+    let original = fs::read(&f.binding.pile).unwrap();
+    let author = hex::encode(f.binding.signer);
+    f.binding.key = f.binding.key.with_file_name("other-synthetic-node.key");
+    f.signer = signing_key_file::init(&f.binding.key).unwrap();
+    f.binding.signer = f.signer.verifying_key().to_bytes();
+    fs::write(
+        f.layout.dir.join("node.json"),
+        serde_json::to_vec(&NodeLocator {
+            pile: f.binding.pile.clone(),
+            key: f.binding.key.clone(),
+            expected_signer: hex::encode(f.binding.signer),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let locator = f.locator();
+    let control = StartupControl::new(true);
+    let worker_control = control.clone();
+    let layout = f.layout.clone();
+    let worker = thread::spawn(move || Runtime::start_controlled(&layout, &worker_control));
+    let consent = prompt(&control);
+    assert_eq!(consent.title, "Update local data?");
+    consent.answer(true);
+    let error = worker.join().unwrap().err().unwrap();
+    assert!(error.to_string().contains("original authors"), "{error:#}");
+    assert!(
+        error.to_string().contains(&author),
+        "the exact missing author is actionable"
+    );
+    assert_eq!(f.locator(), locator);
+    assert_eq!(fs::read(&f.binding.pile).unwrap(), original);
     assert!(!f.layout.dir.join("mcp.token").exists());
 }

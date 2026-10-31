@@ -120,6 +120,8 @@ impl StartupControl {
             migration::Stage::Describe => "Preparing storage descriptions",
             migration::Stage::Branch => "Importing the selected branch",
             migration::Stage::Ready => "Checking the prepared storage",
+            migration::Stage::Canonical => "Updating signed storage records",
+            migration::Stage::Audit => "Verifying updated storage records",
         };
         let detail = if progress.total_bytes == 0 {
             format!("{stage}…")
@@ -250,7 +252,7 @@ pub(crate) fn prepare(
         }
     }
     let original = fs::metadata(&binding.pile)?;
-    let inspection =
+    let mut inspection =
         migration::inspect_with_progress(&binding.pile, &mut |p| control.migration_progress(p))?;
     control.check()?;
     if !inspection.unsupported.is_empty() {
@@ -258,16 +260,11 @@ pub(crate) fn prepare(
             "This pile contains a storage format this Erlkonig cannot convert. Keep the original pile and use a release that understands that format before reopening Erlkonig. No replacement was activated."
         );
     }
-    if inspection
+    let canonical = inspection
         .requirements
         .iter()
-        .any(|r| matches!(r, Requirement::Canonical { .. }))
-    {
-        bail!(
-            "This pile needs the canonical signed-record migration (/32). Use trible-migrate canonical with the original signing key and exact refreshes from any foreign authors, then bind the validated result with Erlkonig bind-node. Erlkonig cannot invent those authors' authority. The original pile and node locator are unchanged."
-        );
-    }
-    if inspection.current_framing {
+        .any(|r| matches!(r, Requirement::Canonical { .. }));
+    if inspection.current_framing && !canonical {
         return Ok(binding);
     }
     ensure!(
@@ -279,48 +276,114 @@ pub(crate) fn prepare(
         "Your local data needs an update before Erlkonig can start. Erlkonig will create an updated copy and keep the original. Your existing identity and signing key will stay the same.\n\nOriginal: {}",
         binding.pile.display()
     ), "Migrate", "Not now")?;
-    let mut names = Vec::new();
-    let branch_names = if inspection.legacy_branches.is_empty() {
-        Default::default()
-    } else {
-        control.progress("Reading legacy branch labels…")?;
-        migration::legacy_branch_names(&binding.pile)?
-    };
-    for branch in &inspection.legacy_branches {
-        let name = branch_names
-            .get(&format!("{branch:X}"))
-            .cloned()
-            .unwrap_or_else(|| format!("Imported branch {branch:X}"));
-        control.progress("Waiting for your branch import choice…")?;
-        control.approve(format!("Import {name}?"), format!(
-            "Import this branch as the collection “{name}”?\n\nBranch: {branch:X}\nRead and write authority: this node ({})\n\nThe existing signing key will be used. The original pile remains intact. This imports a collection; it does not select a Faculty role, enroll it in a workspace, or recover application settings. Cancel if this node should not own the imported collection.",
-            hex::encode(binding.signer)
-        ), "Import with this node", "Cancel startup")?;
-        names.push((*branch, name));
-    }
-    let decisions: Vec<_> = names
-        .iter()
-        .map(|(branch, name)| BranchDecision {
-            branch: *branch,
-            collection_name: name,
-            signer,
-            authority: signer.verifying_key(),
-        })
-        .collect();
     let filename = binding
         .pile
         .file_name()
         .context("node pile has no filename")?;
-    let destination = binding.pile.with_file_name(format!(
-        "{}.upgrade-{:X}.pile",
-        filename.to_string_lossy(),
-        genid().id
-    ));
-    control.progress("Preparing upgraded storage; the original remains intact…")?;
-    let outcome =
-        migration::prepare_with_progress(&binding.pile, &destination, &decisions, &mut |p| {
+    let fresh_sibling = |phase: &str| {
+        binding.pile.with_file_name(format!(
+            "{}.{}-{:X}.pile",
+            filename.to_string_lossy(),
+            phase,
+            genid().id
+        ))
+    };
+    let mut prepared_source = binding.pile.clone();
+    let mut retained_caches = 0;
+    if canonical {
+        let destination = fresh_sibling("canonical");
+        control.progress("Updating signed storage records; the original remains intact…")?;
+        match migration::prepare_canonical_with_progress(
+            &binding.pile,
+            &destination,
+            signer,
+            &[],
+            &mut |p| control.migration_progress(p),
+        )
+        .with_context(|| {
+            format!(
+                "prepare signed-record candidate {}; original retained at {}",
+                destination.display(),
+                binding.pile.display()
+            )
+        })? {
+            migration::CanonicalOutcome::Converted {
+                destination: actual,
+                retained_original_caches,
+                ..
+            } => {
+                ensure!(
+                    actual == destination,
+                    "canonical converter returned a different destination"
+                );
+                prepared_source = destination;
+                retained_caches = retained_original_caches;
+            }
+            migration::CanonicalOutcome::ForeignRefreshRequired { authors } => {
+                let authors = authors
+                    .iter()
+                    .map(hex::encode)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                bail!(
+                    "Some saved records need refreshed signatures from their original authors. Ask those authors for exact canonical refreshes, apply them with trible-migrate canonical, and bind the validated result before restarting Erlkonig. This node cannot sign on their behalf. The original pile and locator are unchanged.\n\nAuthor public keys:\n{authors}"
+                );
+            }
+        }
+        control.check()?;
+        inspection = migration::inspect_with_progress(&prepared_source, &mut |p| {
             control.migration_progress(p)
-        })
+        })?;
+        ensure!(
+            inspection.unsupported.is_empty()
+                && !inspection
+                    .requirements
+                    .iter()
+                    .any(|r| matches!(r, Requirement::Canonical { .. })),
+            "signed-record candidate still needs an unsupported conversion; no replacement activated"
+        );
+    }
+    let (destination, imported_branches) = if inspection.current_framing {
+        // Canonical conversion can retain already-current legacy pins. They
+        // do not imply an unperformed import, and never cause another prompt.
+        (prepared_source, 0)
+    } else {
+        let mut names = Vec::new();
+        let branch_names = if inspection.legacy_branches.is_empty() {
+            Default::default()
+        } else {
+            control.progress("Reading legacy branch labels…")?;
+            migration::legacy_branch_names(&prepared_source)?
+        };
+        for branch in &inspection.legacy_branches {
+            let name = branch_names
+                .get(&format!("{branch:X}"))
+                .cloned()
+                .unwrap_or_else(|| format!("Imported branch {branch:X}"));
+            control.progress("Waiting for your branch import choice…")?;
+            control.approve(format!("Import {name}?"), format!(
+                "Import this branch as the collection “{name}”?\n\nBranch: {branch:X}\nRead and write authority: this node ({})\n\nThe existing signing key will be used. The original pile remains intact. This imports a collection; it does not select a Faculty role, enroll it in a workspace, or recover application settings. Cancel if this node should not own the imported collection.",
+                hex::encode(binding.signer)
+            ), "Import with this node", "Cancel startup")?;
+            names.push((*branch, name));
+        }
+        let decisions: Vec<_> = names
+            .iter()
+            .map(|(branch, name)| BranchDecision {
+                branch: *branch,
+                collection_name: name,
+                signer,
+                authority: signer.verifying_key(),
+            })
+            .collect();
+        let destination = fresh_sibling("upgrade");
+        control.progress("Preparing upgraded storage; the original remains intact…")?;
+        let outcome = migration::prepare_with_progress(
+            &prepared_source,
+            &destination,
+            &decisions,
+            &mut |p| control.migration_progress(p),
+        )
         .with_context(|| {
             format!(
                 "prepare fresh candidate {}; original retained at {}",
@@ -328,31 +391,32 @@ pub(crate) fn prepare(
                 binding.pile.display()
             )
         })?;
-    control.check()?;
-    let branches = match outcome {
-        Outcome::Converted {
-            destination: actual,
-            branches,
-            ..
-        } => {
-            ensure!(
-                actual == destination,
-                "converter returned a different destination"
-            );
-            branches
-        }
-        Outcome::Current { .. } => {
-            bail!("source changed classification during startup; no replacement activated")
-        }
-        Outcome::ChoiceRequired { .. } => bail!(
-            "storage still requires an explicit migration choice; original pile and locator retained"
-        ),
-        Outcome::Unsupported { .. } => {
-            bail!("storage format is unsupported; original pile and locator retained")
+        control.check()?;
+        match outcome {
+            Outcome::Converted {
+                destination: actual,
+                branches,
+                ..
+            } => {
+                ensure!(
+                    actual == destination,
+                    "converter returned a different destination"
+                );
+                (destination, branches.len())
+            }
+            Outcome::Current { .. } => {
+                bail!("source changed classification during startup; no replacement activated")
+            }
+            Outcome::ChoiceRequired { .. } => bail!(
+                "storage still requires an explicit migration choice; original pile and locator retained"
+            ),
+            Outcome::Unsupported { .. } => {
+                bail!("storage format is unsupported; original pile and locator retained")
+            }
         }
     };
     control.progress("Checking upgraded settings and workspaces…")?;
-    validate(&binding.pile, &destination, signer, false).with_context(|| {
+    validate(&binding.pile, &destination, signer, canonical).with_context(|| {
         format!(
             "candidate {} was not activated; original retained at {}",
             destination.display(),
@@ -397,10 +461,15 @@ pub(crate) fn prepare(
         "Storage upgraded. Original retained at {}. The node identity and existing key are unchanged.",
         binding.pile.display()
     );
-    if !branches.is_empty() {
+    if imported_branches != 0 {
         notice.push_str(&format!(
             " {} legacy branches imported as collections; workspace setup may still be needed.",
-            branches.len()
+            imported_branches
+        ));
+    }
+    if retained_caches != 0 {
+        notice.push_str(&format!(
+            " {retained_caches} cached results remain in the original and may be recomputed."
         ));
     }
     control

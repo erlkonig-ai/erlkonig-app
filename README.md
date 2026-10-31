@@ -163,6 +163,8 @@ Faculty role or enroll it in a workspace. The separate settings migration
 handles old application identities and configuration. Unsupported formats and
 canonical signed-record migrations that need original authors' refreshes leave
 the original and locator untouched and explain the required next step.
+After migration approval, records signed by this node use its existing key for
+the canonical update. Foreign signatures are never replaced with this node's.
 Quit cancels startup at the converter's checkpoints and waits for its current
 native operation to finish before releasing the owner lock.
 

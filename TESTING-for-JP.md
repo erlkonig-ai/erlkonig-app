@@ -23,6 +23,19 @@ This exercises framing conversion, not the separately authored `/32` canonical
 cutover. It must not be reported as acceptance of an actual old DMG until that
 artifact's writer format has also been exercised.
 
+For signed `/32` app acceptance, use `--legacy32-writer /absolute/legacy32_writer`
+instead of `--old-framing`. Build `scripts/accept/legacy32_writer.rs` as an example
+inside an isolated historical core checkout at
+`3ca5c1cb5504d8ff60730edfe5bf641b01f44913`, without editing that library. The
+candidate's fixture helper exports synthetic Config/workspace blobs and unsigned
+commit coordinates; that historical library independently stores and signs them.
+The runner records writer/source hashes, then checks native migration consent,
+the real node locator, preserved identity/settings/workspace, and silent restart.
+This is synthetic app-state acceptance under the historical writer, not a copy
+of anyone's installed data. The two ignored `pile_upgrade::tests::historical*`
+tests use `ERLKONIG_LEGACY32_WRITER` for the same boundary, including an unmet
+foreign-author case that must never activate a replacement.
+
 For an old branch fixture, check that the native prompt displays its readable
 label, exact ID and this node's public identity. Cancel leaves the source and
 locator unchanged. Import explicitly adopts that collection only. Quit while
