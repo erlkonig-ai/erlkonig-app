@@ -151,10 +151,13 @@ can change the value resolved under an existing ID on later calls.
 
 Omitted roles are unavailable, including auxiliary roles a tool needs. Report
 the missing configuration; do not synthesize a private root or switch
-workspaces silently. Workspace reads are local-only and may report missing
-payloads. Workspace selection does not change the node's sync or maintenance
-settings or start a second service. Node synchronization follows native-selected
-collections independently of the current request's workspace.
+workspaces silently. An explicit Faculty operation may acquire exact missing
+payloads through a lazy, non-serving client, even with background sync paused.
+The bound node is its first contact; authenticated discovery can lead to other
+providers. It creates no collection selection or replication interest. Workspace
+selection does not change sync or maintenance settings or start a second sync
+service. Node synchronization follows native-selected collections independently
+of the current request's workspace.
 
 If access is missing, explain that a node with the appropriate native grant
 authority must invite the existing node identity with the required access.

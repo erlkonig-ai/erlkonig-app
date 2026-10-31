@@ -1069,7 +1069,7 @@ fn list_is_config_only_and_mutating_faculty_never_runs_without_an_accepted_works
         assert!(f.call("compass_add", args).is_err());
     }
     assert_eq!(fs::read(f.dir.path().join("node.pile")).unwrap(), before);
-    // A failed role lookup may retain its local-only adapter, never an endpoint.
+    // A failed role lookup may retain its dormant adapter, never an endpoint.
 }
 
 #[test]
@@ -1409,4 +1409,117 @@ fn unavailable_revision_does_not_hide_healthy_workspaces_and_can_be_withdrawn() 
         serde_json::from_str(&f.call("list_workspaces", json!({})).unwrap()).unwrap();
     assert_eq!(listed["unavailable"], json!([]));
     assert_eq!(listed["workspaces"].as_array().unwrap().len(), 1);
+}
+
+
+#[test]
+fn cold_message_foundation_acquires_without_background_sync() {
+    use ed25519_dalek::SigningKey;
+    use triblespace::core::blob::encodings::UnknownBlob;
+    use triblespace::core::collection::{CollectionRead, CollectionStore};
+    use triblespace::core::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, StorageClose, WantRead};
+    use triblespace::core::repo::memoryrepo::MemoryRepo;
+    use triblespace_net::peer::{Peer, PeerConfig};
+
+    let f = Fixture::new();
+    let writer = SigningKey::from_bytes(&[87; 32]);
+    let mut source = MemoryRepo::for_host(writer.verifying_key());
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::Open, AdmissionPolicy::direct(writer.verifying_key()),
+    );
+    let relations = source.collection("relations", policy.clone()).unwrap();
+    let messages = source.collection("message", policy).unwrap();
+    let sender = genid().id;
+    let reader = genid().id;
+    for (id, label) in [(sender, "cold sender"), (reader, "cold reader")] {
+        let (person, _, _) = faculties::relations::person_fragment(id, faculties::relations::ProfileInput {
+            label: label.into(), ..Default::default()
+        }).unwrap();
+        source.commit(relations, &writer, person).unwrap();
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    for collection in [relations, messages] {
+        runtime.block_on(faculties::storage::ensure_downstream(&mut source, collection, &writer)).unwrap();
+    }
+    // This later source foundation has no derived attachment. The app's signer
+    // cannot maintain the foreign writer's views, so message_list must acquire
+    // this exact residual through the already-selected Rank9 observation.
+    let (fragment, _) = faculties::message::message_fragment(
+        sender, &faculties::message::Recipient::Person(reader),
+        "cold foundation arrived on demand", faculties::clock::point_now().unwrap(),
+    );
+    let commit = source.commit(messages, &writer, fragment).unwrap();
+    let foundation = Inline::<inlineencodings::Handle<UnknownBlob>>::new(commit.data().raw);
+    let unrelated = source.put::<UnknownBlob, _>(Bytes::from(b"unrequested provider bytes".to_vec())).unwrap();
+    let snapshot = source.snapshot().unwrap();
+    let mut workspace = Workspace::new("Cold read fixture");
+    workspace.routes.insert(faculties::schemas::relations::DEFAULT_SCOPE_ID, relations.handle());
+    workspace.routes.insert(faculties::schemas::message::DEFAULT_SCOPE_ID, messages.handle());
+    {
+        let mut guard = f.node.lock().unwrap();
+        let node = guard.as_mut().unwrap();
+        for info in snapshot.blobs() {
+            let handle = info.unwrap().handle;
+            if handle != foundation && handle != unrelated {
+                let bytes: Bytes = snapshot.get(handle).unwrap();
+                node.pile.put::<UnknownBlob, _>(bytes).unwrap();
+            }
+        }
+        for record in snapshot.records().unwrap() { node.pile.insert(record.unwrap()).unwrap(); }
+        let view = node.config().unwrap();
+        let mut settings = view.settings().unwrap();
+        settings.sync_enabled = false;
+        settings.maintenance_enabled = false;
+        node.put_settings(&view, &settings).unwrap();
+    }
+    f.configure(&mut workspace);
+    let daemon = f.node.lock().unwrap().as_ref().unwrap().signer.clone();
+    let provider = Peer::new(source, daemon, PeerConfig {
+        daemon: None, provider_publication_budget: Some(0), bind: Some("127.0.0.1:0".parse().unwrap()),
+    }).unwrap();
+    struct Provider(Option<Peer<MemoryRepo>>);
+    impl Drop for Provider {
+        fn drop(&mut self) {
+            if let Some(mut peer) = self.0.take() {
+                let stopped = peer.shutdown_and_join();
+                let closed = peer.close();
+                if !std::thread::panicking() {
+                    stopped.unwrap();
+                    closed.unwrap();
+                }
+            }
+        }
+    }
+    let mut provider = Provider(Some(provider));
+    provider.0.as_mut().unwrap().try_refresh().unwrap();
+    let before = {
+        let mut guard = f.node.lock().unwrap();
+        let node = guard.as_mut().unwrap();
+        node.record_sync_addresses(&provider.0.as_ref().unwrap().bound_sockets()).unwrap();
+        node.pile.snapshot().unwrap()
+    };
+    assert!(!before.contains_blob(foundation).unwrap());
+    assert!(!before.contains_blob(unrelated).unwrap());
+    let records_before = before.records().unwrap().count();
+    let result = f.call("message_list", json!({
+        "workspace": format!("{:X}", workspace.id), "reader": "cold reader",
+    }));
+    // Always join the synthetic provider, including the failing-first run.
+    drop(provider);
+    let text = result.unwrap_or_else(|error| panic!("cold message_list: {error:#}"));
+    assert!(text.contains("cold foundation arrived on demand"), "{text}");
+    assert!(!before.contains_blob(foundation).unwrap(), "the frozen view never advances");
+    assert_eq!(before.records().unwrap().count(), records_before);
+    let owners = f.dispatch.owners.borrow();
+    owners.get(&workspace.id).unwrap().storage.with_store(|store, _, _| {
+        let after = store.snapshot()?;
+        assert!(after.contains_blob(foundation)?);
+        assert!(!after.contains_blob(unrelated)?);
+        assert!(after.wants()?.next().is_none());
+        let health = store.health();
+        assert!(!health.store.serving_snapshot);
+        assert!(health.collections.is_empty());
+        assert!(health.peerings.is_empty());
+        Ok(())
+    }).unwrap();
 }

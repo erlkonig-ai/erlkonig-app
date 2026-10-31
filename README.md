@@ -348,8 +348,14 @@ both are installed as the `erlkonig` command. `faculties`, `trible` and
 `triblespace-net` are linked libraries, not launched commands. The node's
 single sync owner provides its durable Peer and enabled maintenance. With
 sync paused, maintenance is local-only and starts no acquisition networking.
-Workspace Faculty reads are local-only: missing payloads fail instead of
-starting acquisition peers. Native owners and safe pile handles end with the app.
+An explicit workspace Faculty operation may acquire exact missing payloads,
+independently of background sync and maintenance settings. Each used workspace
+retains one lazy, non-serving client: resident operations start no endpoint;
+a cold read contacts the bound node first and may follow authenticated provider
+and discovery hints. It neither selects collections nor activates replication.
+Its frozen collection observation remains unchanged while exact bytes arrive.
+Workspace replacement/withdrawal and app shutdown close those clients and their
+safe pile handles.
 
 Maintenance uses a dedicated four-worker CPU pool, dependency-first ordering,
 and value-change gating at a one-second cadence. Native held sets are maintained
@@ -561,8 +567,9 @@ current 3.6-second ripple cycle, landing exactly on the resting outline; new wor
 before that landing continues the same phase without a restart. Overlapping
 work shares one activity count; enabling services, idle waits, status sampling
 and rendering do not count. It is an activity indicator, not a bytes-per-second
-meter. Payload counters still report measured bytes, and local-only workspace
-reads add no network traffic. There is no animation-preview mode.
+meter. Payload counters report the background service's measured bytes; exact
+workspace-client acquisition is not included in that counter. There is no
+animation-preview mode.
 
 ## Integrations
 

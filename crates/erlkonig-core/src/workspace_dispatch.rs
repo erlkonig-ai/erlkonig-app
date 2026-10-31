@@ -145,9 +145,12 @@ impl WorkspaceDispatch {
     fn open(&self, workspace: Workspace) -> Result<Owner> {
         let signer = VerifyingKey::from_bytes(&self.node.signer)
             .context("workspace has an invalid configured signing identity")?;
-        // Workspace selection alone does not authorize an acquisition network
-        // owner. Missing payloads are reported; managed sync is independent.
-        let mut storage = Storage::shared_local(self.node.pile.clone(), Some(self.node.key.clone()))
+        // An explicit Faculty operation may acquire its exact missing bytes.
+        // This lazy, non-serving client contacts the bound node first; it does
+        // not activate background replication or change the selected workspace.
+        let mut storage = Storage::shared_with_daemon(
+            self.node.pile.clone(), Some(self.node.key.clone()), Some(signer),
+        )
             .with_collections(workspace.routes.clone())
             .with_expected_signer(signer);
         if let Some(bridge) = &self.protected_access {
