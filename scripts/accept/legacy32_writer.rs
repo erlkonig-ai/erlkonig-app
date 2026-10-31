@@ -97,18 +97,21 @@ fn main() {
             Inline::new(handle(&commit["metadata"])),
         ));
         record.verify_strict().unwrap();
-        // Existing deployed /32 COMMIT grammar, not a newly minted identifier.
-        assert_eq!(
-            hex::encode(&record.to_bytes()[..32]),
-            "a1322bb3f5214287c314d42afcc1a97cb264facd9a22b4938838be78db31aa59",
-            "this example must run against the independent historical writer"
-        );
         pile.insert(record).unwrap();
     }
     pile.close().unwrap();
+    let serialized = fs::read(&destination).unwrap();
     let mut count = 0;
     for frame in PileRecords::open(&destination).unwrap() {
-        if let PileRecordContent::Collection { record } = frame.unwrap().content {
+        let frame = frame.unwrap();
+        if let PileRecordContent::Collection { record } = frame.content {
+            // Assert the actual historical pile envelope, not the distinct
+            // dense record representation returned by CollectionRecord::to_bytes.
+            assert_eq!(
+                hex::encode(&serialized[frame.offset + 32..frame.offset + 64]),
+                "a1322bb3f5214287c314d42afcc1a97cb264facd9a22b4938838be78db31aa59",
+                "this example must run against the independent historical writer"
+            );
             record.verify_strict().unwrap();
             count += 1;
         }
@@ -118,6 +121,6 @@ fn main() {
         "{}",
         json!({"historical_core":"3ca5c1cb5504d8ff60730edfe5bf641b01f44913",
         "pile":destination,"blobs":blobs.len(),"signed_commits":count,"node_id":manifest["node_id"],
-        "blake3":blake3::hash(&fs::read(&destination).unwrap()).to_hex().as_str()})
+        "blake3":blake3::hash(&serialized).to_hex().as_str()})
     );
 }
