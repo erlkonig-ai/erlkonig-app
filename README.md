@@ -229,7 +229,8 @@ call refuses and names the difference instead of widening or narrowing
 silently; the published routes are exactly the roots given, never the whole
 granted group. A granted root that another local workspace already routes
 stays listed, with that workspace in `routed_in`, may be left out of
-`roots`, and is routed here only when given. A first enrollment needs a
+`roots`, and is routed here only when given; an empty `roots` is refused,
+there is nothing to enroll. A first enrollment needs a
 label; roots that arrive later under an enrolled anchor are listed beside it
 (`local_workspace` enrolled) and enrolling them extends the workspace with a
 new revision over the union of routes, label preserved unless given; the

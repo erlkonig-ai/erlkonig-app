@@ -469,14 +469,16 @@ impl NodeStore {
     /// anchor and select them, as bootstrap enrollment does. No proof,
     /// descriptor or key is imported, copied or created.
     ///
-    /// `roots` are the handles the listing showed for the anchor. Every
-    /// shown root that no local workspace routes must be given (a root that
-    /// arrived since the listing refuses, naming it); a root the listing
-    /// disclosed as routed by another local workspace may be left out; a
-    /// root not granted under the anchor refuses, naming it. The published
-    /// routes are exactly the roots given, or their union with the enrolled
-    /// workspace's routes. A label is required for a first enrollment and
-    /// preserved otherwise unless given.
+    /// `roots` are the handles the listing showed for the anchor. An empty
+    /// list refuses: there is nothing to enroll (the MCP schema says
+    /// minItems 1; this is where it is enforced). Every shown root that no
+    /// local workspace routes must be given (a root that arrived since the
+    /// listing refuses, naming it); a root the listing disclosed as routed
+    /// by another local workspace may be left out; a root not granted under
+    /// the anchor refuses, naming it. The published routes are exactly the
+    /// roots given, or their union with the enrolled workspace's routes. A
+    /// label is required for a first enrollment and preserved otherwise
+    /// unless given.
     pub(crate) fn enroll_pending_share(
         &mut self,
         expected: &ConfigView,
@@ -484,6 +486,11 @@ impl NodeStore {
         roots: &BTreeSet<CollectionHandle>,
         label: Option<&str>,
     ) -> Result<Enrolled> {
+        if roots.is_empty() {
+            bail!(
+                "no roots given: nothing to enroll; call config_list_pending_shares and pass exactly the roots it shows for this anchor"
+            );
+        }
         let label = label.map(str::trim).filter(|label| !label.is_empty());
         if self.config_changed(expected)? {
             bail!("node configuration changed; inspect before enrolling");
