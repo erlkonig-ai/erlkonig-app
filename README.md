@@ -147,8 +147,11 @@ returns `outcome_unknown` and its receipt, never a no-publication claim.
 
 ## One node, named workspaces
 
-Startup inspects the selected pile before opening services. Supported older
-framing is converted on one background startup task into a fresh sibling file;
+Startup inspects the selected pile before opening services. When an update is
+needed, the native app asks **Update local data?** with **Migrate** and **Not now**.
+Not now leaves the original and locator unchanged, with local services stopped.
+Noninteractive startup cannot answer on the person's behalf. After approval,
+supported older framing is converted on one background startup task into a fresh sibling file;
 the original pile and existing signing key are retained. Erlkonig checks the
 candidate through its settings and workspace readers, then atomically updates
 the existing `node.json` locator. A restart uses that locator and does not

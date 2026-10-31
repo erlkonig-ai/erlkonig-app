@@ -14,6 +14,11 @@ app settings and workspace routes, appends a public released-format fixture
 record, and writes the public `node.json` locator with the same existing key.
 The acceptance runner checks a fresh sibling is selected, source bytes and key
 are retained, settings/routes remain usable, and restart keeps that selection.
+On the first launch choose **Migrate** in the candidate's **Update local data?**
+prompt; the runner allows two minutes for that explicit response. Separately
+choose **Not now**: the source and locator must remain unchanged and local
+services must remain stopped. Reopening asks again; a completed update's next
+launch must not ask again. Noninteractive startup must never silently consent.
 This exercises framing conversion, not the separately authored `/32` canonical
 cutover. It must not be reported as acceptance of an actual old DMG until that
 artifact's writer format has also been exercised.

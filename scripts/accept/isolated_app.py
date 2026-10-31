@@ -144,7 +144,11 @@ def main():
     parser.add_argument("--root", type=Path, required=True, help="new absolute fixture/evidence directory")
     parser.add_argument("--old-framing", action="store_true",
                         help="exercise supported framing upgrade with retained source and the public node locator; excludes /32 conversion")
+    parser.add_argument("--legacy32-writer", type=Path,
+                        help="independently built historical 3ca5c1cb example for synthetic Config/workspace /32 acceptance")
     args = parser.parse_args()
+    check(not (args.old_framing and args.legacy32_writer), "choose one historical fixture mode")
+    needs_upgrade = args.old_framing or args.legacy32_writer is not None
     check(sys.platform == "darwin", "this acceptance lane requires macOS")
     candidate = args.candidate.resolve(strict=True)
     executable = candidate / "Contents/MacOS/erlkonig" if candidate.suffix == ".app" else candidate
@@ -181,11 +185,22 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
         path = root / "bin" / name
         path.write_text(shim)
         path.chmod(0o700)
-    fixture_command = [str(fixture_binary), str(root)] + (["--old-framing"] if args.old_framing else [])
+    fixture_mode = ["--old-framing"] if args.old_framing else (["--legacy32-input"] if args.legacy32_writer else [])
+    fixture_command = [str(fixture_binary), str(root)] + fixture_mode
     prepared = subprocess.run(fixture_command, env=env, cwd=env["HOME"],
                               capture_output=True, text=True, timeout=45, check=True)
     fixture = json.loads(prepared.stdout)
     (root / "fixture.json").write_text(json.dumps(fixture, indent=2) + "\n")
+    if args.legacy32_writer:
+        writer = args.legacy32_writer.resolve(strict=True)
+        produced = subprocess.run([str(writer), str(root)], env=env, cwd=env["HOME"],
+                                  capture_output=True, text=True, timeout=120, check=True)
+        provenance = json.loads(produced.stdout)
+        check(provenance["historical_core"] == "3ca5c1cb5504d8ff60730edfe5bf641b01f44913", "wrong historical writer")
+        check(provenance["node_id"] == fixture["node_id"] and provenance["pile"] == fixture["pile"], "historical writer changed the fixture binding")
+        provenance["writer_sha256"] = hashlib.sha256(writer.read_bytes()).hexdigest()
+        provenance["source_sha256"] = hashlib.sha256(Path(fixture["pile"]).read_bytes()).hexdigest()
+        (root / "historical-writer.json").write_text(json.dumps(provenance, indent=2) + "\n")
     pile, key = Path(fixture["pile"]), Path(fixture["key"])
     check(pile.is_relative_to(root) and key.is_relative_to(root), "helper selected storage outside the fixture")
     check(stat.S_IMODE(key.stat().st_mode) == 0o600, "synthetic key is not private")
@@ -206,6 +221,8 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
 
     def start(label):
         process = spawn(label)
+        if needs_upgrade and label == "first":
+            print("In the isolated candidate, choose Migrate in 'Update local data?'. This fixture contains no live data.", flush=True)
 
         def ready():
             check(process.poll() is None, "candidate exited before readiness")
@@ -222,7 +239,8 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
             client.initialize()
             return process, client
 
-        return wait_until(ready, 20, "candidate readiness deadline")
+        return wait_until(ready, 120 if needs_upgrade and label == "first" else 20,
+                          "candidate readiness deadline (migration consent may still be pending)")
 
     def stopped(process, url):
         process.wait(timeout=15)
@@ -244,7 +262,7 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
         check(not inspected["runtime"]["sync_running"] and not inspected["runtime"]["maintenance_running"], "fixture started network or maintenance services")
         check(inspected["mcp_url"] == client.url, "candidate endpoint does not match its own listener")
         check((key.stat().st_ino, key.stat().st_size, key.stat().st_mtime_ns) == key_stat, "key file changed")
-        if args.old_framing:
+        if needs_upgrade:
             locator = json.loads((Path(fixture["app_data"]) / "node.json").read_text())
             selected = Path(locator["pile"])
             check(selected != original_pile and selected.parent == original_pile.parent, "upgrade did not select a fresh sibling")
@@ -256,7 +274,7 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
     try:
         first, client = start("first")
         same_identity(client)
-        if args.old_framing:
+        if needs_upgrade:
             activated_pile = Path(json.loads((Path(fixture["app_data"]) / "node.json").read_text())["pile"])
             pile = activated_pile
         for authorization, origin, expected in [(False, None, 401), (True, "https://untrusted.invalid", 403)]:
@@ -322,7 +340,7 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
                         if entry["client"] == "codex" else ["plugin", "list", "--json"])
             check(entry["args"] == expected, "candidate attempted an unrequested client mutation")
         (root / "result.json").write_text(json.dumps({"status": "passed", "node_id": fixture["node_id"],
-            "supported_framing_upgrade": args.old_framing, "canonical_32_conversion_tested": False,
+            "supported_framing_upgrade": args.old_framing, "canonical_32_conversion_tested": args.legacy32_writer is not None,
             "checks": ["authenticated HTTP", "explicit workspace", "native item tools", "duplicate refusal",
                        "stdio forwarding only", "Quit closes listener and forwarder", "bounded AppKit drain", "same identity on relaunch"]}, indent=2) + "\n")
         print("isolated candidate acceptance passed; no fixture app left running")

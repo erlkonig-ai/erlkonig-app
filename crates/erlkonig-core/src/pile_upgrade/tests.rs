@@ -89,7 +89,7 @@ impl Fixture {
     }
 }
 
-fn prompt(control: &StartupControl) -> BranchPrompt {
+fn prompt(control: &StartupControl) -> StartupPrompt {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(prompt) = control.take_prompt() {
@@ -110,7 +110,23 @@ fn framing_upgrade_retains_source_identity_config_and_restart_selection() {
     old_framing::append_released_blob(&f.binding.pile);
     let source = fs::read(&f.binding.pile).unwrap();
     let key = fs::read(&f.binding.key).unwrap();
-    let mut runtime = Runtime::start(&f.layout).unwrap();
+    let control = StartupControl::new(true);
+    let worker_control = control.clone();
+    let layout = f.layout.clone();
+    let worker = thread::spawn(move || Runtime::start_controlled(&layout, &worker_control));
+    let consent = prompt(&control);
+    assert_eq!(consent.title, "Update local data?");
+    assert_eq!(consent.approve_label, "Migrate");
+    assert_eq!(consent.decline_label, "Not now");
+    assert_eq!(
+        fs::read_dir(f.binding.pile.parent().unwrap())
+            .unwrap()
+            .count(),
+        2,
+        "no candidate exists before consent"
+    );
+    consent.answer(true);
+    let mut runtime = worker.join().unwrap().unwrap();
     let selected = runtime.binding().clone();
     assert_ne!(selected.pile, f.binding.pile);
     assert_eq!(selected.pile.parent(), f.binding.pile.parent());
@@ -147,6 +163,35 @@ fn framing_upgrade_retains_source_identity_config_and_restart_selection() {
     restarted.finish().unwrap();
     assert_eq!(f.locator(), locator);
     assert_eq!(fs::read(&f.binding.pile).unwrap(), source);
+}
+
+#[test]
+fn declining_migration_and_noninteractive_start_never_create_a_candidate() {
+    let f = Fixture::new();
+    f.configured();
+    old_framing::append_released_blob(&f.binding.pile);
+    let source = fs::read(&f.binding.pile).unwrap();
+    let locator = f.locator();
+    let control = StartupControl::new(true);
+    let worker_control = control.clone();
+    let layout = f.layout.clone();
+    let worker = thread::spawn(move || Runtime::start_controlled(&layout, &worker_control));
+    let consent = prompt(&control);
+    assert_eq!(consent.title, "Update local data?");
+    consent.answer(false);
+    let error = worker.join().unwrap().err().unwrap();
+    assert!(error.to_string().contains("Local services are not running"));
+    let error = Runtime::start(&f.layout).err().unwrap();
+    assert!(error.to_string().contains("needs your approval"));
+    assert_eq!(
+        fs::read_dir(f.binding.pile.parent().unwrap())
+            .unwrap()
+            .count(),
+        2
+    );
+    assert_eq!(fs::read(&f.binding.pile).unwrap(), source);
+    assert_eq!(f.locator(), locator);
+    assert!(!f.layout.dir.join("mcp.token").exists());
 }
 
 #[test]
@@ -202,8 +247,11 @@ fn branch_choice_is_explicit_and_locator_changes_are_not_overwritten() {
     let binding = f.binding.clone();
     let signer = f.signer.clone();
     let worker = thread::spawn(move || prepare(&layout, binding, &signer, &worker_control));
+    let consent = prompt(&control);
+    assert_eq!(consent.title, "Update local data?");
+    consent.answer(true);
     let choice = prompt(&control);
-    assert_eq!(choice.name, "legacy");
+    assert_eq!(choice.title, "Import legacy?");
     assert!(choice.details.contains(&hex::encode(f.binding.signer)));
     let changed = b"a concurrent locator change";
     fs::write(f.layout.dir.join("node.json"), changed).unwrap();
@@ -224,6 +272,8 @@ fn cancellation_drains_a_pending_choice_without_publishing() {
     let worker_control = control.clone();
     let layout = f.layout.clone();
     let worker = thread::spawn(move || Runtime::start_controlled(&layout, &worker_control));
+    let consent = prompt(&control);
+    consent.answer(true);
     let choice = prompt(&control);
     assert!(
         Runtime::start(&f.layout).is_err(),
@@ -275,13 +325,16 @@ fn unresolved_settings_and_concurrent_workspace_revisions_are_preserved() {
     node.close().unwrap();
     old_framing::append_released_blob(&f.binding.pile);
     let source = fs::read(&f.binding.pile).unwrap();
-    let selected = prepare(
-        &f.layout,
-        f.binding.clone(),
-        &f.signer,
-        &StartupControl::new(false),
-    )
-    .unwrap();
+    let control = StartupControl::new(true);
+    let worker_control = control.clone();
+    let layout = f.layout.clone();
+    let binding = f.binding.clone();
+    let signer = f.signer.clone();
+    let worker = thread::spawn(move || prepare(&layout, binding, &signer, &worker_control));
+    let consent = prompt(&control);
+    assert_eq!(consent.title, "Update local data?");
+    consent.answer(true);
+    let selected = worker.join().unwrap().unwrap();
     let after = config_view(&selected.pile, &f.signer).unwrap().unwrap();
     assert_eq!(
         format!("{:#}", after.settings().unwrap_err()),

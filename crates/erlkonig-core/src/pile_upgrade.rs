@@ -30,13 +30,15 @@ use triblespace::core::{
 };
 
 /// One pending native choice. The response belongs only to this startup.
-pub struct BranchPrompt {
-    pub name: String,
+pub struct StartupPrompt {
+    pub title: String,
     pub details: String,
+    pub approve_label: String,
+    pub decline_label: String,
     answer: mpsc::SyncSender<bool>,
 }
 
-impl BranchPrompt {
+impl StartupPrompt {
     pub fn answer(self, approved: bool) {
         let _ = self.answer.try_send(approved);
     }
@@ -45,7 +47,7 @@ impl BranchPrompt {
 struct StartupState {
     detail: String,
     notice: Option<String>,
-    prompt: Option<BranchPrompt>,
+    prompt: Option<StartupPrompt>,
 }
 
 /// Transient progress and one choice for the application's one startup task.
@@ -83,7 +85,7 @@ impl StartupControl {
             .detail
             .clone()
     }
-    pub fn take_prompt(&self) -> Option<BranchPrompt> {
+    pub fn take_prompt(&self) -> Option<StartupPrompt> {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -130,16 +132,24 @@ impl StartupControl {
         self.progress(detail).is_ok()
     }
 
-    fn approve(&self, name: String, details: String) -> Result<()> {
+    fn approve(
+        &self,
+        title: String,
+        details: String,
+        approve_label: &str,
+        decline_label: &str,
+    ) -> Result<()> {
         ensure!(
             self.interactive,
-            "legacy branches need an explicit collection name and authority; open Erlkonig to choose, or use trible-migrate branch-to-collection with the existing key"
+            "local data needs your approval to update; open Erlkonig to choose Migrate or Not now. Local services have not started and the original pile and node locator are unchanged"
         );
         self.check()?;
         let (answer, received) = mpsc::sync_channel(1);
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).prompt = Some(BranchPrompt {
-            name,
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).prompt = Some(StartupPrompt {
+            title,
             details,
+            approve_label: approve_label.into(),
+            decline_label: decline_label.into(),
             answer,
         });
         loop {
@@ -147,7 +157,7 @@ impl StartupControl {
             match received.recv_timeout(Duration::from_millis(100)) {
                 Ok(true) => return self.check(),
                 Ok(false) | Err(mpsc::RecvTimeoutError::Disconnected) => bail!(
-                    "storage upgrade cancelled; the original pile and node locator are unchanged"
+                    "Local data update deferred. Local services are not running. The original pile and node locator are unchanged. Reopen Erlkonig when you are ready to migrate."
                 ),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
@@ -264,6 +274,11 @@ pub(crate) fn prepare(
         layout.uses_locator(),
         "this explicitly fixed pile needs an upgrade; bind it through the application node locator before starting, so a validated replacement can be activated without overwriting the source"
     );
+    control.progress("Waiting for your permission to update local data…")?;
+    control.approve("Update local data?".into(), format!(
+        "Your local data needs an update before Erlkonig can start. Erlkonig will create an updated copy and keep the original. Your existing identity and signing key will stay the same.\n\nOriginal: {}",
+        binding.pile.display()
+    ), "Migrate", "Not now")?;
     let mut names = Vec::new();
     let branch_names = if inspection.legacy_branches.is_empty() {
         Default::default()
@@ -277,10 +292,10 @@ pub(crate) fn prepare(
             .cloned()
             .unwrap_or_else(|| format!("Imported branch {branch:X}"));
         control.progress("Waiting for your branch import choice…")?;
-        control.approve(name.clone(), format!(
+        control.approve(format!("Import {name}?"), format!(
             "Import this branch as the collection “{name}”?\n\nBranch: {branch:X}\nRead and write authority: this node ({})\n\nThe existing signing key will be used. The original pile remains intact. This imports a collection; it does not select a Faculty role, enroll it in a workspace, or recover application settings. Cancel if this node should not own the imported collection.",
             hex::encode(binding.signer)
-        ))?;
+        ), "Import with this node", "Cancel startup")?;
         names.push((*branch, name));
     }
     let decisions: Vec<_> = names

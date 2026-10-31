@@ -7,7 +7,7 @@ use crate::native_menu::NativeMenu;
 use erlkonig_core::{
     install,
     paths::{self, Layout},
-    pile_upgrade::{BranchPrompt, StartupControl},
+    pile_upgrade::{StartupPrompt, StartupControl},
     runtime::Runtime,
 };
 use std::collections::VecDeque;
@@ -198,8 +198,8 @@ pub enum Then {
     LoginSettings,
     /// Button 0 installs the plugin for these detected clients.
     Connect(Vec<install::Host>),
-    /// Approve only the branch currently offered by this startup task.
-    StartupBranch,
+    /// Answer only the migration/branch choice offered by this startup task.
+    StartupChoice,
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -241,7 +241,7 @@ pub struct App<S: Shell> {
     layout: Layout,
     runtime: Option<Runtime>,
     startup_task: Option<StartupTask>,
-    startup_prompt: Option<BranchPrompt>,
+    startup_prompt: Option<StartupPrompt>,
     pub problem: Option<String>,
     items: Items,
     /// The native menu, once a shell has asked for it on its own thread.
@@ -392,7 +392,7 @@ impl<S: Shell> App<S> {
             self.quitting = Some(Instant::now());
         }
         self.startup_prompt = None;
-        self.prompts.retain(|prompt| prompt.then != Then::StartupBranch);
+        self.prompts.retain(|prompt| prompt.then != Then::StartupChoice);
         match task.join() {
             Ok(Ok(runtime)) => {
                 if self.quitting.is_some() { runtime.begin_shutdown(); }
@@ -409,15 +409,16 @@ impl<S: Shell> App<S> {
     fn offer_startup_choice(&mut self) {
         if self.startup_prompt.is_some() { return; }
         let Some(prompt) = self.startup_task.as_ref().and_then(|task| task.control.take_prompt()) else { return; };
-        let title = format!("Import {}?", prompt.name);
+        let title = prompt.title.clone();
         let text = prompt.details.clone();
-        let buttons = ["Import with this node", "Cancel startup"];
+        let labels = [prompt.approve_label.clone(), prompt.decline_label.clone()];
+        let buttons = [labels[0].as_str(), labels[1].as_str()];
         self.startup_prompt = Some(prompt);
         match self.shell.startup_alert(&title, &text, &buttons, &self.terminate) {
-            Some(answer) => self.follow(Then::StartupBranch, answer),
+            Some(answer) => self.follow(Then::StartupChoice, answer),
             None => {
                 self.prompts.push_back(Prompt {
-                    title, text, buttons: buttons.iter().map(|s| (*s).into()).collect(), then: Then::StartupBranch,
+                    title, text, buttons: buttons.iter().map(|s| (*s).into()).collect(), then: Then::StartupChoice,
                 });
                 self.shell.show_window();
             }
@@ -477,7 +478,7 @@ impl<S: Shell> App<S> {
                     self.change_plugins(install::Change::Install, hosts);
                 }
             }
-            Then::StartupBranch => {
+            Then::StartupChoice => {
                 if let Some(prompt) = self.startup_prompt.take() {
                     prompt.answer(answer == 0 && self.quitting.is_none() && !self.terminate.load(Ordering::Relaxed));
                 }

@@ -1,5 +1,6 @@
 //! Acceptance-only bootstrap. Creates synthetic storage, never app services.
 mod old_framing;
+mod legacy32_input;
 
 use erlkonig_core::{
     config::{Bootstrap, NodeLocator},
@@ -13,8 +14,9 @@ use std::{env, path::PathBuf};
 fn main() {
     let args: Vec<_> = env::args_os().skip(1).collect();
     let old_framing = args.len() == 2 && args[1] == "--old-framing";
-    assert!(args.len() == 1 || old_framing,
-        "usage: accept-fixture ABSOLUTE_NEW_FIXTURE_ROOT [--old-framing]");
+    let legacy32 = args.len() == 2 && args[1] == "--legacy32-input";
+    assert!(args.len() == 1 || old_framing || legacy32,
+        "usage: accept-fixture ABSOLUTE_NEW_FIXTURE_ROOT [--old-framing | --legacy32-input]");
     let root = PathBuf::from(&args[0]);
     assert!(root.is_absolute() && root.is_dir());
     for (name, relative) in [
@@ -55,13 +57,19 @@ fn main() {
         .create_workspace(&view, "Synthetic acceptance fixture")
         .unwrap();
     node.close().unwrap();
+    let selected_pile = if legacy32 { custody.join("historical.pile") } else { bootstrap.pile.clone() };
+    if legacy32 {
+        legacy32_input::export(&root, &bootstrap.pile, &bootstrap.key, &public, &selected_pile);
+    }
     if old_framing {
         old_framing::append_released_blob(&bootstrap.pile);
+    }
+    if old_framing || legacy32 {
         ensure_private_dir(&app).unwrap();
         // The public app's real locator format, pointing at the same existing
         // key. No alternate test-only runtime configuration is introduced.
         std::fs::write(app.join("node.json"), serde_json::to_vec(&NodeLocator {
-            pile: bootstrap.pile.clone(), key: bootstrap.key.clone(), expected_signer: public.clone(),
+            pile: selected_pile.clone(), key: bootstrap.key.clone(), expected_signer: public.clone(),
         }).unwrap()).unwrap();
     }
     // No key bytes, app token, credentials, native owner or network endpoint.
@@ -70,9 +78,10 @@ fn main() {
     println!(
         "{}",
         json!({
-            "app_data":app, "pile":bootstrap.pile, "key":bootstrap.key,
+            "app_data":app, "pile":selected_pile, "key":bootstrap.key,
             "node_id":public, "workspace":format!("{workspace:X}"),
             "old_framing":old_framing,
+            "legacy32_input":legacy32,
         })
     );
 }
