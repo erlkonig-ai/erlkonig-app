@@ -452,12 +452,15 @@ fn native_config_acquisition_failures_are_compared_as_outcomes() {
     f.configured();
     let missing = f.binding.pile.with_file_name("missing-descriptor.pile");
     fs::write(&missing, []).unwrap();
+    let resident = config_snapshot(&f.binding.pile, &f.signer).unwrap();
+    let collection = Collection::open(
+        &resident,
+        faculties::config::handle(f.signer.verifying_key()),
+    )
+    .unwrap();
     let acquire_missing = || {
         let snapshot = config_snapshot(&missing, &f.signer).unwrap();
-        ConfigView::from_snapshot(
-            snapshot,
-            Collection::from_handle(faculties::config::handle(f.signer.verifying_key())),
-        )
+        ConfigView::from_snapshot(snapshot, collection)
     };
     assert!(
         acquire_missing().is_err(),

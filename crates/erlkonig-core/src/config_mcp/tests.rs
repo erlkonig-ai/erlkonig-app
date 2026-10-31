@@ -274,7 +274,7 @@ impl Fixture {
         for root in workspace.routes.values().copied().collect::<std::collections::BTreeSet<_>>() {
             let overlay = triblespace_net::collection_activation::collection_repair_overlay(&snapshot, root).unwrap();
             let evidence = overlay.authorization_evidence();
-            match evidence.authorized_readers() {
+            match evidence.authorized_readers(&snapshot) {
                 CollectionReadAudience::Open => {}
                 CollectionReadAudience::Restricted(subjects) => assert!(subjects.contains(&target.signer.verifying_key()), "server resident authority admits this endpoint"),
             }
