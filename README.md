@@ -263,6 +263,12 @@ stopped services, and Quit rejects retries while draining owned work.
 Healthy operation has no status row in the crown menu. An error adds a short
 **Sync paused**, **Services paused** or **Attention needed** action; click it
 for the full local diagnostics. Diagnostic text never becomes the menu title.
+On macOS, long reports use a bounded, selectable scrolling text area; the
+native dismissal button stays outside it and Return keeps its default action.
+Short alerts retain their usual native layout. The hidden AppKit layout probe
+(`cargo run --release -p erlkonig-mac --example alert-layout`) checks full-text
+retention, selection, scrolling, button bounds, and small-screen sizing without
+opening a dialog or starting services; it is not a visible interaction test.
 The same attention condition gives the crown a mildly sharper static outline;
 it remains distinct with Reduce Motion, without inventing activity.
 

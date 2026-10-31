@@ -7,8 +7,8 @@ use erlkonig_app::crown::WorkActivity;
 use erlkonig_core::paths::{self, Layout};
 use erlkonig_core::secret_entry::{EntryAnswer, EntryKind, EntryValue, SecretPrompt};
 use objc2::{MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSApplication, NSWorkspace};
-use objc2_foundation::{NSBundle, NSString, NSURL};
+use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSApplication, NSScreen, NSWorkspace};
+use objc2_foundation::{NSBundle, NSSize, NSString, NSURL};
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -62,12 +62,10 @@ impl Shell for MacShell {
         let app = NSApplication::sharedApplication(self.mtm);
         #[allow(deprecated)]
         app.activateIgnoringOtherApps(true);
-        let alert = NSAlert::new(self.mtm);
-        alert.setMessageText(&NSString::from_str(title));
-        alert.setInformativeText(&NSString::from_str(text));
-        for button in buttons {
-            alert.addButtonWithTitle(&NSString::from_str(button));
-        }
+        let visible_size = NSScreen::mainScreen(self.mtm)
+            .map(|screen| screen.visibleFrame().size)
+            .unwrap_or(NSSize::new(1024.0, 768.0));
+        let alert = crate::alert::message_alert(self.mtm, title, text, buttons, visible_size);
         Some((alert.runModal() - NSAlertFirstButtonReturn).max(0) as usize)
     }
 

@@ -11,6 +11,10 @@ publish.workspace = true
 name = "crown-render"
 path = "../../scripts/crown-render.rs"
 
+[[example]]
+name = "alert-layout"
+path = "../../scripts/alert-layout.rs"
+
 [dependencies]
 erlkonig-app.workspace = true
 
