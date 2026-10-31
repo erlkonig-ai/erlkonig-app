@@ -15,6 +15,16 @@ path = "../../scripts/crown-render.rs"
 name = "alert-layout"
 path = "../../scripts/alert-layout.rs"
 
+[[example]]
+name = "protected-secrets-trial"
+path = "../../scripts/protected-secrets-trial.rs"
+
+[dev-dependencies]
+faculties.workspace = true
+triblespace.workspace = true
+hifitime.workspace = true
+ed25519-dalek.workspace = true
+
 [dependencies]
 erlkonig-app.workspace = true
 
