@@ -75,19 +75,31 @@ pub fn run(args: &[OsString]) -> Result<bool> {
     };
     if command == "--help" {
         println!(
-            "erlkonig public-key --key EXISTING_KEY\nerlkonig inspect-node --pile EXISTING_PILE --public PUBLIC_HEX\nerlkonig bind-node --data-dir APP_DIR --pile EXISTING_PILE --key EXISTING_KEY --expect-public PUBLIC_HEX\nerlkonig migration-plan --request REQUEST_JSON\nerlkonig migrate-settings --request REQUEST_JSON\nerlkonig mcp-stdio --data-dir APP_DIR --url http://127.0.0.1:PORT/"
+            "erlkonig public-key --key EXISTING_KEY\nerlkonig inspect-node --pile EXISTING_PILE --public PUBLIC_HEX\nerlkonig inspect-fd-events --pile EXISTING_PILE --public PUBLIC_HEX [--collection OBSERVED_METRICS_HANDLE]\n  Without --collection: list accessible recorded metrics descriptors only.\nerlkonig bind-node --data-dir APP_DIR --pile EXISTING_PILE --key EXISTING_KEY --expect-public PUBLIC_HEX\nerlkonig migration-plan --request REQUEST_JSON\nerlkonig migrate-settings --request REQUEST_JSON\nerlkonig mcp-stdio --data-dir APP_DIR --url http://127.0.0.1:PORT/"
         );
         return Ok(true);
     }
     if !matches!(
         command,
-        "public-key" | "inspect-node" | "bind-node" | "migration-plan" | "migrate-settings"
+        "public-key" | "inspect-node" | "inspect-fd-events" | "bind-node" | "migration-plan" | "migrate-settings"
     ) {
         return Ok(false);
     }
     let mut opts = options(&args[1..])?;
     let mut get = |name: &str| opts.remove(name).with_context(|| format!("missing {name}"));
     match command {
+        "inspect-fd-events" => {
+            let path = PathBuf::from(get("--pile")?);
+            let signer = public(&get("--public")?)?;
+            let selected = opts.remove("--collection").as_deref().map(parse_handle).transpose()?;
+            if !opts.is_empty() {
+                bail!("unknown FD inspection options");
+            }
+            let observed = snapshot(&path, signer)
+                .map_err(|_| anyhow::anyhow!("read-only node snapshot unavailable"))?;
+            let report = crate::node_metrics::fd::reader::inspect(&observed, signer, selected)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         "public-key" => {
             let key = PathBuf::from(get("--key")?);
             if !opts.is_empty() {

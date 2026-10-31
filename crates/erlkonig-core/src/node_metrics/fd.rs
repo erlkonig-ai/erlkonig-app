@@ -6,6 +6,8 @@ use super::*;
 use crate::fd_diagnostics::{Batch, CAPACITY, FD_CAPACITY, TYPE_NAMES};
 use triblespace::macros::id_hex;
 
+pub(crate) mod reader;
+
 pub const KIND_FD_EXHAUSTION: Id = id_hex!("E46B35F4FCEFEB58C3940AC16CA0FB58");
 pub const KIND_FD_CAPTURE_LOSS: Id = id_hex!("391CF649FDAB35582A0480D562DEB444");
 
