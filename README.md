@@ -59,6 +59,51 @@ single chosen login or JSON export.
 Legacy consumers of raw `secrets_get` continue to receive the original bytes,
 but must explicitly adopt native item APIs to consume new local login entries.
 
+## Protected local Secrets candidate (not deployed)
+
+`secrets_enter_local` additionally accepts `protected: true`. The native form
+collects and confirms an independent app passphrase (1–1024 UTF-8 bytes), never
+the Mac login password. A new protected version has its own random DEK, wrapped
+by an Argon2id-derived passphrase key; there is no node/agent-key recipient wrap.
+Existing versions are not converted, deleted, or made retrospectively private.
+Keep the passphrase separately: this candidate has no recovery reset, and losing
+it loses access. Omit the flag for unchanged ordinary agent-accessible entry.
+
+Protected explicit Secrets get/open/inspect/export/TOTP operations detach their
+exact encrypted request, release the store lease, and ask locally. The prompt
+names the operation and its disclosure. Approval returns a request-bound key,
+not an unlocked vault; the operation reopens and rechecks its immutable binding.
+Plaintext output is available to the calling integration after approval. The
+shared MCP bearer token does not authenticate an individual named agent. Direct
+Mail/Discord/other low-level consumers have not been adapted: protected reads
+there fail closed, without silently using ordinary agent-key access.
+
+Both entry and unlock prompts expire after 120 seconds. Shutdown aborts pending
+and visible modals. The deadline gates admission, not already-admitted work.
+Transport disconnect/MCP cancellation is not yet propagated to these synchronous
+requests; it must not be described as revoking a pending approval. No automatic
+retry occurs. Rust-owned passphrases/keys are zeroized; AppKit and immutable
+Apple framework buffer copies cannot promise complete erasure.
+
+Touch ID remains **not configured and not UI-enabled** in this candidate. The
+concrete source backend creates P-256 Secure Enclave keys with private-key-use
+and current-biometry access control, wraps an independent DEK binding with ECIES,
+and uses a new LAContext per read. It cancels/invalidate-drops that context and
+never caches authentication between requests. It provides no OS-password,
+software-key, or agent-key fallback. Hardware loss, missing hardware/enrollment,
+biometry changes/lockout, headless use, signing failure and missing key deny the
+device path; an independently configured passphrase wrap remains the recovery
+path. Source compilation/mock tests do not constitute hardware acceptance.
+
+The existing app is ad-hoc signed with no team identity/entitlements. Activating
+the device path requires a provisioned app identity, appropriate data-protection
+keychain access, explicit enrollment UI, and synthetic hardware tests across
+cancel, repeated access, app upgrade and missing-key scenarios. No keychain item,
+profile or signing account was created during implementation. Apple references:
+[Secure Enclave keys](https://developer.apple.com/documentation/security/protecting-keys-with-the-secure-enclave),
+[macOS keychains](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains),
+[authentication context reuse](https://developer.apple.com/documentation/security/ksecuseauthenticationcontext).
+
 ## One node, named workspaces
 
 One node identity, one logical pile and one local MCP endpoint serve every

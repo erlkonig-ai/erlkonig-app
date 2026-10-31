@@ -7,6 +7,27 @@ the app deliberately refuses to share its data-owner lock with it.
 
 These are pending interactive checks, not an already-passed checklist:
 
+Protected Secrets candidate checks (only with invented data in an isolated
+store/HOME; do not run against an existing credential):
+
+- Create a protected generic item and a protected login. Confirm the separate
+  app passphrase twice; mismatch, empty input, over 1024 UTF-8 bytes, Cancel,
+  shutdown and the 120-second deadline must publish nothing.
+- Request raw plaintext, private facts, structural inspection, one exact
+  text/binary field and a TOTP code separately. Confirm each prompt describes
+  its different disclosure and remains screen-bounded with long labels. A
+  second request must ask again, not reuse the previous passphrase/unlock.
+- Cancel a pending request, including after its native window is visible;
+  verify no plaintext output. Disconnect is not currently a cancellation
+  guarantee: allow only synthetic calls to reach the deadline.
+- The current ad-hoc candidate must say Touch ID is not configured. No device
+  key may be created merely by startup, metadata listing or drawing a prompt.
+  Real Secure Enclave enrollment remains a separate, explicitly interactive
+  acceptance after provisioned signing is available: verify fresh Touch ID per
+  access, cancellation, lockout, enrollment changes, missing hardware/key,
+  hardware loss recovery and key access across a signed app upgrade. Never
+  report source/mock tests as having passed these hardware checks.
+
 1. Launch the candidate. Expect one crown, no Dock window, and a clickable
    status line. A fresh app store enables sync of permitted collections and
    maintenance of supported attached collections. No background-node approval

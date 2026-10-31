@@ -136,6 +136,14 @@ impl Shell for MacShell {
 
     fn show_window(&mut self) {}
 
+    fn unlock_secret(
+        &mut self,
+        prompt: &erlkonig_core::protected_access::ProtectedPrompt,
+        terminate: &Arc<AtomicBool>,
+    ) -> erlkonig_core::protected_access::AccessResult {
+        crate::protected_access::unlock(self.mtm, prompt, terminate)
+    }
+
     fn enter_secret(&mut self, prompt: &SecretPrompt, terminate: &Arc<AtomicBool>) -> EntryAnswer {
         use block2::RcBlock;
         use objc2_app_kit::{NSModalPanelRunLoopMode, NSSecureTextField, NSTextField, NSView};
@@ -152,8 +160,10 @@ impl Shell for MacShell {
         let alert = NSAlert::new(self.mtm);
         alert.setMessageText(&NSString::from_str("Save a local secret"));
         alert.setInformativeText(&NSString::from_str(&format!(
-            "Workspace: {}\nID: {}\nService: {}\nSecret name: {}\n\nEnter the credentials in the fields below, then choose Save. Never put them in chat. Saved encrypted in this workspace; no sharing grants are created. Cancel saves nothing.",
-            request.workspace_label, request.workspace, request.service, request.name,
+            "Workspace: {}\nID: {}\nService: {}\nSecret name: {}\n\nEnter the credentials in the fields below, then choose Save. Never put them in chat. {} No sharing grants are created. Cancel saves nothing.",
+            crate::protected_access::bounded_label(&request.workspace_label), request.workspace,
+            crate::protected_access::bounded_label(&request.service), crate::protected_access::bounded_label(&request.name),
+            if request.protected { "Next, choose and confirm an independent app passphrase. The agent key cannot unlock this item." } else { "Saved encrypted in this workspace with ordinary agent-accessible protection." },
         )));
         alert.addButtonWithTitle(&NSString::from_str("Save"));
         let cancel = alert.addButtonWithTitle(&NSString::from_str("Cancel"));
@@ -233,7 +243,18 @@ impl Shell for MacShell {
             username.setStringValue(&NSString::from_str(""));
         }
         window.orderOut(None);
-        answer
+        if request.protected {
+            if let EntryAnswer::Submit(value) = answer {
+                let detail = format!(
+                    "Workspace: {}\nSecret: {}\n\nChoose a strong independent app passphrase, not your Mac login password. Enter it locally for each requested read.\n\nKeep it safely: losing it means losing access. Touch ID recovery is not configured. Cancel saves nothing.",
+                    crate::protected_access::bounded_label(&request.workspace_label), crate::protected_access::bounded_label(&request.name),
+                );
+                match crate::protected_access::passphrase(self.mtm, "Protect a local secret", &detail, true, prompt.cancellation_check(), terminate) {
+                    Ok(password) => EntryAnswer::Submit(value.with_protection(password)),
+                    Err(_) => EntryAnswer::Cancelled,
+                }
+            } else { answer }
+        } else { answer }
     }
 }
 

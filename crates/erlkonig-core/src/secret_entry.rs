@@ -9,6 +9,7 @@ use std::sync::{
     mpsc,
 };
 use zeroize::Zeroizing;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +26,7 @@ pub struct EntryRequest {
     pub service: String,
     pub name: String,
     pub kind: EntryKind,
+    pub protected: bool,
 }
 
 /// Deliberately neither Debug nor Clone. AppKit may retain its own copies;
@@ -32,6 +34,7 @@ pub struct EntryRequest {
 pub struct EntryValue {
     username: Option<Zeroizing<String>>,
     value: Zeroizing<String>,
+    protection: Option<Zeroizing<String>>,
 }
 
 /// Borrow the zeroizing UI buffers only for the admitted write. Login fields
@@ -49,6 +52,7 @@ impl EntryValue {
         Self {
             username: Some(username),
             value: password,
+            protection: None,
         }
     }
 
@@ -56,7 +60,19 @@ impl EntryValue {
         Self {
             username: None,
             value,
+            protection: None,
         }
+    }
+
+    pub fn with_protection(mut self, password: Zeroizing<String>) -> Self {
+        self.protection = Some(password);
+        self
+    }
+
+    pub(crate) fn protection(&self) -> Option<faculties::secrets::protected::Protection<'_>> {
+        self.protection.as_ref().map(|password| faculties::secrets::protected::Protection {
+            password: password.as_bytes(), device: None,
+        })
     }
 
     pub(crate) fn input(&self, kind: EntryKind) -> Result<EntryInput<'_>> {
@@ -97,16 +113,18 @@ pub struct SecretPrompt {
     pub request: EntryRequest,
     reply: Option<mpsc::SyncSender<EntryAnswer>>,
     closed: Arc<AtomicBool>,
+    deadline: Instant,
 }
 
 impl SecretPrompt {
     pub fn is_cancelled(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
+        self.closed.load(Ordering::Acquire) || Instant::now() >= self.deadline
     }
 
     pub fn cancellation_check(&self) -> impl Fn() -> bool + Send + 'static {
         let closed = self.closed.clone();
-        move || closed.load(Ordering::Acquire)
+        let deadline = self.deadline;
+        move || closed.load(Ordering::Acquire) || Instant::now() >= deadline
     }
 
     pub fn answer(mut self, answer: EntryAnswer) {
@@ -144,6 +162,7 @@ pub struct SecretEntry {
 impl SecretEntry {
     pub(crate) fn request(&self, request: EntryRequest) -> Result<EntryAnswer> {
         let (reply, receiver) = mpsc::sync_channel(1);
+        let deadline = Instant::now() + Duration::from_secs(120);
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if self.closed.load(Ordering::Acquire) {
@@ -157,14 +176,16 @@ impl SecretEntry {
                 request,
                 reply: Some(reply),
                 closed: self.closed.clone(),
+                deadline,
             });
         }
-        let answer = receiver.recv().unwrap_or(EntryAnswer::Cancelled);
+        let answer = receiver.recv_timeout(Duration::from_secs(120)).unwrap_or(EntryAnswer::Cancelled);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.active = None;
+        state.pending.take();
         // This is the Save admission boundary. Closing before admission wins;
         // a Save admitted before shutdown is ordinary work that may drain.
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire) || Instant::now() >= deadline {
             Ok(EntryAnswer::Cancelled)
         } else {
             Ok(answer)
@@ -206,6 +227,7 @@ mod tests {
             service: "Synthetic service".into(),
             name: "fixture".into(),
             kind: EntryKind::Login,
+            protected: false,
         }
     }
 

@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::VerifyingKey;
@@ -20,6 +21,7 @@ use triblespace::core::id::Id;
 
 use crate::config::NodeBinding;
 use crate::node_store::ConfigView;
+use crate::protected_access::ProtectedAccessBridge;
 use crate::secret_entry::{EntryAnswer, EntryInput, EntryKind, EntryRequest, SecretEntry};
 use crate::workspace::Workspace;
 
@@ -31,8 +33,8 @@ const LIST: Tool = Tool {
 
 const ENTER_LOCAL: Tool = Tool {
     name: "secrets_enter_local",
-    description: "Ask the running app to show one local secure-entry dialog for the exact workspace, service and secret name. Never put credentials in these arguments. The person enters a login (native structured encrypted username/password fields) or a generic secret (unchanged raw UTF-8 bytes) locally. Both login fields, or the generic value, must be nonempty; invalid Save publishes nothing and asks for a new local entry. Save returns only an immutable version ID; Cancel saves nothing. Only one prompt may be active. This synchronous call waits for the person; keep the connection open. Disconnect/cancellation does not undo an admitted Save; an unknown outcome must not be retried automatically. Inspect secrets_items metadata for login or secrets_list for generic entry before any new entry. Creates no grants; collection sharing and secret delivery authority are unchanged.",
-    input_schema: r#"{"type":"object","properties":{"service":{"type":"string","minLength":1,"maxLength":160},"name":{"type":"string","minLength":1,"maxLength":160},"kind":{"type":"string","enum":["login","secret"],"default":"login"}},"required":["service","name"],"additionalProperties":false}"#,
+    description: "Ask the running app to show one local secure-entry dialog for the exact workspace, service and secret name. Never put credentials or protection passphrases in these arguments. The person enters a login (native structured encrypted username/password fields) or a generic secret (unchanged raw UTF-8 bytes) locally. Set protected=true to create a new locally passphrase-protected version; the person enters and confirms the protection passphrase locally. This does not convert existing secrets. Protected access later prompts for this exact operation; approval may disclose plaintext to the calling integration when the requested tool exports values. Omitted protected=false preserves ordinary entry. Both login fields, or the generic value, must be nonempty; invalid Save publishes nothing and asks for a new local entry. Save returns only an immutable version ID; Cancel saves nothing. Only one prompt may be active. This synchronous call waits for the person; keep the connection open. Disconnect/cancellation does not undo an admitted Save; an unknown outcome must not be retried automatically. Inspect secrets_items metadata for login or secrets_list for generic entry before any new entry. Creates no grants; collection sharing and secret delivery authority are unchanged.",
+    input_schema: r#"{"type":"object","properties":{"service":{"type":"string","minLength":1,"maxLength":160},"name":{"type":"string","minLength":1,"maxLength":160},"kind":{"type":"string","enum":["login","secret"],"default":"login"},"protected":{"type":"boolean","default":false}},"required":["service","name"],"additionalProperties":false}"#,
 };
 
 pub struct WorkspaceDispatch {
@@ -43,6 +45,7 @@ pub struct WorkspaceDispatch {
     // Handles and their adapters, never a materialized dataset or config cache.
     owners: RefCell<BTreeMap<Id, Owner>>,
     secret_entry: Option<SecretEntry>,
+    protected_access: Option<ProtectedAccessBridge>,
 }
 
 struct Owner {
@@ -83,11 +86,17 @@ impl WorkspaceDispatch {
             schemas,
             owners: RefCell::new(BTreeMap::new()),
             secret_entry: None,
+            protected_access: None,
         })
     }
 
     pub fn with_secret_entry(mut self, secret_entry: SecretEntry) -> Self {
         self.secret_entry = Some(secret_entry);
+        self
+    }
+
+    pub fn with_protected_access(mut self, protected_access: ProtectedAccessBridge) -> Self {
+        self.protected_access = Some(protected_access);
         self
     }
 
@@ -123,9 +132,25 @@ impl WorkspaceDispatch {
             .context("workspace has an invalid configured signing identity")?;
         // Workspace selection alone does not authorize an acquisition network
         // owner. Missing payloads are reported; managed sync is independent.
-        let storage = Storage::shared_local(self.node.pile.clone(), Some(self.node.key.clone()))
+        let mut storage = Storage::shared_local(self.node.pile.clone(), Some(self.node.key.clone()))
             .with_collections(workspace.routes.clone())
             .with_expected_signer(signer);
+        if let Some(bridge) = &self.protected_access {
+            let bridge = bridge.clone();
+            let workspace_id = format!("{:X}", workspace.id);
+            let workspace_label = workspace
+                .label
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(160)
+                .collect::<String>();
+            // Secrets alone invokes this resolver, after releasing its store
+            // lease. It reopens and validates the exact detached operation
+            // before using the returned key; dispatch never retries a call.
+            storage = storage.with_protected_access(Arc::new(move |request| {
+                bridge.request(workspace_id.clone(), workspace_label.clone(), request.clone())
+            }));
+        }
         let mut config = catalog::Config::new(&self.node.pile);
         config.key = Some(self.node.key.clone());
         Ok(Owner {
@@ -288,6 +313,8 @@ impl Faculty for WorkspaceDispatch {
                 name: String,
                 #[serde(default)]
                 kind: EntryKind,
+                #[serde(default)]
+                protected: bool,
             }
             let args: Entry = mcp::decode_arguments(selected.arguments)?;
             for text in [&args.service, &args.name] {
@@ -329,6 +356,7 @@ impl Faculty for WorkspaceDispatch {
                 service: args.service,
                 name: args.name.clone(),
                 kind: args.kind,
+                protected: args.protected,
             })?;
             let response = match answer {
                 EntryAnswer::Cancelled => json!({"status": "cancelled"}),
@@ -337,29 +365,44 @@ impl Faculty for WorkspaceDispatch {
                     use faculties::secrets::item::{FieldInput, FieldValue, ItemInput};
                     use faculties::secrets::schema::{ROLE_PASSWORD, ROLE_USERNAME};
                     let input = value.input(args.kind)?;
+                    let protection = value.protection();
+                    if args.protected != protection.is_some() {
+                        bail!("local entry protection mismatch; no secret was saved");
+                    }
                     let secrets = faculties::secrets::Secrets::with_storage(owner.storage.clone());
                     // Only this worker touches the request-bound storage. An
                     // error may follow commit, so never claim that it rolled back.
                     let saved = match input {
-                        EntryInput::Login { username, password } => secrets.add_item(
-                            &args.name,
-                            ItemInput {
-                                fields: &[
-                                    FieldInput {
-                                        role: ROLE_USERNAME,
-                                        label: None,
-                                        value: FieldValue::Text(username),
-                                    },
-                                    FieldInput {
-                                        role: ROLE_PASSWORD,
-                                        label: None,
-                                        value: FieldValue::Text(password),
-                                    },
-                                ],
+                        EntryInput::Login { username, password } => {
+                            let fields = [
+                                FieldInput {
+                                    role: ROLE_USERNAME,
+                                    label: None,
+                                    value: FieldValue::Text(username),
+                                },
+                                FieldInput {
+                                    role: ROLE_PASSWORD,
+                                    label: None,
+                                    value: FieldValue::Text(password),
+                                },
+                            ];
+                            let item = ItemInput {
+                                fields: &fields,
                                 attachments: &[],
-                            },
-                        ),
-                        EntryInput::Secret(plaintext) => secrets.add(&args.name, plaintext),
+                            };
+                            match protection {
+                                Some(protection) => {
+                                    secrets.add_item_protected(&args.name, item, protection)
+                                }
+                                None => secrets.add_item(&args.name, item),
+                            }
+                        }
+                        EntryInput::Secret(plaintext) => match protection {
+                            Some(protection) => {
+                                secrets.add_protected(&args.name, plaintext, protection)
+                            }
+                            None => secrets.add(&args.name, plaintext),
+                        },
                     };
                     match saved {
                         Ok(id) => json!({"status": "saved", "secret": format!("{id:X}")}),

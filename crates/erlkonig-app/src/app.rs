@@ -59,6 +59,15 @@ pub trait Shell {
     ) -> erlkonig_core::secret_entry::EntryAnswer {
         erlkonig_core::secret_entry::EntryAnswer::Unavailable
     }
+    /// One exact pending read, never an unlocked session. Unsupported shells
+    /// deny without collecting a passphrase in an ordinary alert.
+    fn unlock_secret(
+        &mut self,
+        _prompt: &erlkonig_core::protected_access::ProtectedPrompt,
+        _terminate: &Arc<AtomicBool>,
+    ) -> erlkonig_core::protected_access::AccessResult {
+        erlkonig_core::protected_access::unavailable()
+    }
 }
 
 /// The menu as plain data: what every entry shows, which optional entries
@@ -506,6 +515,15 @@ impl<S: Shell> App<S> {
         // Image-caused events neither redraw nor slide this deadline forward.
         if Instant::now() < self.next_refresh {
             return false;
+        }
+        if let Some(prompt) = self.runtime.as_ref().and_then(Runtime::take_protected_prompt) {
+            let answer = self.shell.unlock_secret(&prompt, &self.terminate);
+            if self.terminate.load(Ordering::Relaxed) { self.quit(); }
+            prompt.answer(answer);
+            if self.quitting.is_some() {
+                self.next_refresh = Instant::now();
+                return false;
+            }
         }
         if let Some(prompt) = self.runtime.as_ref().and_then(Runtime::take_secret_prompt) {
             let answer = self.shell.enter_secret(&prompt, &self.terminate);
