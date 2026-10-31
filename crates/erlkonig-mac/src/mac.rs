@@ -5,12 +5,13 @@ use crate::crown_display::DisplayCrown;
 use erlkonig_app::app::{App, Login, Shell};
 use erlkonig_app::crown::WorkActivity;
 use erlkonig_core::paths::{self, Layout};
-use objc2::MainThreadMarker;
+use erlkonig_core::secret_entry::{EntryAnswer, EntryKind, EntryValue, SecretPrompt};
+use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSApplication, NSWorkspace};
 use objc2_foundation::{NSBundle, NSString, NSURL};
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tray_icon::menu::MenuEvent;
 use tray_icon::{TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
@@ -133,6 +134,85 @@ impl Shell for MacShell {
     }
 
     fn show_window(&mut self) {}
+
+    fn enter_secret(&mut self, prompt: &SecretPrompt, terminate: &Arc<AtomicBool>) -> EntryAnswer {
+        use block2::RcBlock;
+        use objc2_app_kit::{NSModalPanelRunLoopMode, NSSecureTextField, NSTextField, NSView};
+        use objc2_foundation::{NSPoint, NSRect, NSRunLoop, NSSize, NSTimer};
+        use zeroize::Zeroizing;
+
+        if prompt.is_cancelled() || terminate.load(Ordering::Relaxed) {
+            return EntryAnswer::Cancelled;
+        }
+        let app = NSApplication::sharedApplication(self.mtm);
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+        let request = &prompt.request;
+        let alert = NSAlert::new(self.mtm);
+        alert.setMessageText(&NSString::from_str("Save a local secret"));
+        alert.setInformativeText(&NSString::from_str(&format!(
+            "Workspace: {}\nID: {}\nService: {}\nSecret name: {}\n\nSaved encrypted in this workspace. This does not create sharing grants. Cancel saves nothing.",
+            request.workspace_label, request.workspace, request.service, request.name,
+        )));
+        alert.addButtonWithTitle(&NSString::from_str("Save"));
+        let cancel = alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+        cancel.setKeyEquivalent(&NSString::from_str("\u{1b}"));
+        let login = request.kind == EntryKind::Login;
+        let rect = |y, height| NSRect::new(NSPoint::new(0.0, y), NSSize::new(380.0, height));
+        let fields = NSView::initWithFrame(NSView::alloc(self.mtm), rect(0.0, if login { 120.0 } else { 60.0 }));
+        let password = NSSecureTextField::initWithFrame(NSSecureTextField::alloc(self.mtm), rect(0.0, 24.0));
+        let password_label = NSTextField::labelWithString(&NSString::from_str(if login { "Password" } else { "Secret value" }), self.mtm);
+        password_label.setFrame(rect(28.0, 20.0));
+        fields.addSubview(&password_label);
+        fields.addSubview(&password);
+        let username = if login {
+            let label = NSTextField::labelWithString(&NSString::from_str("Username or email"), self.mtm);
+            label.setFrame(rect(88.0, 20.0));
+            let field = NSTextField::initWithFrame(NSTextField::alloc(self.mtm), rect(60.0, 24.0));
+            fields.addSubview(&label);
+            fields.addSubview(&field);
+            // Both views are retained by the accessory throughout this modal.
+            unsafe { field.setNextKeyView(Some(&password)); }
+            Some(field)
+        } else { None };
+        alert.setAccessoryView(Some(&fields));
+        let window = alert.window();
+        if let Some(username) = &username {
+            window.setInitialFirstResponder(Some(username));
+        } else {
+            window.setInitialFirstResponder(Some(&password));
+        }
+
+        // runModal has its own loop. A timer in its mode observes an already
+        // visible prompt's cancellation, including SIGTERM without a winit tick.
+        // Capture only Send Rust state; resolve AppKit objects on the main thread.
+        let cancelled = prompt.cancellation_check();
+        let stopping = terminate.clone();
+        let check = RcBlock::new(move |_timer: std::ptr::NonNull<NSTimer>| {
+            if cancelled() || stopping.load(Ordering::Relaxed) {
+                if let Some(mtm) = MainThreadMarker::new() {
+                    NSApplication::sharedApplication(mtm).abortModal();
+                }
+            }
+        });
+        let timer = unsafe { NSTimer::timerWithTimeInterval_repeats_block(0.1, true, &check) };
+        unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSModalPanelRunLoopMode); }
+        let result = alert.runModal();
+        timer.invalidate();
+        let answer = if result == NSAlertFirstButtonReturn
+            && !prompt.is_cancelled() && !terminate.load(Ordering::Relaxed)
+        {
+            let value = Zeroizing::new(password.stringValue().to_string());
+            EntryAnswer::Submit(if let Some(username) = &username {
+                EntryValue::login(Zeroizing::new(username.stringValue().to_string()), value)
+            } else { EntryValue::secret(value) })
+        } else { EntryAnswer::Cancelled };
+        // Clear controls promptly; AppKit/editor copies are not guaranteed erased.
+        password.setStringValue(&NSString::from_str(""));
+        if let Some(username) = username { username.setStringValue(&NSString::from_str("")); }
+        window.orderOut(None);
+        answer
+    }
 }
 
 /// The shared application as this binary's own type: winit's
@@ -187,11 +267,15 @@ pub fn main() {
         .with_activation_policy(ActivationPolicy::Accessory)
         .build()
         .expect("event loop");
+    let terminate = Arc::new(AtomicBool::new(false));
+    let modal_terminate = terminate.clone();
     let proxy = event_loop.create_proxy();
-    MenuEvent::set_event_handler(Some(move |e| {
+    MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+        // Native menu callbacks may arrive inside NSAlert's nested loop before
+        // winit can dispatch its event. Let the modal's timer observe Quit too.
+        if e.id == "erlkonig.quit" { modal_terminate.store(true, Ordering::Relaxed); }
         let _ = proxy.send_event(e);
     }));
-    let terminate = Arc::new(AtomicBool::new(false));
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         signal_hook::flag::register(signal, terminate.clone()).expect("shutdown signal");
     }

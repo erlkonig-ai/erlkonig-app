@@ -28,6 +28,7 @@ triblespace-net.workspace = true
 trible.workspace = true
 ed25519-dalek.workspace = true
 iroh-base.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

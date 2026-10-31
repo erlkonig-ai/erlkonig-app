@@ -25,3 +25,4 @@ objc2-foundation.workspace = true
 objc2-app-kit.workspace = true
 objc2-service-management.workspace = true
 objc2-quartz-core.workspace = true
+zeroize.workspace = true

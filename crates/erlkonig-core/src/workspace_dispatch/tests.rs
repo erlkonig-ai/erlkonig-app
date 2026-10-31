@@ -101,6 +101,157 @@ fn selection(workspace: &Workspace) -> Value {
     json!({"workspace": format!("{:X}", workspace.id)})
 }
 
+fn local_entry_args(workspace: &Workspace) -> Value {
+    json!({"workspace": format!("{:X}", workspace.id), "service": "Synthetic service", "name": "fixture login"})
+}
+
+fn take_local_prompt(bridge: &SecretEntry) -> crate::secret_entry::SecretPrompt {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(prompt) = bridge.take_prompt() { return prompt; }
+        assert!(std::time::Instant::now() < deadline, "local prompt was not delivered");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn local_entry_missing_route_rejects_before_key_or_pile_io() {
+    let f = Fixture::new();
+    let mut workspace = f.workspace("No secrets");
+    workspace.routes.remove(&faculties::secrets::DEFAULT_SCOPE_ID);
+    f.configure(&mut workspace);
+    let view = f.node.lock().unwrap().as_mut().unwrap().config().unwrap();
+    let absent = f.dir.path().join("absent");
+    let bridge = SecretEntry::default();
+    let dispatch = WorkspaceDispatch::new(NodeBinding {
+        pile: absent.join("node.pile"), key: absent.join("node.key"), signer: f.dispatch.node.signer,
+    }, move || Ok(view.clone())).unwrap().with_secret_entry(bridge.clone());
+    let error = rpc_call(&mut session(&dispatch), ENTER_LOCAL.name, local_entry_args(&workspace));
+    assert!(error.to_string().contains("secrets is unconfigured"));
+    assert!(dispatch.owners.borrow().is_empty());
+    assert!(bridge.take_prompt().is_none());
+    assert!(!absent.exists());
+}
+
+#[test]
+fn local_entry_cancel_publishes_nothing_and_never_accepts_secret_arguments() {
+    let mut f = Fixture::new();
+    let workspace = f.workspace("Cancel fixture");
+    let bridge = SecretEntry::default();
+    f.dispatch.secret_entry = Some(bridge.clone());
+    let before = fs::read(&f.dispatch.node.pile).unwrap();
+    let worker = std::thread::spawn(move || {
+        let prompt = take_local_prompt(&bridge);
+        assert_eq!(prompt.request.kind, EntryKind::Login);
+        prompt.answer(EntryAnswer::Cancelled);
+    });
+    let response = f.call(ENTER_LOCAL.name, local_entry_args(&workspace)).unwrap();
+    worker.join().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&response).unwrap(), json!({"status":"cancelled"}));
+    assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
+    let mut arguments = local_entry_args(&workspace);
+    arguments["value"] = json!("invented input that must be rejected");
+    assert!(f.call(ENTER_LOCAL.name, arguments).is_err());
+    assert!(f.call("secrets_list", selection(&workspace)).unwrap().contains("(no secrets)"));
+}
+
+#[test]
+fn local_entry_write_denied_route_never_requests_plaintext() {
+    let mut f = Fixture::new();
+    let mut workspace = f.workspace("Not writable");
+    let other = signing_key_file::init(&f.dir.path().join("synthetic-other.key")).unwrap();
+    {
+        // Reuse the existing node owner, not another opener alongside it.
+        let mut guard = f.node.lock().unwrap();
+        let node = guard.as_mut().unwrap();
+        let root = node.pile.collection("Synthetic denied Secrets", CollectionPolicy::new(
+            AdmissionPolicy::Open, AdmissionPolicy::direct(other.verifying_key()),
+        )).unwrap().handle();
+        workspace.routes.insert(faculties::secrets::DEFAULT_SCOPE_ID, root);
+    }
+    f.configure(&mut workspace);
+    let bridge = SecretEntry::default();
+    f.dispatch.secret_entry = Some(bridge.clone());
+    let before = fs::read(&f.dispatch.node.pile).unwrap();
+    let error = f.call(ENTER_LOCAL.name, local_entry_args(&workspace)).unwrap_err();
+    assert!(error.to_string().contains("not admitted to WRITE"));
+    assert!(bridge.take_prompt().is_none());
+    assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
+}
+
+#[test]
+fn local_entry_keeps_the_original_workspace_if_configuration_changes_during_input() {
+    use crate::secret_entry::EntryValue;
+    use zeroize::Zeroizing;
+    let mut f = Fixture::new();
+    let a = f.workspace("Same label");
+    let b = f.workspace("Same label");
+    let bridge = SecretEntry::default();
+    f.dispatch.secret_entry = Some(bridge.clone());
+    let node = f.node.clone();
+    let original = a.clone();
+    let other = b.clone();
+    let worker = std::thread::spawn(move || {
+        let prompt = take_local_prompt(&bridge);
+        assert_eq!(prompt.request.workspace, format!("{:X}", original.id));
+        assert_eq!(prompt.request.workspace_label, original.label);
+        assert_eq!(prompt.request.service, "Synthetic service");
+        assert_eq!(prompt.request.name, "fixture login");
+        let mut node = node.lock().unwrap();
+        let node = node.as_mut().unwrap();
+        let view = node.config().unwrap();
+        let mut changed = original;
+        changed.routes = other.routes;
+        node.put_workspace(&view, &changed).unwrap();
+        drop(view);
+        prompt.answer(EntryAnswer::Submit(EntryValue::login(
+            Zeroizing::new("invented@example.invalid".into()),
+            Zeroizing::new("invented-password".into()),
+        )));
+    });
+    let response = f.call(ENTER_LOCAL.name, local_entry_args(&a)).unwrap();
+    worker.join().unwrap();
+    let response: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response.as_object().unwrap().len(), 2);
+    assert_eq!(response["status"], "saved");
+    let secret = Id::from_hex(response["secret"].as_str().unwrap()).unwrap();
+    let storage = f.dispatch.owners.borrow()[&a.id].storage.clone();
+    let secrets = faculties::secrets::Secrets::with_storage(storage);
+    let stored = secrets.get(secret).unwrap();
+    assert_eq!(stored.as_slice(), br#"{"username":"invented@example.invalid","password":"invented-password"}"#);
+    assert_eq!(secrets.list().unwrap().len(), 1);
+    assert!(!f.call("secrets_list", selection(&b)).unwrap().contains(&format!("{secret:x}")));
+}
+
+#[test]
+fn local_entry_closed_bridge_is_unavailable_and_generic_success_returns_id_only() {
+    use crate::secret_entry::EntryValue;
+    use zeroize::Zeroizing;
+    let mut f = Fixture::new();
+    let workspace = f.workspace("Generic fixture");
+    let bridge = SecretEntry::default();
+    f.dispatch.secret_entry = Some(bridge.clone());
+    let worker_bridge = bridge.clone();
+    let worker = std::thread::spawn(move || {
+        let prompt = take_local_prompt(&worker_bridge);
+        assert_eq!(prompt.request.kind, EntryKind::Secret);
+        prompt.answer(EntryAnswer::Submit(EntryValue::secret(Zeroizing::new("invented generic value".into()))));
+    });
+    let mut args = local_entry_args(&workspace);
+    args["kind"] = json!("secret");
+    let response: Value = serde_json::from_str(&f.call(ENTER_LOCAL.name, args).unwrap()).unwrap();
+    worker.join().unwrap();
+    assert_eq!(response.as_object().unwrap().len(), 2);
+    assert_eq!(response["status"], "saved");
+    let id = Id::from_hex(response["secret"].as_str().unwrap()).unwrap();
+    let storage = f.dispatch.owners.borrow()[&workspace.id].storage.clone();
+    assert_eq!(faculties::secrets::Secrets::with_storage(storage).get(id).unwrap().as_slice(), b"invented generic value");
+    bridge.close();
+    let response = f.call(ENTER_LOCAL.name, local_entry_args(&workspace)).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&response).unwrap(), json!({"status":"unavailable"}));
+    assert!(bridge.take_prompt().is_none());
+}
+
 #[test]
 fn schema_registration_does_not_open_a_pile_key_or_configuration() {
     let dir = tempfile::tempdir().unwrap();
