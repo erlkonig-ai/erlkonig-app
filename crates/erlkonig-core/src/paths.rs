@@ -92,6 +92,9 @@ impl Layout {
         }
         Ok((self.node.clone(), None))
     }
+    pub(crate) fn uses_locator(&self) -> bool {
+        self.application
+    }
     /// Unresolved construction default, for explicit isolated fixtures.
     /// Application callers use selected_node; running callers use Runtime::binding.
     pub fn bootstrap(&self) -> crate::config::Bootstrap {

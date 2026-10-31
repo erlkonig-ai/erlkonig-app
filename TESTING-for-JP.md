@@ -7,6 +7,24 @@ the app deliberately refuses to share its data-owner lock with it.
 
 These are pending interactive checks, not an already-passed checklist:
 
+Supported framing upgrade (synthetic-only, isolated candidate): run the same
+`scripts/accept/isolated_app.py` candidate/helper command documented in README
+with `--old-framing` and a new absolute fixture root. The helper preserves real
+app settings and workspace routes, appends a public released-format fixture
+record, and writes the public `node.json` locator with the same existing key.
+The acceptance runner checks a fresh sibling is selected, source bytes and key
+are retained, settings/routes remain usable, and restart keeps that selection.
+This exercises framing conversion, not the separately authored `/32` canonical
+cutover. It must not be reported as acceptance of an actual old DMG until that
+artifact's writer format has also been exercised.
+
+For an old branch fixture, check that the native prompt displays its readable
+label, exact ID and this node's public identity. Cancel leaves the source and
+locator unchanged. Import explicitly adopts that collection only. Quit while
+waiting must close the prompt and join startup; Quit during conversion waits
+for a native-operation checkpoint. Current piles with retained branch pins
+must start without repeating the import prompt.
+
 Protected local 1Password importer (synthetic-only, isolated candidate):
 
 The source-only helper extension is `protected-secrets-trial --interactive-import

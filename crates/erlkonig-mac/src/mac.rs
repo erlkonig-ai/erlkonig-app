@@ -69,6 +69,22 @@ impl Shell for MacShell {
         Some((alert.runModal() - NSAlertFirstButtonReturn).max(0) as usize)
     }
 
+    fn startup_alert(&mut self, title: &str, text: &str, buttons: &[&str], terminate: &Arc<AtomicBool>) -> Option<usize> {
+        let stopping = terminate.clone();
+        let check = RcBlock::new(move |_timer: std::ptr::NonNull<NSTimer>| {
+            if stopping.load(Ordering::Relaxed) {
+                if let Some(mtm) = MainThreadMarker::new() {
+                    NSApplication::sharedApplication(mtm).abortModal();
+                }
+            }
+        });
+        let timer = unsafe { NSTimer::timerWithTimeInterval_repeats_block(0.1, true, &check) };
+        unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSModalPanelRunLoopMode); }
+        let answer = self.alert(title, text, buttons);
+        timer.invalidate();
+        if terminate.load(Ordering::Relaxed) { Some(1) } else { answer }
+    }
+
     fn open_url(&self, url: &str) {
         if let Some(url) = NSURL::URLWithString(&NSString::from_str(url)) {
             NSWorkspace::sharedWorkspace().openURL(&url);

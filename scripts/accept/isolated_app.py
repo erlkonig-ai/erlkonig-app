@@ -6,6 +6,7 @@ Save/Cancel values, while the candidate Mac build checks its unchanged controls.
 All owned processes are stopped, including on failure; fixture evidence remains.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -141,6 +142,8 @@ def main():
     parser.add_argument("--fixture-binary", type=Path, required=True,
                         help="accept-fixture built from the same candidate source/dependency closure")
     parser.add_argument("--root", type=Path, required=True, help="new absolute fixture/evidence directory")
+    parser.add_argument("--old-framing", action="store_true",
+                        help="exercise supported framing upgrade with retained source and the public node locator; excludes /32 conversion")
     args = parser.parse_args()
     check(sys.platform == "darwin", "this acceptance lane requires macOS")
     candidate = args.candidate.resolve(strict=True)
@@ -178,7 +181,8 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
         path = root / "bin" / name
         path.write_text(shim)
         path.chmod(0o700)
-    prepared = subprocess.run([str(fixture_binary), str(root)], env=env, cwd=env["HOME"],
+    fixture_command = [str(fixture_binary), str(root)] + (["--old-framing"] if args.old_framing else [])
+    prepared = subprocess.run(fixture_command, env=env, cwd=env["HOME"],
                               capture_output=True, text=True, timeout=45, check=True)
     fixture = json.loads(prepared.stdout)
     (root / "fixture.json").write_text(json.dumps(fixture, indent=2) + "\n")
@@ -186,6 +190,9 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
     check(pile.is_relative_to(root) and key.is_relative_to(root), "helper selected storage outside the fixture")
     check(stat.S_IMODE(key.stat().st_mode) == 0o600, "synthetic key is not private")
     key_stat = (key.stat().st_ino, key.stat().st_size, key.stat().st_mtime_ns)
+    original_pile = pile
+    original_digest = hashlib.sha256(pile.read_bytes()).hexdigest()
+    activated_pile = None
     children = []
     logs = []
 
@@ -237,10 +244,21 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
         check(not inspected["runtime"]["sync_running"] and not inspected["runtime"]["maintenance_running"], "fixture started network or maintenance services")
         check(inspected["mcp_url"] == client.url, "candidate endpoint does not match its own listener")
         check((key.stat().st_ino, key.stat().st_size, key.stat().st_mtime_ns) == key_stat, "key file changed")
+        if args.old_framing:
+            locator = json.loads((Path(fixture["app_data"]) / "node.json").read_text())
+            selected = Path(locator["pile"])
+            check(selected != original_pile and selected.parent == original_pile.parent, "upgrade did not select a fresh sibling")
+            check(locator["key"] == str(key) and locator["expected_signer"] == fixture["node_id"], "upgrade changed identity binding")
+            check(hashlib.sha256(original_pile.read_bytes()).hexdigest() == original_digest, "upgrade changed the retained source")
+            if activated_pile is not None:
+                check(selected == activated_pile, "restart repeated the framing upgrade")
 
     try:
         first, client = start("first")
         same_identity(client)
+        if args.old_framing:
+            activated_pile = Path(json.loads((Path(fixture["app_data"]) / "node.json").read_text())["pile"])
+            pile = activated_pile
         for authorization, origin, expected in [(False, None, 401), (True, "https://untrusted.invalid", 403)]:
             try:
                 HttpMcp(client.url, client.token).post(initialize(), token=authorization, origin=origin)
@@ -304,6 +322,7 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
                         if entry["client"] == "codex" else ["plugin", "list", "--json"])
             check(entry["args"] == expected, "candidate attempted an unrequested client mutation")
         (root / "result.json").write_text(json.dumps({"status": "passed", "node_id": fixture["node_id"],
+            "supported_framing_upgrade": args.old_framing, "canonical_32_conversion_tested": False,
             "checks": ["authenticated HTTP", "explicit workspace", "native item tools", "duplicate refusal",
                        "stdio forwarding only", "Quit closes listener and forwarder", "bounded AppKit drain", "same identity on relaunch"]}, indent=2) + "\n")
         print("isolated candidate acceptance passed; no fixture app left running")

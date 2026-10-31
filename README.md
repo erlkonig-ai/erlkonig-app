@@ -147,6 +147,22 @@ returns `outcome_unknown` and its receipt, never a no-publication claim.
 
 ## One node, named workspaces
 
+Startup inspects the selected pile before opening services. Supported older
+framing is converted on one background startup task into a fresh sibling file;
+the original pile and existing signing key are retained. Erlkonig checks the
+candidate through its settings and workspace readers, then atomically updates
+the existing `node.json` locator. A restart uses that locator and does not
+repeat conversion merely because retained legacy branch pins remain.
+
+Legacy branches require an explicit native choice naming the collection and
+this node's read/write authority. Importing a collection does not infer its
+Faculty role or enroll it in a workspace. The separate settings migration
+handles old application identities and configuration. Unsupported formats and
+canonical signed-record migrations that need original authors' refreshes leave
+the original and locator untouched and explain the required next step.
+Quit cancels startup at the converter's checkpoints and waits for its current
+native operation to finish before releasing the owner lock.
+
 One node identity, one logical pile and one local MCP endpoint serve every
 workspace. A workspace is a named bundle of collections, not a separate
 identity, key or physical data store. Collection capabilities define what the

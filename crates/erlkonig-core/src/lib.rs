@@ -13,6 +13,7 @@ pub mod node_metrics;
 pub mod node_schema;
 pub mod node_store;
 pub mod paths;
+pub mod pile_upgrade;
 mod resource_guard;
 pub mod runtime;
 pub mod secret_entry;

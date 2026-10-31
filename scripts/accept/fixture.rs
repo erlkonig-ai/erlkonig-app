@@ -1,6 +1,8 @@
 //! Acceptance-only bootstrap. Creates synthetic storage, never app services.
+mod old_framing;
+
 use erlkonig_core::{
-    config::Bootstrap,
+    config::{Bootstrap, NodeLocator},
     init,
     node_store::{NodeSettings, NodeStore},
     paths::{Layout, ensure_private_dir},
@@ -10,11 +12,9 @@ use std::{env, path::PathBuf};
 
 fn main() {
     let args: Vec<_> = env::args_os().skip(1).collect();
-    assert_eq!(
-        args.len(),
-        1,
-        "usage: accept-fixture ABSOLUTE_NEW_FIXTURE_ROOT"
-    );
+    let old_framing = args.len() == 2 && args[1] == "--old-framing";
+    assert!(args.len() == 1 || old_framing,
+        "usage: accept-fixture ABSOLUTE_NEW_FIXTURE_ROOT [--old-framing]");
     let root = PathBuf::from(&args[0]);
     assert!(root.is_absolute() && root.is_dir());
     for (name, relative) in [
@@ -55,6 +55,15 @@ fn main() {
         .create_workspace(&view, "Synthetic acceptance fixture")
         .unwrap();
     node.close().unwrap();
+    if old_framing {
+        old_framing::append_released_blob(&bootstrap.pile);
+        ensure_private_dir(&app).unwrap();
+        // The public app's real locator format, pointing at the same existing
+        // key. No alternate test-only runtime configuration is introduced.
+        std::fs::write(app.join("node.json"), serde_json::to_vec(&NodeLocator {
+            pile: bootstrap.pile.clone(), key: bootstrap.key.clone(), expected_signer: public.clone(),
+        }).unwrap()).unwrap();
+    }
     // No key bytes, app token, credentials, native owner or network endpoint.
     let layout = Layout::application(&app).unwrap();
     assert_eq!(layout.bootstrap().pile, bootstrap.pile);
@@ -63,6 +72,7 @@ fn main() {
         json!({
             "app_data":app, "pile":bootstrap.pile, "key":bootstrap.key,
             "node_id":public, "workspace":format!("{workspace:X}"),
+            "old_framing":old_framing,
         })
     );
 }

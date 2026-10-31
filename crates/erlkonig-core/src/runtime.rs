@@ -48,6 +48,7 @@ pub struct Runtime {
     local_import: crate::local_import::LocalImport,
     workers: Vec<JoinHandle<Result<()>>>,
     lock: Option<File>,
+    startup_notice: Option<String>,
 }
 
 fn update(status: &Arc<Mutex<Status>>, f: impl FnOnce(&mut Status)) {
@@ -112,6 +113,21 @@ impl Runtime {
     }
 
     fn start_with_guard(layout: &Layout, guard: ResourceCheck) -> Result<Self> {
+        Self::start_controlled_with_guard(layout, &crate::pile_upgrade::StartupControl::new(false), guard)
+    }
+
+    /// The native app calls this on its one owned startup worker. The same
+    /// lock covers inspection, conversion, locator publication and services.
+    pub fn start_controlled(layout: &Layout, control: &crate::pile_upgrade::StartupControl) -> Result<Self> {
+        Self::start_controlled_with_guard(layout, control, Arc::new(crate::resource_guard::sample))
+    }
+
+    fn start_controlled_with_guard(
+        layout: &Layout,
+        control: &crate::pile_upgrade::StartupControl,
+        guard: ResourceCheck,
+    ) -> Result<Self> {
+        control.check()?;
         ensure_private_dir(&layout.dir)?;
         let lock = lease(&layout.lock()).context(
             "another Erlkonig owner is using this data directory; stop it before starting this app",
@@ -133,6 +149,8 @@ impl Runtime {
             key: bootstrap.key,
             signer: signer.verifying_key().to_bytes(),
         };
+        let binding = crate::pile_upgrade::prepare(layout, binding, &signer, control)?;
+        control.progress("Opening local services…")?;
         let mut node = NodeStore::open(&binding.pile, signer.clone())?;
         let port = node.config().and_then(|view| view.mcp_port())
             .unwrap_or_else(|_| NodeSettings::default().mcp_port);
@@ -173,6 +191,7 @@ impl Runtime {
             local_import: crate::local_import::LocalImport::default(),
             workers: Vec::new(),
             lock: Some(lock),
+            startup_notice: control.notice(),
         };
         let http_stop = app.stop.subscribe();
         let state = app.status.clone();
@@ -240,6 +259,10 @@ impl Runtime {
                     result
                 })?,
         );
+        if control.is_cancelled() {
+            app.finish()?;
+            control.check()?;
+        }
         Ok(app)
     }
 
@@ -297,6 +320,9 @@ impl Runtime {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         status.active_work = self.activity.count();
+        if let Some(notice) = &self.startup_notice {
+            status.warnings.push(notice.clone());
+        }
         status
     }
     /// Request one guarded retry without editing persistent settings.

@@ -7,6 +7,7 @@ use crate::native_menu::NativeMenu;
 use erlkonig_core::{
     install,
     paths::{self, Layout},
+    pile_upgrade::{BranchPrompt, StartupControl},
     runtime::Runtime,
 };
 use std::collections::VecDeque;
@@ -34,6 +35,10 @@ pub trait Shell {
     /// draws its prompts itself returns `None`: [`App`] then queues the prompt
     /// and the shell answers later through [`App::answer`].
     fn alert(&mut self, title: &str, text: &str, buttons: &[&str]) -> Option<usize>;
+    /// Startup's native modal must also observe application termination.
+    fn startup_alert(&mut self, title: &str, text: &str, buttons: &[&str], _terminate: &Arc<AtomicBool>) -> Option<usize> {
+        self.alert(title, text, buttons)
+    }
     fn open_url(&self, url: &str);
     /// Show `path` selected in the file manager.
     fn reveal(&self, path: &Path);
@@ -193,6 +198,8 @@ pub enum Then {
     LoginSettings,
     /// Button 0 installs the plugin for these detected clients.
     Connect(Vec<install::Host>),
+    /// Approve only the branch currently offered by this startup task.
+    StartupBranch,
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -233,6 +240,8 @@ pub struct App<S: Shell> {
     pub shell: S,
     layout: Layout,
     runtime: Option<Runtime>,
+    startup_task: Option<StartupTask>,
+    startup_prompt: Option<BranchPrompt>,
     pub problem: Option<String>,
     items: Items,
     /// The native menu, once a shell has asked for it on its own thread.
@@ -275,6 +284,31 @@ struct PluginTask {
     thread: std::thread::JoinHandle<PluginResult>,
 }
 
+struct StartupTask {
+    control: StartupControl,
+    thread: Option<std::thread::JoinHandle<Result<Runtime, String>>>,
+}
+
+impl StartupTask {
+    fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(|thread| thread.is_finished())
+    }
+
+    fn join(mut self) -> std::thread::Result<Result<Runtime, String>> {
+        self.thread.take().expect("startup worker").join()
+    }
+}
+
+impl Drop for StartupTask {
+    fn drop(&mut self) {
+        // Event-loop failures must not detach a startup owner either.
+        self.control.cancel();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 fn host_index(host: install::Host) -> usize {
     match host {
         install::Host::OpenAi => 0,
@@ -288,6 +322,8 @@ impl<S: Shell> App<S> {
             shell,
             layout,
             runtime: None,
+            startup_task: None,
+            startup_prompt: None,
             problem: None,
             items: Items::new(),
             native: None,
@@ -328,15 +364,64 @@ impl<S: Shell> App<S> {
 
     /// Start native services once the platform's status item exists.
     pub fn start(&mut self) {
+        if self.runtime.is_some() || self.startup_task.is_some() || self.quitting.is_some() {
+            return;
+        }
         if std::env::current_exe().is_ok_and(|p| paths::is_translocated(&p)) {
             self.problem = Some("Move Erlkonig to Applications, then open it again.".into());
         } else {
-            match Runtime::start(&self.layout) {
-                Ok(runtime) => self.runtime = Some(runtime),
-                Err(error) => self.problem = Some(format!("{error:#}")),
+            let layout = self.layout.clone();
+            let control = StartupControl::new(true);
+            let worker = control.clone();
+            match std::thread::Builder::new().name("erlkonig-startup".into())
+                .spawn(move || Runtime::start_controlled(&layout, &worker).map_err(|error| format!("{error:#}")))
+            {
+                Ok(thread) => self.startup_task = Some(StartupTask { control, thread: Some(thread) }),
+                Err(error) => self.problem = Some(format!("Cannot start local services: {error}")),
             }
         }
-        self.check_plugins();
+        self.next_refresh = Instant::now();
+    }
+
+    fn finish_startup_task(&mut self) {
+        if !self.startup_task.as_ref().is_some_and(StartupTask::is_finished) {
+            return;
+        }
+        let task = self.startup_task.take().expect("finished startup task");
+        if self.quitting.is_some() {
+            self.quitting = Some(Instant::now());
+        }
+        self.startup_prompt = None;
+        self.prompts.retain(|prompt| prompt.then != Then::StartupBranch);
+        match task.join() {
+            Ok(Ok(runtime)) => {
+                if self.quitting.is_some() { runtime.begin_shutdown(); }
+                self.runtime = Some(runtime);
+            }
+            Ok(Err(error)) => self.problem = Some(error),
+            Err(_) => self.problem = Some("Local storage startup did not complete. The original pile was retained; inspect the node locator before retrying.".into()),
+        }
+        if self.quitting.is_none() {
+            self.check_plugins();
+        }
+    }
+
+    fn offer_startup_choice(&mut self) {
+        if self.startup_prompt.is_some() { return; }
+        let Some(prompt) = self.startup_task.as_ref().and_then(|task| task.control.take_prompt()) else { return; };
+        let title = format!("Import {}?", prompt.name);
+        let text = prompt.details.clone();
+        let buttons = ["Import with this node", "Cancel startup"];
+        self.startup_prompt = Some(prompt);
+        match self.shell.startup_alert(&title, &text, &buttons, &self.terminate) {
+            Some(answer) => self.follow(Then::StartupBranch, answer),
+            None => {
+                self.prompts.push_back(Prompt {
+                    title, text, buttons: buttons.iter().map(|s| (*s).into()).collect(), then: Then::StartupBranch,
+                });
+                self.shell.show_window();
+            }
+        }
     }
 
     /// The monotonic origin the crown's activity is measured against.
@@ -392,6 +477,11 @@ impl<S: Shell> App<S> {
                     self.change_plugins(install::Change::Install, hosts);
                 }
             }
+            Then::StartupBranch => {
+                if let Some(prompt) = self.startup_prompt.take() {
+                    prompt.answer(answer == 0 && self.quitting.is_none() && !self.terminate.load(Ordering::Relaxed));
+                }
+            }
         }
     }
 
@@ -408,6 +498,7 @@ impl<S: Shell> App<S> {
     /// then the last plugin failure and any client configuration notes.
     fn details(&self) -> String {
         let mut text = self.problem.clone().unwrap_or_else(|| {
+            if let Some(task) = &self.startup_task { return task.control.detail(); }
             self.runtime
                 .as_ref()
                 .map(|r| {
@@ -480,9 +571,10 @@ impl<S: Shell> App<S> {
         if self.terminate.load(Ordering::Relaxed) && self.quitting.is_none() {
             self.quit();
         }
+        self.finish_startup_task();
         if let Some(since) = self.quitting {
             let mut exit = false;
-            if since.elapsed() >= Duration::from_secs(15) {
+            if self.startup_task.is_none() && since.elapsed() >= Duration::from_secs(15) {
                 // The person's Quit is final. A stuck admitted native call
                 // cannot leave the app alive indefinitely. Like Force Quit,
                 // this fallback cannot promise to flush an unfinished write.
@@ -498,6 +590,7 @@ impl<S: Shell> App<S> {
             }
             .into();
             if self.runtime.as_ref().is_none_or(Runtime::is_finished)
+                && self.startup_task.is_none()
                 && self
                     .plugin_task
                     .as_ref()
@@ -521,6 +614,11 @@ impl<S: Shell> App<S> {
         // Status/config polling is independent of the native display clock.
         // Image-caused events neither redraw nor slide this deadline forward.
         if Instant::now() < self.next_refresh {
+            return false;
+        }
+        self.offer_startup_choice();
+        if self.terminate.load(Ordering::Relaxed) {
+            self.quit();
             return false;
         }
         if let Some(prompt) = self.runtime.as_ref().and_then(Runtime::take_protected_prompt) {
@@ -558,6 +656,8 @@ impl<S: Shell> App<S> {
         let status = self.runtime.as_ref().map(Runtime::status);
         let attention = if self.problem.is_some() {
             Some("Attention needed")
+        } else if self.startup_task.is_some() {
+            Some("Preparing local storage…")
         } else {
             status
                 .as_ref()
@@ -598,7 +698,7 @@ impl<S: Shell> App<S> {
         let now = self.origin.elapsed();
         crown::observe(
             &mut self.activity,
-            status.as_ref().is_some_and(|s| s.active_work > 0),
+            self.startup_task.is_some() || status.as_ref().is_some_and(|s| s.active_work > 0),
             now,
         );
         self.shell.crown(self.activity, attention.is_some());
@@ -611,6 +711,8 @@ impl<S: Shell> App<S> {
         self.shell.stop_crown(); // Invalidate display callbacks before service teardown.
         // Quit is final: unanswered prompts no longer lead anywhere.
         self.prompts.clear();
+        self.startup_prompt = None;
+        if let Some(task) = &self.startup_task { task.control.cancel(); }
         if let Some(task) = &self.plugin_task {
             task.cancel.store(true, Ordering::Relaxed);
         }
@@ -639,10 +741,20 @@ impl<S: Shell> App<S> {
 
     /// The platform can terminate without returning from its event loop
     /// (AppKit delivers LoopExiting synchronously from
-    /// applicationWillTerminate), so drain here, with the same final
-    /// process-exit deadline.
+    /// applicationWillTerminate), so drain startup here before applying the
+    /// existing service-shutdown deadline.
     pub fn finish_termination(&mut self) {
         self.shell.stop_crown();
+        if let Some(task) = &self.startup_task { task.control.cancel(); }
+        self.startup_prompt = None;
+        // A converter may be finishing one native blob/branch operation.
+        // Keep ownership and node.lock until it reaches its cancellation
+        // checkpoint; never detach it or activate a partially checked output.
+        while self.startup_task.as_ref().is_some_and(|task| !task.is_finished()) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        self.quitting.get_or_insert_with(Instant::now);
+        self.finish_startup_task();
         if let Some(task) = &self.plugin_task {
             task.cancel.store(true, Ordering::Relaxed);
         }
@@ -1241,6 +1353,52 @@ mod tests {
     fn app(shell: Fake) -> App<Fake> {
         let dir = std::env::temp_dir().join("erlkonig-app-tests-unused");
         App::new(shell, Layout::new(dir), Arc::new(AtomicBool::new(false)))
+    }
+
+    #[test]
+    fn startup_progress_stays_responsive_and_quit_joins_the_worker() {
+        let mut app = app(Fake::default());
+        let control = StartupControl::new(true);
+        let worker_control = control.clone();
+        let (release, wait) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            wait.recv().unwrap(); // One deliberately nonpreemptible operation.
+            assert!(worker_control.is_cancelled());
+            Err("startup cancelled".into())
+        });
+        app.startup_task = Some(StartupTask { control, thread: Some(thread) });
+        assert!(!app.tick());
+        assert!(app.view().details.contains("Inspecting local storage"));
+        assert_eq!(app.view().attention.unwrap().label, "Preparing local storage…");
+        app.quit();
+        app.quitting = Some(Instant::now() - Duration::from_secs(16));
+        assert!(!app.tick(), "Quit retains the in-flight startup owner past the ordinary service deadline");
+        // The normal service deadline begins after this startup task drains.
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.tick() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.startup_task.is_none());
+        assert!(app.runtime.is_none());
+    }
+
+    #[test]
+    fn dropping_the_app_cancels_and_joins_startup() {
+        let mut app = app(Fake::default());
+        let control = StartupControl::new(true);
+        let worker_control = control.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_done = done.clone();
+        let thread = std::thread::spawn(move || {
+            while !worker_control.is_cancelled() { std::thread::sleep(Duration::from_millis(1)); }
+            worker_done.store(true, Ordering::Relaxed);
+            Err("startup cancelled".into())
+        });
+        app.startup_task = Some(StartupTask { control, thread: Some(thread) });
+        drop(app);
+        assert!(done.load(Ordering::Relaxed));
     }
 
     #[test]
