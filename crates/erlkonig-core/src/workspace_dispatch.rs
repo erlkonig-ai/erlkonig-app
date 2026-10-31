@@ -383,14 +383,7 @@ impl Faculty for WorkspaceDispatch {
                                 "archive_only_files": report.counts.archive_only_files,
                                 "archive_only_values": report.counts.archive_only_values},
                         }),
-                        // Typed publication uncertainty retains a safe receipt
-                        // selector for recovery, never a content fingerprint.
-                        Err(error) => match error.downcast_ref::<faculties::secrets::onepassword::ProtectedImportPublicationError>() {
-                            Some(unknown) => json!({"status": "outcome_unknown", "receipt": format!("{:X}", unknown.receipt),
-                                "code": "publication_uncertain", "message": "Import may have committed. Keep this receipt; inspect metadata before explicitly verifying it. Nothing was retried."}),
-                            None => json!({"status": "not_saved", "code": "import_rejected",
-                                "message": "The export or previous receipt could not be accepted; no import was published. Nothing was retried."}),
-                        },
+                        Err(error) => local_import_failure(&error),
                     }
                 }
             };
@@ -513,6 +506,25 @@ impl Faculty for WorkspaceDispatch {
             .context("registered workspace tool has no native adapter")?;
         faculty.call(name, selected.arguments, out)
     }
+}
+
+/// Only core-owned static classifications cross this boundary. Never format an
+/// underlying error: archive paths, field labels and values may be in its cause.
+fn local_import_failure(error: &anyhow::Error) -> Value {
+    use faculties::secrets::onepassword::{ProtectedImportPublicationError, ProtectedImportRejection};
+    if let Some(unknown) = error.downcast_ref::<ProtectedImportPublicationError>() {
+        return json!({"status": "outcome_unknown", "receipt": format!("{:X}", unknown.receipt),
+            "code": "publication_uncertain", "message": "Import may have committed. Keep this receipt; inspect metadata before explicitly verifying it. Nothing was retried."});
+    }
+    if let Some(rejection) = error.downcast_ref::<ProtectedImportRejection>() {
+        let mut response = json!({"status": "not_saved", "stage": rejection.stage.as_str(), "code": rejection.code.as_str()});
+        if let Some(code) = rejection.os_error_code.filter(|code| *code > 0) {
+            response["os_error_code"] = json!(code);
+        }
+        return response;
+    }
+    json!({"status": "not_saved", "code": "import_rejected",
+        "message": "The export or previous receipt could not be accepted; no import was published. Nothing was retried."})
 }
 
 fn register_tool(
