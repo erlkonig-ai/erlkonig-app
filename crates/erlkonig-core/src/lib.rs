@@ -4,6 +4,7 @@ mod active_work;
 pub mod config;
 mod config_mcp;
 pub mod credentials;
+mod fd_diagnostics;
 pub mod init;
 pub mod install;
 pub mod migration;

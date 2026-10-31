@@ -5,6 +5,7 @@ use crate::{
     config::NodeBinding,
     config_mcp::ConfigMcp,
     credentials, init,
+    fd_diagnostics::Diagnostics,
     node_metrics::{Sample, ServiceCode, ServiceEvent, ServicePhase},
     node_store::{ConfigView, NodeSettings, NodeStore},
     paths::{Layout, ensure_private_dir},
@@ -473,6 +474,9 @@ fn controller(
     guard: ResourceCheck,
 ) -> Result<()> {
     let (reports, receiver) = mpsc::channel();
+    let fd_diagnostics = Arc::new(Diagnostics::new());
+    let mut last_fd_sample = Instant::now() - Duration::from_secs(1);
+    let mut last_fd_publish = Instant::now();
     let mut task: Option<Task> = None;
     // The last interpreted service settings are independent of task liveness.
     // Reaping a finished handle must not turn unrelated Config edits into retries.
@@ -482,6 +486,12 @@ fn controller(
     let mut last_metrics = Instant::now();
     let mut last_guard = Instant::now() - Duration::from_secs(1);
     while !*stop.borrow() {
+        // Best-effort sampling, outside every node lock. A delayed controller
+        // leaves gaps; this is sampled high-water evidence, not an exact peak.
+        if last_fd_sample.elapsed() >= Duration::from_secs(1) {
+            fd_diagnostics.sample();
+            last_fd_sample = Instant::now();
+        }
         if task.as_ref().is_some_and(|task| task.worker.is_finished()) {
             join_task(task.take().unwrap(), &status, &node);
         }
@@ -575,6 +585,7 @@ fn controller(
                     let state = status.clone();
                     let work = activity.clone();
                     let metrics = reports.clone();
+                    let diagnostics = fd_diagnostics.clone();
                     let shared = node.clone();
                     let worker =
                         thread::Builder::new()
@@ -609,6 +620,7 @@ fn controller(
                                             &state,
                                             &work,
                                             &metrics,
+                                            Some(&diagnostics),
                                             attempt,
                                             &mut entered,
                                         )
@@ -664,6 +676,16 @@ fn controller(
             });
             last_metrics = Instant::now();
         }
+        if last_fd_publish.elapsed() >= Duration::from_secs(10) {
+            if let Err(error) = fd_diagnostics.publish_pending(|batch| {
+                with_node(&node, |node| node.append_fd_events(batch))
+            }) {
+                // No failure is fed back into capture. The immutable pending
+                // occurrences remain queued even if commit succeeded but flush failed.
+                update(&status, |s| s.metrics_problem = Some(format!("{error:#}")));
+            }
+            last_fd_publish = Instant::now();
+        }
         thread::sleep(Duration::from_millis(200));
     }
     if let Some(old) = task.take() {
@@ -676,8 +698,13 @@ fn controller(
     }
     let mut batch: Vec<_> = pending.into_values().collect();
     batch.append(&mut failures);
-    with_node(&node, |node| node.append_metrics(&batch))?;
-    Ok(())
+    let fd_result = fd_diagnostics.publish_pending(|batch| with_node(&node, |node| node.append_fd_events(batch)));
+    let metrics_result = with_node(&node, |node| node.append_metrics(&batch));
+    match (fd_result, metrics_result) {
+        (Err(fd), Err(metrics)) => Err(anyhow::anyhow!("{fd:#}; ordinary metrics: {metrics:#}")),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 fn sample(
@@ -700,6 +727,7 @@ fn maintenance_observer<'a>(
     status: &'a Arc<Mutex<Status>>,
     activity: &'a ActiveWork,
     metrics: &'a mpsc::Sender<Sample>,
+    diagnostics: Option<&'a Diagnostics>,
 ) -> impl FnMut(Event) + Send + 'a {
     let started = Instant::now();
     let mut published = 0u128;
@@ -708,6 +736,17 @@ fn maintenance_observer<'a>(
     // when an in-flight tick is dropped. No-op ticks emit no HopStarted.
     let mut work = None;
     move |event| {
+        // Upstream has already converted its error into a String and may have
+        // released temporary FDs. Capture before this handler's own formatting,
+        // activity/status locks, or unbounded ordinary sample channel.
+        if let Some(diagnostics) = diagnostics {
+            match &event {
+                Event::HopFinished { error: Some(error), .. } | Event::Failure { error, .. } => {
+                    diagnostics.maintenance_failure(session, error);
+                }
+                _ => {}
+            }
+        }
         match &event {
             Event::HopStarted { .. } => work = Some(activity.enter()),
             Event::HopFinished { .. } | Event::HopCancelled { .. } => {
@@ -760,6 +799,7 @@ fn node_session(
     status: &Arc<Mutex<Status>>,
     activity: &ActiveWork,
     metrics: &mpsc::Sender<Sample>,
+    diagnostics: Option<&Diagnostics>,
     attempt: Attempt,
     entered: &mut bool,
 ) -> Result<()> {
@@ -780,7 +820,7 @@ fn node_session(
         .enable_all()
         .build()?;
     let store = faculties::storage::open_pile_strict_as(&binding.pile, signer.verifying_key())?;
-    let mut observer = maintenance_observer(signer.verifying_key(), session, status, activity, metrics);
+    let mut observer = maintenance_observer(signer.verifying_key(), session, status, activity, metrics, diagnostics);
     let result = if settings.sync_enabled {
         let mut peer = Peer::new(
             store,
@@ -1365,13 +1405,42 @@ mod tests {
     }
 
     #[test]
+    fn fd_observer_captures_stringified_failure_before_ordinary_metrics() {
+        use triblespace::core::collection::CollectionHandle;
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let status = Arc::new(Mutex::new(Status::default()));
+        let work = ActiveWork::default();
+        let (metrics, reports) = mpsc::channel();
+        let diagnostics = Diagnostics::new();
+        let session = genid().id;
+        let mut observer = maintenance_observer(signer.verifying_key(), session,
+            &status, &work, &metrics, Some(&diagnostics));
+        let collection = CollectionHandle::new([5; 32]);
+        observer(Event::HopFinished { collection, elapsed: Duration::ZERO, census: None,
+            publications: Default::default(),
+            error: Some("failed to create a buffer: wrapped tempfile: Too many open files (os error 24)".into()) });
+        observer(Event::Failure { reference: "fixture".into(), error: "permission denied".into() });
+        observer(Event::Failure { reference: "fixture".into(), error: "Too many open files in system (os error 23)".into() });
+        assert_eq!(reports.try_iter().count(), 3, "ordinary metrics are unchanged");
+        diagnostics.publish_pending(|batch| {
+            let events: Vec<_> = batch.events.iter().flatten().collect();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].session, session);
+            assert_eq!(events[0].code, crate::fd_diagnostics::Exhaustion::Process);
+            assert_eq!(events[1].code, crate::fd_diagnostics::Exhaustion::System);
+            assert!(events.iter().all(|event| event.handler.monotonic_ns.is_some()));
+            Ok::<_, ()>(())
+        }).unwrap();
+    }
+
+    #[test]
     fn maintenance_boundaries_release_only_their_own_work() {
         use triblespace::core::collection::CollectionHandle;
         let signer = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
         let status = Arc::new(Mutex::new(Status::default()));
         let work = ActiveWork::default();
         let (metrics, _reports) = mpsc::channel();
-        let mut observer = maintenance_observer(signer.verifying_key(), genid().id, &status, &work, &metrics);
+        let mut observer = maintenance_observer(signer.verifying_key(), genid().id, &status, &work, &metrics, None);
         let collection = CollectionHandle::new([5; 32]);
         observer(Event::Failure { reference: "fixture".into(), error: "before hop".into() });
         assert_eq!(work.count(), 0, "no actual maintenance was entered");
@@ -1408,7 +1477,7 @@ mod tests {
         let work = ActiveWork::default();
         let status = Arc::new(Mutex::new(Status::default()));
         let (metrics, _reports) = mpsc::channel();
-        let mut observer = maintenance_observer(signer.verifying_key(), genid().id, &status, &work, &metrics);
+        let mut observer = maintenance_observer(signer.verifying_key(), genid().id, &status, &work, &metrics, None);
         let mut starts = 0;
         let mut observed = |event: Event| {
             let started = matches!(event, Event::HopStarted { .. });
@@ -1542,6 +1611,7 @@ mod tests {
                 &status,
                 &activity,
                 &metrics,
+                None,
                 Attempt::new(signer.verifying_key()),
                 &mut false,
             )

@@ -18,6 +18,8 @@ use crate::{node_schema, node_store::NodeStore};
 
 pub use faculties::schemas::service_events::{KIND_SERVICE_EVENT, ServiceCode, ServicePhase};
 
+pub mod fd;
+
 /// One occurrence supplied at the actual transition, not reconstructed from
 /// status frames. The caller owns an attempt ID created before startup, so its
 /// initiating cause and independent cleanup failures can name the same attempt.
