@@ -156,6 +156,43 @@ fn local_entry_cancel_publishes_nothing_and_never_accepts_secret_arguments() {
 }
 
 #[test]
+fn local_entry_empty_save_returns_fixed_error_and_publishes_nothing() {
+    use crate::secret_entry::EntryValue;
+    use zeroize::Zeroizing;
+    let mut f = Fixture::new();
+    let workspace = f.workspace("Empty Save fixture");
+    let login_error = "Local login entry requires both username and password. No secret was saved. Request a new local entry and fill both fields.";
+    let secret_error = "Local secret entry requires a nonempty value. No secret was saved. Request a new local entry.";
+    for (kind, username, value, expected) in [
+        (EntryKind::Login, "", "", login_error),
+        (EntryKind::Login, "invented@example.invalid", "", login_error),
+        (EntryKind::Login, "", "invented-password", login_error),
+        (EntryKind::Secret, "", "", secret_error),
+    ] {
+        let bridge = SecretEntry::default();
+        f.dispatch.secret_entry = Some(bridge.clone());
+        let before = fs::read(&f.dispatch.node.pile).unwrap();
+        let worker = std::thread::spawn(move || {
+            let prompt = take_local_prompt(&bridge);
+            assert_eq!(prompt.request.kind, kind);
+            prompt.answer(EntryAnswer::Submit(match kind {
+                EntryKind::Login => EntryValue::login(
+                    Zeroizing::new(username.into()), Zeroizing::new(value.into()),
+                ),
+                EntryKind::Secret => EntryValue::secret(Zeroizing::new(value.into())),
+            }));
+        });
+        let mut args = local_entry_args(&workspace);
+        if kind == EntryKind::Secret { args["kind"] = json!("secret"); }
+        let error = f.call(ENTER_LOCAL.name, args).unwrap_err();
+        worker.join().unwrap();
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
+    }
+    assert!(f.call("secrets_list", selection(&workspace)).unwrap().contains("(no secrets)"));
+}
+
+#[test]
 fn local_entry_write_denied_route_never_requests_plaintext() {
     let mut f = Fixture::new();
     let mut workspace = f.workspace("Not writable");

@@ -52,6 +52,11 @@ impl EntryValue {
     pub(crate) fn encode(&self, kind: EntryKind) -> Result<Zeroizing<Vec<u8>>> {
         match (kind, self.username.as_ref()) {
             (EntryKind::Login, Some(username)) => {
+                // The owner calls this before Secrets::add. An invalid local
+                // Save must not encode a payload or publish a secret version.
+                if username.is_empty() || self.value.is_empty() {
+                    bail!("Local login entry requires both username and password. No secret was saved. Request a new local entry and fill both fields.");
+                }
                 // Serialize borrowed fields: no serde_json::Value copies.
                 #[derive(serde::Serialize)]
                 struct Login<'a> {
@@ -63,7 +68,12 @@ impl EntryValue {
                     password: &self.value,
                 })?))
             }
-            (EntryKind::Secret, None) => Ok(Zeroizing::new(self.value.as_bytes().to_vec())),
+            (EntryKind::Secret, None) => {
+                if self.value.is_empty() {
+                    bail!("Local secret entry requires a nonempty value. No secret was saved. Request a new local entry.");
+                }
+                Ok(Zeroizing::new(self.value.as_bytes().to_vec()))
+            }
             _ => bail!("local entry kind mismatch; no secret was saved"),
         }
     }
