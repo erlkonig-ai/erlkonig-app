@@ -6,7 +6,10 @@ use crate::{
     runtime::Runtime,
 };
 use std::{thread, time::Instant};
-use triblespace::core::{collection::CollectionStoreExt, metadata, signing_key_file};
+use triblespace::core::{
+    collection::{CollectionCommit, CollectionRecord, CollectionStore, CollectionStoreExt},
+    metadata, signing_key_file,
+};
 use triblespace::prelude::*;
 
 #[path = "../../../../scripts/accept/legacy32_input.rs"]
@@ -337,7 +340,11 @@ fn unresolved_settings_and_concurrent_workspace_revisions_are_preserved() {
     assert_eq!(consent.title, "Update local data?");
     consent.answer(true);
     let selected = worker.join().unwrap().unwrap();
-    let after = config_view(&selected.pile, &f.signer).unwrap().unwrap();
+    let after = config_view(
+        config_snapshot(&selected.pile, &f.signer).unwrap(),
+        &f.signer,
+    )
+    .unwrap();
     assert_eq!(
         format!("{:#}", after.settings().unwrap_err()),
         settings_error
@@ -366,6 +373,146 @@ fn missing_candidate_config_is_rejected_instead_of_becoming_empty_settings() {
             .contains("lost the previously resident application configuration")
     );
     assert_eq!(f.locator(), locator);
+}
+
+fn add_missing_config_payload(path: &Path, signer: &SigningKey) {
+    let mut node = NodeStore::open(path, signer.clone()).unwrap();
+    let resident = node
+        .pile
+        .commit(
+            node.config,
+            signer,
+            entity! { metadata::description: "synthetic missing-payload fixture" },
+        )
+        .unwrap();
+    let missing = Inline::new([0x52; 32]); // Intentionally absent synthetic blob, not a schema ID.
+    let commit = CollectionCommit::sign(signer, node.config.handle(), missing, resident.metadata());
+    commit.verify_strict().unwrap();
+    node.pile.insert(CollectionRecord::Commit(commit)).unwrap();
+    node.close().unwrap();
+}
+
+#[test]
+fn unavailable_config_payload_survives_framing_upgrade_for_normal_reconciliation() {
+    let f = Fixture::new();
+    f.configured();
+    add_missing_config_payload(&f.binding.pile, &f.signer);
+    old_framing::append_released_blob(&f.binding.pile);
+    let source = fs::read(&f.binding.pile).unwrap();
+    let before = config_view(
+        config_snapshot(&f.binding.pile, &f.signer).unwrap(),
+        &f.signer,
+    )
+    .unwrap();
+    let unavailable = format!("{:#}", before.facts().unwrap_err());
+    let control = StartupControl::new(true);
+    let worker_control = control.clone();
+    let layout = f.layout.clone();
+    let binding = f.binding.clone();
+    let signer = f.signer.clone();
+    let worker = thread::spawn(move || prepare(&layout, binding, &signer, &worker_control));
+    prompt(&control).answer(true);
+    let selected = worker.join().unwrap().unwrap();
+    let after = config_view(
+        config_snapshot(&selected.pile, &f.signer).unwrap(),
+        &f.signer,
+    )
+    .unwrap();
+    assert_eq!(format!("{:#}", after.facts().unwrap_err()), unavailable);
+    assert_eq!(fs::read(&f.binding.pile).unwrap(), source);
+    assert_ne!(selected.pile, f.binding.pile);
+    assert!(
+        !f.layout.dir.join("mcp.token").exists(),
+        "validation starts no services"
+    );
+    // The canonical boundary must not demand recovery of a missing payload
+    // either; signed-record preservation is its separate native audit.
+    validate(&f.binding.pile, &selected.pile, &f.signer, true).unwrap();
+}
+
+#[test]
+fn readable_config_must_not_become_unavailable_in_the_candidate() {
+    let f = Fixture::new();
+    f.configured();
+    let candidate = f.binding.pile.with_file_name("unavailable-candidate.pile");
+    fs::copy(&f.binding.pile, &candidate).unwrap();
+    add_missing_config_payload(&candidate, &f.signer);
+    let error = validate(&f.binding.pile, &candidate, &f.signer, false).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("configuration facts unavailable"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn native_config_acquisition_failures_are_compared_as_outcomes() {
+    let f = Fixture::new();
+    f.configured();
+    let missing = f.binding.pile.with_file_name("missing-descriptor.pile");
+    fs::write(&missing, []).unwrap();
+    let acquire_missing = || {
+        let snapshot = config_snapshot(&missing, &f.signer).unwrap();
+        ConfigView::from_snapshot(
+            snapshot,
+            Collection::from_handle(faculties::config::handle(f.signer.verifying_key())),
+        )
+    };
+    assert!(
+        acquire_missing().is_err(),
+        "the native acquisition boundary actually fails"
+    );
+    compare_config_views(acquire_missing(), acquire_missing()).unwrap();
+    let readable = config_view(
+        config_snapshot(&f.binding.pile, &f.signer).unwrap(),
+        &f.signer,
+    );
+    assert!(compare_config_views(readable, acquire_missing()).is_err());
+}
+
+#[test]
+fn cancellation_after_temp_durability_prevents_locator_publication_and_cleans_temp() {
+    let dir = tempfile::tempdir().unwrap();
+    let locator = dir.path().join("node.json");
+    fs::write(&locator, b"original locator").unwrap();
+    let control = StartupControl::new(true);
+    let error = publish_locator(&locator, b"new locator", &control, || {
+        let temporary = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path != &locator)
+            .expect("durable sibling exists before the callback");
+        assert_eq!(fs::read(temporary).unwrap(), b"new locator");
+        assert_eq!(fs::read(&locator).unwrap(), b"original locator");
+        control.cancel();
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("before locator publication"));
+    assert_eq!(fs::read(&locator).unwrap(), b"original locator");
+    assert_eq!(
+        fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "cancelled publication removes its temp"
+    );
+}
+
+#[test]
+fn cancellation_after_rename_reports_the_committed_locator() {
+    let dir = tempfile::tempdir().unwrap();
+    let locator = dir.path().join("node.json");
+    let control = StartupControl::new(true);
+    publish_locator(&locator, b"selected locator", &control, || Ok(())).unwrap();
+    control.cancel();
+    assert!(
+        control
+            .check()
+            .unwrap_err()
+            .to_string()
+            .contains("new locator remains selected")
+    );
+    assert_eq!(fs::read(locator).unwrap(), b"selected locator");
 }
 
 #[test]

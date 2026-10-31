@@ -25,7 +25,7 @@ use triblespace::core::{
     id::genid,
     repo::{
         BlobStoreList, SnapshotSource,
-        pile::{Pile, PileFile},
+        pile::{Pile, PileFile, PileSnapshot},
     },
 };
 
@@ -48,6 +48,7 @@ struct StartupState {
     detail: String,
     notice: Option<String>,
     prompt: Option<StartupPrompt>,
+    locator_published: bool,
 }
 
 /// Transient progress and one choice for the application's one startup task.
@@ -67,6 +68,7 @@ impl StartupControl {
                 detail: "Inspecting local storage…".into(),
                 notice: None,
                 prompt: None,
+                locator_published: false,
             })),
             interactive,
         }
@@ -100,10 +102,19 @@ impl StartupControl {
             .clone()
     }
     pub(crate) fn check(&self) -> Result<()> {
-        ensure!(
-            !self.is_cancelled(),
-            "startup cancelled; the original pile is retained"
-        );
+        if self.is_cancelled() {
+            if self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .locator_published
+            {
+                bail!(
+                    "startup cancelled after updated storage was selected; the new locator remains selected for next startup and the original pile is retained"
+                );
+            }
+            bail!("startup cancelled before locator publication; the original pile is retained");
+        }
         Ok(())
     }
     pub(crate) fn progress(&self, detail: impl Into<String>) -> Result<()> {
@@ -167,57 +178,98 @@ impl StartupControl {
     }
 }
 
-fn config_view(path: &Path, signer: &SigningKey) -> Result<Option<ConfigView>> {
+fn config_snapshot(path: &Path, signer: &SigningKey) -> Result<PileSnapshot> {
     let file = PileFile::open_read_only(path)?;
     let mut pile = Pile::with_host(file, Some(signer.verifying_key()));
-    let snapshot = pile.snapshot()?;
-    let handle = faculties::config::handle(signer.verifying_key());
-    if snapshot.contains_blob(handle)? {
-        let collection = Collection::open(&snapshot, handle)?;
-        return Ok(Some(ConfigView::from_snapshot(snapshot, collection)?));
-    }
-    Ok(None)
+    Ok(pile.snapshot()?)
 }
 
-/// Compare only the application's existing native readers, including their
-/// unresolved outcomes. Conversion must not require cleaner data than normal
-/// startup, choose a concurrent winner, or filter unknown application facts.
-fn validate(source: &Path, candidate: &Path, signer: &SigningKey, canonical: bool) -> Result<()> {
-    let before = config_view(source, signer)?;
-    let after = config_view(candidate, signer)?;
+fn config_view(snapshot: PileSnapshot, signer: &SigningKey) -> Result<ConfigView> {
+    let handle = faculties::config::handle(signer.verifying_key());
+    let collection = Collection::open(&snapshot, handle)?;
+    ConfigView::from_snapshot(snapshot, collection)
+}
+
+/// Compare the native reader outcomes, not a second model of configuration.
+/// An unchanged unavailable observation is valid migration input; losing an
+/// available observation is not. The ordinary runtime owns reconciliation.
+fn compare_config_views(before: Result<ConfigView>, after: Result<ConfigView>) -> Result<()> {
+    let (before, after) = match (before, after) {
+        (Ok(before), Ok(after)) => (before, after),
+        (Err(before), Err(after)) => {
+            ensure!(
+                format!("{before:#}") == format!("{after:#}"),
+                "candidate changed the configuration acquisition failure"
+            );
+            return Ok(());
+        }
+        (Err(_), Ok(_)) => return Ok(()),
+        (Ok(_), Err(error)) => {
+            bail!("candidate made configuration acquisition unavailable: {error:#}")
+        }
+    };
+    match (before.facts(), after.facts()) {
+        (Ok(_), Ok(_)) => {}
+        (Err(before), Err(after)) => {
+            ensure!(
+                format!("{before:#}") == format!("{after:#}"),
+                "candidate changed the configuration payload failure"
+            );
+            return Ok(());
+        }
+        (Err(_), Ok(_)) => return Ok(()),
+        (Ok(_), Err(error)) => bail!("candidate made configuration facts unavailable: {error:#}"),
+    }
     ensure!(
-        before.is_none() || after.is_some(),
+        before.settings().map_err(|e| format!("{e:#}"))
+            == after.settings().map_err(|e| format!("{e:#}")),
+        "candidate changed the application's settings read outcome"
+    );
+    let revisions = after.workspace_ids().map_err(|e| format!("{e:#}"));
+    ensure!(
+        before.workspace_ids().map_err(|e| format!("{e:#}")) == revisions,
+        "candidate changed the application's configured workspace revisions"
+    );
+    if let Ok(revisions) = revisions {
+        for revision in revisions {
+            ensure!(
+                before.workspace(revision).map_err(|e| format!("{e:#}"))
+                    == after.workspace(revision).map_err(|e| format!("{e:#}")),
+                "candidate changed the configured workspace {revision:X} read outcome"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Descriptor retention is independent of Config projection. In particular,
+/// old signed /32 records cannot be projected by the current reader: their
+/// strict canonical audit owns preservation, and unavailable candidate data
+/// remains an ordinary runtime condition rather than a migration veto.
+fn validate(source: &Path, candidate: &Path, signer: &SigningKey, canonical: bool) -> Result<()> {
+    let before = config_snapshot(source, signer)?;
+    let after = config_snapshot(candidate, signer)?;
+    let handle = faculties::config::handle(signer.verifying_key());
+    let had_config = before.contains_blob(handle)?;
+    let has_config = after.contains_blob(handle)?;
+    ensure!(
+        !had_config || has_config,
         "candidate lost the previously resident application configuration"
     );
-    if let Some(after) = after {
-        // Force the native content read. A signed /32 source cannot itself be
-        // projected by this reader; its converter's signed-record audit owns
-        // preservation, while these reads exercise the resulting app paths.
-        after.facts()?;
-        let settings = after.settings().map_err(|e| format!("{e:#}"));
-        let revisions = after.workspace_ids().map_err(|e| format!("{e:#}"));
-        if let Some(before) = before.filter(|_| !canonical) {
-            ensure!(
-                before.settings().map_err(|e| format!("{e:#}")) == settings,
-                "candidate changed the application's settings read outcome"
-            );
-            ensure!(
-                before.workspace_ids().map_err(|e| format!("{e:#}")) == revisions,
-                "candidate changed the application's configured workspace revisions"
-            );
-            if let Ok(revisions) = revisions {
-                for revision in revisions {
-                    ensure!(
-                        before.workspace(revision).map_err(|e| format!("{e:#}"))
-                            == after.workspace(revision).map_err(|e| format!("{e:#}")),
-                        "candidate changed the configured workspace {revision:X} read outcome"
-                    );
-                }
-            }
-        } else if let Ok(revisions) = revisions {
+    if !has_config {
+        return Ok(());
+    }
+    let after = config_view(after, signer);
+    if had_config && !canonical {
+        return compare_config_views(config_view(before, signer), after);
+    }
+    if let Ok(after) = after {
+        // Exercise the same native paths; a missing payload or an unresolved
+        // setting is reported by normal startup. This claims no data recovery.
+        let _ = after.facts();
+        let _ = after.settings();
+        if let Ok(revisions) = after.workspace_ids() {
             for revision in revisions {
-                // An unavailable/conflicting workspace remains a normal app
-                // reconciliation outcome, not migration ineligibility.
                 let _ = after.workspace(revision);
             }
         }
@@ -231,6 +283,27 @@ fn locator_bytes(layout: &Layout) -> Result<Option<Vec<u8>>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).context("read existing node locator"),
     }
+}
+
+/// Rename is the activation commit point. The caller's custody checks and
+/// cancellation are repeated after temp-file durability, just before rename.
+/// This is cooperative checking, not exclusion of arbitrary external writers.
+fn publish_locator(
+    path: &Path,
+    bytes: &[u8],
+    control: &StartupControl,
+    validate_custody: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    crate::status::write_atomic_checked(path, bytes, || {
+        validate_custody().map_err(std::io::Error::other)?;
+        control.check().map_err(std::io::Error::other)
+    })?;
+    control
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .locator_published = true;
+    Ok(())
 }
 
 /// Called under node.lock with the existing signing key already verified.
@@ -435,29 +508,33 @@ pub(crate) fn prepare(
         expected_signer: hex::encode(selected.signer),
     };
     locator.binding()?;
-    ensure!(
-        locator_bytes(layout)? == original_locator,
-        "node locator changed during preparation; candidate was not activated"
-    );
-    let now = fs::metadata(&binding.pile)?;
-    ensure!(
-        original.dev() == now.dev()
-            && original.ino() == now.ino()
-            && original.len() == now.len()
-            && original.modified()? == now.modified()?,
-        "original pile changed during candidate validation; candidate was not activated"
-    );
-    ensure!(
-        triblespace::core::signing_key_file::load_existing(&binding.key)?
-            .verifying_key()
-            .to_bytes()
-            == binding.signer,
-        "node signing identity changed during preparation; candidate was not activated"
-    );
     control.check()?;
-    crate::status::write_atomic(
+    publish_locator(
         &layout.dir.join("node.json"),
         &serde_json::to_vec_pretty(&locator)?,
+        control,
+        || {
+            ensure!(
+                locator_bytes(layout)? == original_locator,
+                "node locator changed during preparation; candidate was not activated"
+            );
+            let now = fs::metadata(&binding.pile)?;
+            ensure!(
+                original.dev() == now.dev()
+                    && original.ino() == now.ino()
+                    && original.len() == now.len()
+                    && original.modified()? == now.modified()?,
+                "original pile changed during candidate validation; candidate was not activated"
+            );
+            ensure!(
+                triblespace::core::signing_key_file::load_existing(&binding.key)?
+                    .verifying_key()
+                    .to_bytes()
+                    == binding.signer,
+                "node signing identity changed during preparation; candidate was not activated"
+            );
+            Ok(())
+        },
     )?;
     let mut notice = format!(
         "Storage upgraded. Original retained at {}. The node identity and existing key are unchanged.",

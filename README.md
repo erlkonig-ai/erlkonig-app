@@ -167,6 +167,10 @@ After migration approval, records signed by this node use its existing key for
 the canonical update. Foreign signatures are never replaced with this node's.
 Quit cancels startup at the converter's checkpoints and waits for its current
 native operation to finish before releasing the owner lock.
+Cancellation is checked again after the locator's temp file is durable and
+immediately before selection. Once selected, the updated copy stays selected
+even if the remaining startup is cancelled. Existing unavailable Config data
+and unresolved choices retain their native read outcomes for normal repair.
 
 One node identity, one logical pile and one local MCP endpoint serve every
 workspace. A workspace is a named bundle of collections, not a separate
