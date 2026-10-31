@@ -400,6 +400,70 @@ fn malformed_storage_fails_without_opening_services_or_changing_the_locator() {
     assert!(!f.layout.dir.join("mcp.token").exists());
 }
 
+fn append_unknown_current_kind(path: &Path) {
+    use std::io::Write;
+    let records = triblespace::core::repo::pile::PileRecords::open(path).unwrap();
+    let mut frame = [0u8; 256];
+    // Reuse the fixture's actual current recovery prefix. This sentinel is
+    // deliberately not a schema/format identifier introduced by the app.
+    frame[..28].copy_from_slice(&records.bytes()[..28]);
+    frame[28..32].copy_from_slice(&1u32.to_le_bytes());
+    frame[32..64].fill(0xa5);
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(&frame).unwrap();
+    file.sync_all().unwrap();
+}
+
+#[test]
+fn current_unknown_bounded_kind_starts_without_migration_or_consent() {
+    let f = Fixture::new();
+    let workspace = f.configured();
+    append_unknown_current_kind(&f.binding.pile);
+    let inspection = migration::inspect(&f.binding.pile).unwrap();
+    assert!(inspection.current_framing);
+    assert_eq!(
+        inspection.unsupported.len(),
+        1,
+        "unsupported for rewrite, not for ordinary replay"
+    );
+    let before = fs::read(&f.binding.pile).unwrap();
+    let locator = f.locator();
+    let mut runtime = Runtime::start(&f.layout).unwrap();
+    assert_eq!(runtime.binding(), &f.binding);
+    assert_eq!(
+        runtime.config().unwrap().workspace(workspace.id).unwrap(),
+        Some(workspace)
+    );
+    runtime.finish().unwrap();
+    assert_eq!(f.locator(), locator);
+    assert!(fs::read(&f.binding.pile).unwrap().starts_with(&before));
+    assert_eq!(
+        fs::read_dir(f.binding.pile.parent().unwrap())
+            .unwrap()
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn unknown_kind_still_refuses_an_actual_rewrite() {
+    let f = Fixture::new();
+    f.configured();
+    append_unknown_current_kind(&f.binding.pile);
+    old_framing::append_released_blob(&f.binding.pile);
+    let before = fs::read(&f.binding.pile).unwrap();
+    let locator = f.locator();
+    let error = Runtime::start(&f.layout).err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("format this Erlkonig cannot convert")
+    );
+    assert_eq!(f.locator(), locator);
+    assert_eq!(fs::read(&f.binding.pile).unwrap(), before);
+    assert!(!f.layout.dir.join("mcp.token").exists());
+}
+
 /// The fixture is signed/serialized by an independently built historical
 /// library. No test helper here constructs old assertions or signatures.
 fn historical_app_fixture(f: &mut Fixture) -> crate::workspace::Workspace {

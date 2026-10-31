@@ -255,17 +255,19 @@ pub(crate) fn prepare(
     let mut inspection =
         migration::inspect_with_progress(&binding.pile, &mut |p| control.migration_progress(p))?;
     control.check()?;
-    if !inspection.unsupported.is_empty() {
-        bail!(
-            "This pile contains a storage format this Erlkonig cannot convert. Keep the original pile and use a release that understands that format before reopening Erlkonig. No replacement was activated."
-        );
-    }
     let canonical = inspection
         .requirements
         .iter()
         .any(|r| matches!(r, Requirement::Canonical { .. }));
+    // A bounded unfamiliar kind in current framing is native forward
+    // compatibility. It only prevents a rewrite that cannot preserve it.
     if inspection.current_framing && !canonical {
         return Ok(binding);
+    }
+    if !inspection.unsupported.is_empty() {
+        bail!(
+            "This pile contains a storage format this Erlkonig cannot convert. Keep the original pile and use a release that understands that format before reopening Erlkonig. No replacement was activated."
+        );
     }
     ensure!(
         layout.uses_locator(),
