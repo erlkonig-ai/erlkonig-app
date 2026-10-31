@@ -34,6 +34,16 @@ pub struct EntryValue {
     value: Zeroizing<String>,
 }
 
+/// Borrow the zeroizing UI buffers only for the admitted write. Login fields
+/// stay separate; generic secrets retain their exact UTF-8 bytes.
+pub(crate) enum EntryInput<'a> {
+    Login {
+        username: &'a str,
+        password: &'a str,
+    },
+    Secret(&'a [u8]),
+}
+
 impl EntryValue {
     pub fn login(username: Zeroizing<String>, password: Zeroizing<String>) -> Self {
         Self {
@@ -49,30 +59,28 @@ impl EntryValue {
         }
     }
 
-    pub(crate) fn encode(&self, kind: EntryKind) -> Result<Zeroizing<Vec<u8>>> {
+    pub(crate) fn input(&self, kind: EntryKind) -> Result<EntryInput<'_>> {
         match (kind, self.username.as_ref()) {
             (EntryKind::Login, Some(username)) => {
-                // The owner calls this before Secrets::add. An invalid local
-                // Save must not encode a payload or publish a secret version.
+                // Validate before either native authoring operation. An invalid
+                // local Save must not publish any secret or item version.
                 if username.is_empty() || self.value.is_empty() {
-                    bail!("Local login entry requires both username and password. No secret was saved. Request a new local entry and fill both fields.");
+                    bail!(
+                        "Local login entry requires both username and password. No secret was saved. Request a new local entry and fill both fields."
+                    );
                 }
-                // Serialize borrowed fields: no serde_json::Value copies.
-                #[derive(serde::Serialize)]
-                struct Login<'a> {
-                    username: &'a str,
-                    password: &'a str,
-                }
-                Ok(Zeroizing::new(serde_json::to_vec(&Login {
+                Ok(EntryInput::Login {
                     username,
                     password: &self.value,
-                })?))
+                })
             }
             (EntryKind::Secret, None) => {
                 if self.value.is_empty() {
-                    bail!("Local secret entry requires a nonempty value. No secret was saved. Request a new local entry.");
+                    bail!(
+                        "Local secret entry requires a nonempty value. No secret was saved. Request a new local entry."
+                    );
                 }
-                Ok(Zeroizing::new(self.value.as_bytes().to_vec()))
+                Ok(EntryInput::Secret(self.value.as_bytes()))
             }
             _ => bail!("local entry kind mismatch; no secret was saved"),
         }

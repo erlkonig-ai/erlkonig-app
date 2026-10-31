@@ -20,7 +20,7 @@ use triblespace::core::id::Id;
 
 use crate::config::NodeBinding;
 use crate::node_store::ConfigView;
-use crate::secret_entry::{EntryAnswer, EntryKind, EntryRequest, SecretEntry};
+use crate::secret_entry::{EntryAnswer, EntryInput, EntryKind, EntryRequest, SecretEntry};
 use crate::workspace::Workspace;
 
 const LIST: Tool = Tool {
@@ -31,7 +31,7 @@ const LIST: Tool = Tool {
 
 const ENTER_LOCAL: Tool = Tool {
     name: "secrets_enter_local",
-    description: "Ask the running app to show one local secure-entry dialog for the exact workspace, service and secret name. Never put credentials in these arguments. The person enters a login (encrypted JSON username/password) or a generic secret (UTF-8 bytes) locally. Both login fields, or the generic value, must be nonempty; invalid Save publishes nothing and asks for a new local entry. Save returns only an immutable secret version ID; Cancel saves nothing. Only one prompt may be active. This synchronous call waits for the person; keep the connection open. Disconnect/cancellation does not undo an admitted Save; an unknown outcome must not be retried automatically. Creates no grants; collection sharing and secret delivery authority are unchanged.",
+    description: "Ask the running app to show one local secure-entry dialog for the exact workspace, service and secret name. Never put credentials in these arguments. The person enters a login (native structured encrypted username/password fields) or a generic secret (unchanged raw UTF-8 bytes) locally. Both login fields, or the generic value, must be nonempty; invalid Save publishes nothing and asks for a new local entry. Save returns only an immutable version ID; Cancel saves nothing. Only one prompt may be active. This synchronous call waits for the person; keep the connection open. Disconnect/cancellation does not undo an admitted Save; an unknown outcome must not be retried automatically. Inspect secrets_items metadata for login or secrets_list for generic entry before any new entry. Creates no grants; collection sharing and secret delivery authority are unchanged.",
     input_schema: r#"{"type":"object","properties":{"service":{"type":"string","minLength":1,"maxLength":160},"name":{"type":"string","minLength":1,"maxLength":160},"kind":{"type":"string","enum":["login","secret"],"default":"login"}},"required":["service","name"],"additionalProperties":false}"#,
 };
 
@@ -70,7 +70,12 @@ impl WorkspaceDispatch {
                 register_tool(&mut tools, &mut schemas, tool, faculty.input_schema(tool))?;
             }
         }
-        register_tool(&mut tools, &mut schemas, &ENTER_LOCAL, ENTER_LOCAL.input_schema)?;
+        register_tool(
+            &mut tools,
+            &mut schemas,
+            &ENTER_LOCAL,
+            ENTER_LOCAL.input_schema,
+        )?;
         Ok(Self {
             node,
             config: Box::new(config),
@@ -184,7 +189,11 @@ impl Faculty for WorkspaceDispatch {
             #[serde(deny_unknown_fields)]
             struct Empty {}
             let _: Empty = mcp::decode_arguments(arguments)?;
-            let view = (self.config)().map_err(|_| anyhow::anyhow!("node configuration is unavailable; native data recovery is required"))?;
+            let view = (self.config)().map_err(|_| {
+                anyhow::anyhow!(
+                    "node configuration is unavailable; native data recovery is required"
+                )
+            })?;
             self.retire(&view, None)?;
             let mut workspaces = Vec::new();
             let mut unavailable = Vec::new();
@@ -226,9 +235,13 @@ impl Faculty for WorkspaceDispatch {
             bail!("unknown workspace MCP tool {name:?}");
         }
         let selected: SelectedArguments = mcp::decode_arguments(arguments)?;
-        let view = (self.config)().map_err(|_| anyhow::anyhow!("node configuration is unavailable; native data recovery is required"))?;
+        let view = (self.config)().map_err(|_| {
+            anyhow::anyhow!("node configuration is unavailable; native data recovery is required")
+        })?;
         // Config text handles are bearer capabilities, not diagnostic detail.
-        let resolved = view.workspace(selected.workspace).map_err(|error| anyhow::anyhow!(error.to_string()));
+        let resolved = view
+            .workspace(selected.workspace)
+            .map_err(|error| anyhow::anyhow!(error.to_string()));
         // IDs are opaque: native annotation can change the value under an
         // existing ID. Reuse only an owner for this exact observed value.
         let unchanged = matches!(&resolved, Ok(Some(binding))
@@ -245,8 +258,14 @@ impl Faculty for WorkspaceDispatch {
         let workspace = resolved?.ok_or_else(|| {
             mcp::invalid_arguments("unknown, removed, or superseded workspace binding; call list_workspaces and explicitly choose a current ID")
         })?;
-        if name == ENTER_LOCAL.name && !workspace.routes.contains_key(&faculties::secrets::DEFAULT_SCOPE_ID) {
-            return Err(mcp::invalid_arguments("workspace collection role secrets is unconfigured; no local entry was requested"));
+        if name == ENTER_LOCAL.name
+            && !workspace
+                .routes
+                .contains_key(&faculties::secrets::DEFAULT_SCOPE_ID)
+        {
+            return Err(mcp::invalid_arguments(
+                "workspace collection role secrets is unconfigured; no local entry was requested",
+            ));
         }
         // Even a tool without a storage entrypoint must not run under a
         // silently replaced binding. Storage repeats this at its own opening
@@ -272,22 +291,41 @@ impl Faculty for WorkspaceDispatch {
             }
             let args: Entry = mcp::decode_arguments(selected.arguments)?;
             for text in [&args.service, &args.name] {
-                if text.trim().is_empty() || text.chars().count() > 160 || text.chars().any(char::is_control) {
-                    return Err(mcp::invalid_arguments("service and name must be 1–160 visible characters"));
+                if text.trim().is_empty()
+                    || text.chars().count() > 160
+                    || text.chars().any(char::is_control)
+                {
+                    return Err(mcp::invalid_arguments(
+                        "service and name must be 1–160 visible characters",
+                    ));
                 }
             }
             let Some(bridge) = &self.secret_entry else {
                 return out.text(r#"{"status":"unavailable"}"#);
             };
             // A read-only admission preflight on the same owner, before asking
-            // for plaintext. Rechecked by Secrets::add at its write boundary.
+            // for plaintext. Rechecked by native Secrets authoring at its write
+            // boundary for either raw bytes or a structured item.
             owner.storage.with_store(|store, signer, runtime| {
-                owner.storage.open_collection_write(store, faculties::secrets::DEFAULT_SCOPE_ID,
-                    signer.verifying_key(), runtime).map(|_| ())
+                owner
+                    .storage
+                    .open_collection_write(
+                        store,
+                        faculties::secrets::DEFAULT_SCOPE_ID,
+                        signer.verifying_key(),
+                        runtime,
+                    )
+                    .map(|_| ())
             })?;
             let answer = bridge.request(EntryRequest {
                 workspace: format!("{:X}", owner.binding.id),
-                workspace_label: owner.binding.label.chars().filter(|c| !c.is_control()).take(160).collect(),
+                workspace_label: owner
+                    .binding
+                    .label
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(160)
+                    .collect(),
                 service: args.service,
                 name: args.name.clone(),
                 kind: args.kind,
@@ -296,12 +334,38 @@ impl Faculty for WorkspaceDispatch {
                 EntryAnswer::Cancelled => json!({"status": "cancelled"}),
                 EntryAnswer::Unavailable => json!({"status": "unavailable"}),
                 EntryAnswer::Submit(value) => {
-                    let plaintext = value.encode(args.kind)?;
+                    use faculties::secrets::item::{FieldInput, FieldValue, ItemInput};
+                    use faculties::secrets::schema::{ROLE_PASSWORD, ROLE_USERNAME};
+                    let input = value.input(args.kind)?;
+                    let secrets = faculties::secrets::Secrets::with_storage(owner.storage.clone());
                     // Only this worker touches the request-bound storage. An
                     // error may follow commit, so never claim that it rolled back.
-                    match faculties::secrets::Secrets::with_storage(owner.storage.clone()).add(&args.name, &plaintext) {
+                    let saved = match input {
+                        EntryInput::Login { username, password } => secrets.add_item(
+                            &args.name,
+                            ItemInput {
+                                fields: &[
+                                    FieldInput {
+                                        role: ROLE_USERNAME,
+                                        label: None,
+                                        value: FieldValue::Text(username),
+                                    },
+                                    FieldInput {
+                                        role: ROLE_PASSWORD,
+                                        label: None,
+                                        value: FieldValue::Text(password),
+                                    },
+                                ],
+                                attachments: &[],
+                            },
+                        ),
+                        EntryInput::Secret(plaintext) => secrets.add(&args.name, plaintext),
+                    };
+                    match saved {
                         Ok(id) => json!({"status": "saved", "secret": format!("{id:X}")}),
-                        Err(_) => json!({"status": "outcome_unknown", "message": "Saving did not report success; it may have committed. Inspect secret metadata before any new entry; nothing was retried."}),
+                        Err(_) => {
+                            json!({"status": "outcome_unknown", "message": "Saving did not report success; it may have committed. Inspect secret metadata before any new entry; nothing was retried."})
+                        }
                     }
                 }
             };

@@ -108,8 +108,13 @@ fn local_entry_args(workspace: &Workspace) -> Value {
 fn take_local_prompt(bridge: &SecretEntry) -> crate::secret_entry::SecretPrompt {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if let Some(prompt) = bridge.take_prompt() { return prompt; }
-        assert!(std::time::Instant::now() < deadline, "local prompt was not delivered");
+        if let Some(prompt) = bridge.take_prompt() {
+            return prompt;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "local prompt was not delivered"
+        );
         std::thread::yield_now();
     }
 }
@@ -118,15 +123,28 @@ fn take_local_prompt(bridge: &SecretEntry) -> crate::secret_entry::SecretPrompt 
 fn local_entry_missing_route_rejects_before_key_or_pile_io() {
     let f = Fixture::new();
     let mut workspace = f.workspace("No secrets");
-    workspace.routes.remove(&faculties::secrets::DEFAULT_SCOPE_ID);
+    workspace
+        .routes
+        .remove(&faculties::secrets::DEFAULT_SCOPE_ID);
     f.configure(&mut workspace);
     let view = f.node.lock().unwrap().as_mut().unwrap().config().unwrap();
     let absent = f.dir.path().join("absent");
     let bridge = SecretEntry::default();
-    let dispatch = WorkspaceDispatch::new(NodeBinding {
-        pile: absent.join("node.pile"), key: absent.join("node.key"), signer: f.dispatch.node.signer,
-    }, move || Ok(view.clone())).unwrap().with_secret_entry(bridge.clone());
-    let error = rpc_call(&mut session(&dispatch), ENTER_LOCAL.name, local_entry_args(&workspace));
+    let dispatch = WorkspaceDispatch::new(
+        NodeBinding {
+            pile: absent.join("node.pile"),
+            key: absent.join("node.key"),
+            signer: f.dispatch.node.signer,
+        },
+        move || Ok(view.clone()),
+    )
+    .unwrap()
+    .with_secret_entry(bridge.clone());
+    let error = rpc_call(
+        &mut session(&dispatch),
+        ENTER_LOCAL.name,
+        local_entry_args(&workspace),
+    );
     assert!(error.to_string().contains("secrets is unconfigured"));
     assert!(dispatch.owners.borrow().is_empty());
     assert!(bridge.take_prompt().is_none());
@@ -145,14 +163,28 @@ fn local_entry_cancel_publishes_nothing_and_never_accepts_secret_arguments() {
         assert_eq!(prompt.request.kind, EntryKind::Login);
         prompt.answer(EntryAnswer::Cancelled);
     });
-    let response = f.call(ENTER_LOCAL.name, local_entry_args(&workspace)).unwrap();
+    let response = f
+        .call(ENTER_LOCAL.name, local_entry_args(&workspace))
+        .unwrap();
     worker.join().unwrap();
-    assert_eq!(serde_json::from_str::<Value>(&response).unwrap(), json!({"status":"cancelled"}));
+    assert_eq!(
+        serde_json::from_str::<Value>(&response).unwrap(),
+        json!({"status":"cancelled"})
+    );
     assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
     let mut arguments = local_entry_args(&workspace);
     arguments["value"] = json!("invented input that must be rejected");
     assert!(f.call(ENTER_LOCAL.name, arguments).is_err());
-    assert!(f.call("secrets_list", selection(&workspace)).unwrap().contains("(no secrets)"));
+    assert!(
+        f.call("secrets_list", selection(&workspace))
+            .unwrap()
+            .contains("(no secrets)")
+    );
+    assert!(
+        f.call("secrets_items", selection(&workspace))
+            .unwrap()
+            .contains("(no structured items)")
+    );
 }
 
 #[test]
@@ -165,7 +197,12 @@ fn local_entry_empty_save_returns_fixed_error_and_publishes_nothing() {
     let secret_error = "Local secret entry requires a nonempty value. No secret was saved. Request a new local entry.";
     for (kind, username, value, expected) in [
         (EntryKind::Login, "", "", login_error),
-        (EntryKind::Login, "invented@example.invalid", "", login_error),
+        (
+            EntryKind::Login,
+            "invented@example.invalid",
+            "",
+            login_error,
+        ),
         (EntryKind::Login, "", "invented-password", login_error),
         (EntryKind::Secret, "", "", secret_error),
     ] {
@@ -177,19 +214,31 @@ fn local_entry_empty_save_returns_fixed_error_and_publishes_nothing() {
             assert_eq!(prompt.request.kind, kind);
             prompt.answer(EntryAnswer::Submit(match kind {
                 EntryKind::Login => EntryValue::login(
-                    Zeroizing::new(username.into()), Zeroizing::new(value.into()),
+                    Zeroizing::new(username.into()),
+                    Zeroizing::new(value.into()),
                 ),
                 EntryKind::Secret => EntryValue::secret(Zeroizing::new(value.into())),
             }));
         });
         let mut args = local_entry_args(&workspace);
-        if kind == EntryKind::Secret { args["kind"] = json!("secret"); }
+        if kind == EntryKind::Secret {
+            args["kind"] = json!("secret");
+        }
         let error = f.call(ENTER_LOCAL.name, args).unwrap_err();
         worker.join().unwrap();
         assert_eq!(error.to_string(), expected);
         assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
     }
-    assert!(f.call("secrets_list", selection(&workspace)).unwrap().contains("(no secrets)"));
+    assert!(
+        f.call("secrets_list", selection(&workspace))
+            .unwrap()
+            .contains("(no secrets)")
+    );
+    assert!(
+        f.call("secrets_items", selection(&workspace))
+            .unwrap()
+            .contains("(no structured items)")
+    );
 }
 
 #[test]
@@ -201,16 +250,28 @@ fn local_entry_write_denied_route_never_requests_plaintext() {
         // Reuse the existing node owner, not another opener alongside it.
         let mut guard = f.node.lock().unwrap();
         let node = guard.as_mut().unwrap();
-        let root = node.pile.collection("Synthetic denied Secrets", CollectionPolicy::new(
-            AdmissionPolicy::Open, AdmissionPolicy::direct(other.verifying_key()),
-        )).unwrap().handle();
-        workspace.routes.insert(faculties::secrets::DEFAULT_SCOPE_ID, root);
+        let root = node
+            .pile
+            .collection(
+                "Synthetic denied Secrets",
+                CollectionPolicy::new(
+                    AdmissionPolicy::Open,
+                    AdmissionPolicy::direct(other.verifying_key()),
+                ),
+            )
+            .unwrap()
+            .handle();
+        workspace
+            .routes
+            .insert(faculties::secrets::DEFAULT_SCOPE_ID, root);
     }
     f.configure(&mut workspace);
     let bridge = SecretEntry::default();
     f.dispatch.secret_entry = Some(bridge.clone());
     let before = fs::read(&f.dispatch.node.pile).unwrap();
-    let error = f.call(ENTER_LOCAL.name, local_entry_args(&workspace)).unwrap_err();
+    let error = f
+        .call(ENTER_LOCAL.name, local_entry_args(&workspace))
+        .unwrap_err();
     assert!(error.to_string().contains("not admitted to WRITE"));
     assert!(bridge.take_prompt().is_none());
     assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
@@ -219,6 +280,11 @@ fn local_entry_write_denied_route_never_requests_plaintext() {
 #[test]
 fn local_entry_keeps_the_original_workspace_if_configuration_changes_during_input() {
     use crate::secret_entry::EntryValue;
+    use faculties::secrets::item::PrivateText;
+    use faculties::secrets::schema::{
+        KIND_ITEM, ROLE_PASSWORD, ROLE_USERNAME, field_role, field_text, item_field,
+    };
+    use triblespace::core::metadata;
     use zeroize::Zeroizing;
     let mut f = Fixture::new();
     let a = f.workspace("Same label");
@@ -248,16 +314,52 @@ fn local_entry_keeps_the_original_workspace_if_configuration_changes_during_inpu
     });
     let response = f.call(ENTER_LOCAL.name, local_entry_args(&a)).unwrap();
     worker.join().unwrap();
+    assert!(!response.contains("invented@example.invalid"));
+    assert!(!response.contains("invented-password"));
     let response: Value = serde_json::from_str(&response).unwrap();
     assert_eq!(response.as_object().unwrap().len(), 2);
     assert_eq!(response["status"], "saved");
     let secret = Id::from_hex(response["secret"].as_str().unwrap()).unwrap();
     let storage = f.dispatch.owners.borrow()[&a.id].storage.clone();
     let secrets = faculties::secrets::Secrets::with_storage(storage);
-    let stored = secrets.get(secret).unwrap();
-    assert_eq!(stored.as_slice(), br#"{"username":"invented@example.invalid","password":"invented-password"}"#);
-    assert_eq!(secrets.list().unwrap().len(), 1);
-    assert!(!f.call("secrets_list", selection(&b)).unwrap().contains(&format!("{secret:x}")));
+    let items = secrets.list_items().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, secret);
+    assert_eq!(items[0].name.as_deref(), Some("fixture login"));
+    let body = items[0].body;
+    let facts = secrets.open_item_body(secret, body).unwrap();
+    for (role, expected) in [
+        (ROLE_USERNAME, "invented@example.invalid"),
+        (ROLE_PASSWORD, "invented-password"),
+    ] {
+        let children: Vec<_> = find!(child: PrivateText, pattern!(&facts, [
+            {metadata::tag: KIND_ITEM, item_field: _?field},
+            {_?field @ field_role: role, field_text: ?child},
+        ]))
+        .collect();
+        assert_eq!(children.len(), 1);
+        let opened = secrets.open_item_child(secret, body, children[0]).unwrap();
+        assert_eq!(&*opened.bytes, expected.as_bytes());
+        let pile = fs::read(&f.dispatch.node.pile).unwrap();
+        assert!(
+            !pile
+                .windows(expected.len())
+                .any(|window| window == expected.as_bytes())
+        );
+    }
+    // Structured logins do not silently become raw bodies or legacy JSON.
+    assert!(secrets.list().unwrap().is_empty());
+    assert!(secrets.get(secret).is_err());
+    // The old workspace request ID was superseded during entry, so inspect
+    // the captured owner's metadata directly rather than reselecting it.
+    let metadata = format!("{items:?}");
+    assert!(!metadata.contains("invented@example.invalid"));
+    assert!(!metadata.contains("invented-password"));
+    assert!(
+        !f.call("secrets_items", selection(&b))
+            .unwrap()
+            .contains(&format!("{secret:x}"))
+    );
 }
 
 #[test]
@@ -272,21 +374,80 @@ fn local_entry_closed_bridge_is_unavailable_and_generic_success_returns_id_only(
     let worker = std::thread::spawn(move || {
         let prompt = take_local_prompt(&worker_bridge);
         assert_eq!(prompt.request.kind, EntryKind::Secret);
-        prompt.answer(EntryAnswer::Submit(EntryValue::secret(Zeroizing::new("invented generic value".into()))));
+        prompt.answer(EntryAnswer::Submit(EntryValue::secret(Zeroizing::new(
+            "  invented generic value\n{\"password\":\"not a login\"} 🗝\r\n".into(),
+        ))));
     });
     let mut args = local_entry_args(&workspace);
     args["kind"] = json!("secret");
-    let response: Value = serde_json::from_str(&f.call(ENTER_LOCAL.name, args).unwrap()).unwrap();
+    let response = f.call(ENTER_LOCAL.name, args).unwrap();
+    assert!(!response.contains("invented generic value"));
+    assert!(!response.contains("not a login"));
+    let response: Value = serde_json::from_str(&response).unwrap();
     worker.join().unwrap();
     assert_eq!(response.as_object().unwrap().len(), 2);
     assert_eq!(response["status"], "saved");
     let id = Id::from_hex(response["secret"].as_str().unwrap()).unwrap();
     let storage = f.dispatch.owners.borrow()[&workspace.id].storage.clone();
-    assert_eq!(faculties::secrets::Secrets::with_storage(storage).get(id).unwrap().as_slice(), b"invented generic value");
+    let secrets = faculties::secrets::Secrets::with_storage(storage);
+    assert_eq!(
+        secrets.get(id).unwrap().as_slice(),
+        "  invented generic value\n{\"password\":\"not a login\"} 🗝\r\n".as_bytes()
+    );
+    assert!(secrets.list_items().unwrap().is_empty());
+    assert!(secrets.open_item(id).is_err());
     bridge.close();
-    let response = f.call(ENTER_LOCAL.name, local_entry_args(&workspace)).unwrap();
-    assert_eq!(serde_json::from_str::<Value>(&response).unwrap(), json!({"status":"unavailable"}));
+    let response = f
+        .call(ENTER_LOCAL.name, local_entry_args(&workspace))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&response).unwrap(),
+        json!({"status":"unavailable"})
+    );
     assert!(bridge.take_prompt().is_none());
+}
+
+#[test]
+fn secure_entry_output_never_contains_plaintext() {
+    // Capture actual stdout/stderr, including dependency logs, from isolated
+    // synthetic-only success cases. This never invokes an app or live endpoint.
+    for name in [
+        "local_entry_keeps_the_original_workspace_if_configuration_changes_during_input",
+        "local_entry_closed_bridge_is_unavailable_and_generic_success_returns_id_only",
+    ] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args([
+            "--exact",
+            &format!("workspace_dispatch::tests::{name}"),
+            "--nocapture",
+        ]);
+        for (key, _) in std::env::vars_os() {
+            if key == "PILE"
+                || key == "TRIBLESPACE_KEY"
+                || key.to_string_lossy().starts_with("TRIBLESPACE_COLLECTION_")
+            {
+                child.env_remove(key);
+            }
+        }
+        let output = child.output().unwrap();
+        assert!(output.status.success(), "synthetic entry subprocess failed");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        for stream in [&output.stdout, &output.stderr] {
+            for private in [
+                "invented@example.invalid",
+                "invented-password",
+                "invented generic value",
+                "not a login",
+            ] {
+                assert!(
+                    !stream
+                        .windows(private.len())
+                        .any(|window| window == private.as_bytes()),
+                    "local entry logged plaintext"
+                );
+            }
+        }
+    }
 }
 
 #[test]
