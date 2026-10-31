@@ -404,6 +404,25 @@ also remain absent when unavailable. The list, limit and clock calls are not
 one atomic observation. Other platforms currently retain limits/clocks but
 report the FD census as unavailable.
 
+Every new occurrence separately records `error_site = maintenance`: this names
+the handler observing failure, **not** the subsystem causing descriptor pressure.
+Snapshots also carry `mcp_http_accepted_streams` from this app's exact MCP HTTP
+endpoint. This allocation-free atomic gauge follows accepted I/O lifetimes:
+it increments only after accept succeeds and decrements after I/O closes, before
+releasing admission. It does not count reserved pre-accept permits, requests,
+sessions, the listener, kernel backlog, outbound sockets or other subsystems.
+A cloned observer does not keep the endpoint alive. Missing instrumentation is
+absent, not zero. The gauge and OS census are separate observations; do not
+subtract them to manufacture an "unattributed socket count". They can disagree
+under concurrent activity, and a recent sampled high-water selects by total FD
+count, not by the HTTP gauge's maximum.
+
+The explicit read-only `inspect-fd-events` report exposes `error_site_subsystems`,
+`pressure_owner: "unknown"`, and each snapshot's `mcp_http_accepted_streams`.
+Older/unknown error-site facts report `unknown`; arbitrary labels are never
+echoed. OS socket ownership and the cause of exhaustion remain unknown: the
+separate MCP gauge is corroborating lifetime evidence, not syscall attribution.
+
 The controller keeps at most 60 in-memory samples at a nominal one-second
 cadence; store work can delay that cadence. A failure carries the maximum
 **complete** sample no older than 60 monotonic seconds and its timestamp, plus
@@ -430,7 +449,8 @@ inside the existing metrics collection. There is no new JSON body, secondary
 store, dedicated UI or MCP reader. `node_metrics` tests demonstrate direct
 `find!` queries, sparse/unknown values, reopening and idempotent retry.
 Attribute anchors and event-kind IDs were minted with `trible genid` on
-2026-10-21 and are recorded verbatim beside their declarations.
+2026-10-21 (original census) and 2026-10-26 (subsystem evidence), and are recorded
+verbatim beside their declarations.
 
 ## Workspace requests
 

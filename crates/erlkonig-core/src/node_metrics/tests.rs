@@ -22,9 +22,11 @@ fn fd_diagnostics_retry_preserves_identity_and_typed_sparse_evidence() {
     types[11] = 1;
     let event = Occurrence {
         session: genid().id, sequence: 7, code: Exhaustion::Process,
+        error_site: crate::fd_diagnostics::ErrorSite::Maintenance,
         handler: Snapshot { wall_unix_ns: Some(1_790_000_000_123_456_789),
             monotonic_ns: Some(500), limits: Some((256, u64::MAX)),
-            census: Some(Census { count: 8, types, complete: false }) },
+            census: Some(Census { count: 8, types, complete: false }),
+            mcp_http_accepted_streams: Some(12) },
         sampled_high_water: None, samples: 0, dropped: 3,
     };
     let mut pending = Batch { session: genid().id, events: [None; CAPACITY], dropped: 3 };
@@ -55,6 +57,8 @@ fn fd_diagnostics_retry_preserves_identity_and_typed_sparse_evidence() {
     assert_eq!((count, complete, soft, hard, unknown, monotonic), (8, false, 256, u64::MAX as u128, 1, 500));
     assert!(!exists!(pattern!(&facts, [{ event_id @ fd::sampled_high_water: _?high_water }])));
     assert!(!exists!(pattern!(&facts, [{ event_id @ metadata::description: _?text }])));
+    assert!(exists!(pattern!(&facts, [{ event_id @ fd::error_site: "maintenance" }])));
+    assert!(exists!(pattern!(&facts, [{ observation @ fd::mcp_http_accepted_streams: 12u128 }])));
     assert!(exists!(pattern!(&facts, [{ metadata::tag: fd::KIND_FD_CAPTURE_LOSS,
         fd::captures_dropped: 3u128, fd::queue_capacity: CAPACITY as u128 }])));
     let types: Vec<_> = find!(count: u128, pattern!(&facts, [
@@ -73,6 +77,7 @@ fn fd_unknown_census_is_absent_not_zero_and_clocks_survive_deferred_publish() {
     let (_dir, _path, _signer, mut node) = scratch();
     let occurrence = Occurrence {
         session: genid().id, sequence: 1, code: Exhaustion::System,
+        error_site: crate::fd_diagnostics::ErrorSite::Maintenance,
         handler: Snapshot::default(), sampled_high_water: None, samples: 0, dropped: 0,
     };
     let mut batch = Batch { session: genid().id, events: [None; CAPACITY], dropped: 0 };
@@ -87,6 +92,7 @@ fn fd_unknown_census_is_absent_not_zero_and_clocks_survive_deferred_publish() {
     ])).next().unwrap();
     assert!(!exists!(pattern!(&facts, [{ handler @ fd::fd_count: _?count }])));
     assert!(!exists!(pattern!(&facts, [{ handler @ fd::soft_limit: _?limit }])));
+    assert!(!exists!(pattern!(&facts, [{ handler @ fd::mcp_http_accepted_streams: _?count }])));
     assert!(!exists!(pattern!(&facts, [{ event @ metadata::created_at: _?time }])));
     assert!(!exists!(pattern!(&facts, [{ event @ fd::monotonic_ns: _?time }])));
     drop(observed);
