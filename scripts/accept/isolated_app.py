@@ -2,7 +2,7 @@
 
 No open(1), installed app, live identity, real client CLI or client registry.
 Migration modes require explicit native UI choices; --decline-first also records
-the operator's observation of Not now and the stopped/waiting UI. Credential
+the operator's observed Not now click separately from machine-verified stopped state. Credential
 popups remain covered by separate synthetic core tests.
 All owned processes are stopped, including on failure; fixture evidence remains.
 """
@@ -148,7 +148,7 @@ def main():
     parser.add_argument("--legacy32-writer", type=Path,
                         help="independently built historical 3ca5c1cb example for synthetic Config/workspace /32 acceptance")
     parser.add_argument("--decline-first", action="store_true",
-                        help="observe Not now in the native UI, verify unchanged storage, then relaunch for Migrate; requires stdin acknowledgment")
+                        help="acknowledge observed native Not now click; machine-check startup drain and unchanged storage, then relaunch for Migrate")
     parser.add_argument("--operator-quit", action="store_true",
                         help="operator clicks native Quit and acknowledges via stdin; excludes operator latency from timing claims")
     args = parser.parse_args()
@@ -283,8 +283,15 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
     try:
         if args.decline_first:
             declined = spawn("declined")
-            print("In the isolated candidate, click Not now in 'Update local data?', then verify the app says local services are not running. Enter declined here only after observing both.", flush=True)
-            check(input().strip() == "declined", "explicit observed native decline acknowledgment required")
+            print("In the isolated candidate, click Not now in 'Update local data?'. Enter declined here only after observing that click. The harness will separately verify startup has drained and services remain stopped; it does not claim a visual stopped-state check.", flush=True)
+            check(input().strip() == "declined", "explicit observed native Not now acknowledgment required")
+            custody = [*original_siblings, Path(fixture["app_data"]) / "node.lock"]
+
+            def startup_drained():
+                check(declined.poll() is None, "declined candidate exited unexpectedly")
+                return not owns_storage(declined.pid, custody)
+
+            wait_until(startup_drained, 10, "declined candidate still holds startup custody handles")
             check(declined.poll() is None, "declined candidate exited unexpectedly")
             check(not listening(declined.pid), "declined candidate opened a listener")
             check(not (Path(fixture["app_data"]) / "mcp.token").exists(), "declined candidate created a service credential")
@@ -296,8 +303,10 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
             declined.wait(timeout=15)
             check(declined.returncode == 0, "declined candidate did not quit cleanly")
             (root / "decline-result.json").write_text(json.dumps({
-                "status": "passed", "native_ui_observation": "operator acknowledged Not now and stopped/waiting UI",
-                "checks": ["original unchanged", "locator unchanged", "key unchanged", "no candidate", "no service credential", "no listener", "clean Quit"]
+                "status": "passed", "native_ui_observation": "operator acknowledged clicking Not now",
+                "stopped_state_verification": "machine-verified after startup custody handles released; visual stopped-state not checked",
+                "candidate_pid": declined.pid,
+                "checks": ["startup custody handles released", "original unchanged", "locator unchanged", "key unchanged", "no candidate", "no service credential", "no listener", "clean Quit"]
             }, indent=2) + "\n")
         first, client = start("first")
         same_identity(client)
