@@ -1,6 +1,8 @@
-//! Acceptance-only bootstrap. Creates synthetic storage, never app services.
+//! Acceptance-only synthetic bootstrap or explicit read-only pile inspection.
+//! Never starts app services.
 mod old_framing;
 mod legacy32_input;
+mod inspect_pile;
 
 use erlkonig_core::{
     config::{Bootstrap, NodeLocator},
@@ -13,10 +15,18 @@ use std::{env, path::PathBuf};
 
 fn main() {
     let args: Vec<_> = env::args_os().skip(1).collect();
+    if args.len() == 2 && args[0] == "--inspect-pile" {
+        // Return before all environment/default-path and synthetic write code.
+        if let Err(error) = inspect_pile::run(std::path::Path::new(&args[1])) {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let old_framing = args.len() == 2 && args[1] == "--old-framing";
     let legacy32 = args.len() == 2 && args[1] == "--legacy32-input";
     assert!(args.len() == 1 || old_framing || legacy32,
-        "usage: accept-fixture ABSOLUTE_NEW_FIXTURE_ROOT [--old-framing | --legacy32-input]");
+        "usage: accept-fixture ABSOLUTE_NEW_FIXTURE_ROOT [--old-framing | --legacy32-input] OR accept-fixture --inspect-pile ABSOLUTE_PILE");
     let root = PathBuf::from(&args[0]);
     assert!(root.is_absolute() && root.is_dir());
     for (name, relative) in [
