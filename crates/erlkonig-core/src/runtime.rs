@@ -868,7 +868,6 @@ fn node_session(
             store,
             signer.clone(),
             PeerConfig {
-                walk_algorithm: triblespace_net::walk_stream::Algorithm::default(),
                 // This app owns the daemon, rather than dialing another one.
                 daemon: None,
                 provider_publication_budget: None,
