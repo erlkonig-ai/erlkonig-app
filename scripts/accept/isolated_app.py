@@ -1,8 +1,9 @@
 """Explicitly run a candidate against a new synthetic-only Mac fixture.
 
 No open(1), installed app, live identity, real client CLI or client registry.
-The native popup itself is not opened: core local-entry tests exercise invented
-Save/Cancel values, while the candidate Mac build checks its unchanged controls.
+Migration modes require explicit native UI choices; --decline-first also records
+the operator's observation of Not now and the stopped/waiting UI. Credential
+popups remain covered by separate synthetic core tests.
 All owned processes are stopped, including on failure; fixture evidence remains.
 """
 import argparse
@@ -146,9 +147,12 @@ def main():
                         help="exercise supported framing upgrade with retained source and the public node locator; excludes /32 conversion")
     parser.add_argument("--legacy32-writer", type=Path,
                         help="independently built historical 3ca5c1cb example for synthetic Config/workspace /32 acceptance")
+    parser.add_argument("--decline-first", action="store_true",
+                        help="observe Not now in the native UI, verify unchanged storage, then relaunch for Migrate; requires stdin acknowledgment")
     args = parser.parse_args()
     check(not (args.old_framing and args.legacy32_writer), "choose one historical fixture mode")
     needs_upgrade = args.old_framing or args.legacy32_writer is not None
+    check(not args.decline_first or needs_upgrade, "--decline-first requires a migration fixture")
     check(sys.platform == "darwin", "this acceptance lane requires macOS")
     candidate = args.candidate.resolve(strict=True)
     executable = candidate / "Contents/MacOS/erlkonig" if candidate.suffix == ".app" else candidate
@@ -207,6 +211,9 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
     key_stat = (key.stat().st_ino, key.stat().st_size, key.stat().st_mtime_ns)
     original_pile = pile
     original_digest = hashlib.sha256(pile.read_bytes()).hexdigest()
+    locator_path = Path(fixture["app_data"]) / "node.json"
+    original_locator = locator_path.read_bytes() if needs_upgrade else None
+    original_siblings = set(pile.parent.iterdir())
     activated_pile = None
     children = []
     logs = []
@@ -272,6 +279,24 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
                 check(selected == activated_pile, "restart repeated the framing upgrade")
 
     try:
+        if args.decline_first:
+            declined = spawn("declined")
+            print("In the isolated candidate, click Not now in 'Update local data?', then verify the app says local services are not running. Enter declined here only after observing both.", flush=True)
+            check(input().strip() == "declined", "explicit observed native decline acknowledgment required")
+            check(declined.poll() is None, "declined candidate exited unexpectedly")
+            check(not listening(declined.pid), "declined candidate opened a listener")
+            check(not (Path(fixture["app_data"]) / "mcp.token").exists(), "declined candidate created a service credential")
+            check(locator_path.read_bytes() == original_locator, "decline changed the locator")
+            check(hashlib.sha256(original_pile.read_bytes()).hexdigest() == original_digest, "decline changed the original pile")
+            check(set(pile.parent.iterdir()) == original_siblings, "decline created a migration candidate")
+            check((key.stat().st_ino, key.stat().st_size, key.stat().st_mtime_ns) == key_stat, "decline changed the key")
+            declined.send_signal(signal.SIGTERM)
+            declined.wait(timeout=15)
+            check(declined.returncode == 0, "declined candidate did not quit cleanly")
+            (root / "decline-result.json").write_text(json.dumps({
+                "status": "passed", "native_ui_observation": "operator acknowledged Not now and stopped/waiting UI",
+                "checks": ["original unchanged", "locator unchanged", "key unchanged", "no candidate", "no service credential", "no listener", "clean Quit"]
+            }, indent=2) + "\n")
         first, client = start("first")
         same_identity(client)
         if needs_upgrade:
@@ -340,6 +365,7 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
                         if entry["client"] == "codex" else ["plugin", "list", "--json"])
             check(entry["args"] == expected, "candidate attempted an unrequested client mutation")
         (root / "result.json").write_text(json.dumps({"status": "passed", "node_id": fixture["node_id"],
+            "native_decline_observed_and_verified": args.decline_first,
             "supported_framing_upgrade": args.old_framing, "canonical_32_conversion_tested": args.legacy32_writer is not None,
             "checks": ["authenticated HTTP", "explicit workspace", "native item tools", "duplicate refusal",
                        "stdio forwarding only", "Quit closes listener and forwarder", "bounded AppKit drain", "same identity on relaunch"]}, indent=2) + "\n")
