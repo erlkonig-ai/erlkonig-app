@@ -70,6 +70,10 @@ impl Shell for MacShell {
     }
 
     fn startup_alert(&mut self, title: &str, text: &str, buttons: &[&str], terminate: &Arc<AtomicBool>) -> Option<usize> {
+        use block2::RcBlock;
+        use objc2_app_kit::NSModalPanelRunLoopMode;
+        use objc2_foundation::{NSRunLoop, NSTimer};
+
         let stopping = terminate.clone();
         let check = RcBlock::new(move |_timer: std::ptr::NonNull<NSTimer>| {
             if stopping.load(Ordering::Relaxed) {
