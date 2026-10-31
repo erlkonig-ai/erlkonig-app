@@ -149,6 +149,8 @@ def main():
                         help="independently built historical 3ca5c1cb example for synthetic Config/workspace /32 acceptance")
     parser.add_argument("--decline-first", action="store_true",
                         help="observe Not now in the native UI, verify unchanged storage, then relaunch for Migrate; requires stdin acknowledgment")
+    parser.add_argument("--operator-quit", action="store_true",
+                        help="operator clicks native Quit and acknowledges via stdin; excludes operator latency from timing claims")
     args = parser.parse_args()
     check(not (args.old_framing and args.legacy32_writer), "choose one historical fixture mode")
     needs_upgrade = args.old_framing or args.legacy32_writer is not None
@@ -347,13 +349,18 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
                          + "\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{").encode())
         time.sleep(0.1)
         before = time.monotonic()
-        command = 'ObjC.import("AppKit"); $.NSRunningApplication.runningApplicationWithProcessIdentifier(' + str(second.pid) + ').terminate'
-        accepted = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e", command],
-                                  env=env, capture_output=True, text=True, timeout=10)
-        check(accepted.returncode == 0 and "true" in accepted.stdout, "AppKit termination was not accepted")
+        if args.operator_quit:
+            print("Stalled synthetic HTTP request is ready. Click Quit in the isolated candidate's native menu, then enter quit here after observing the action.", flush=True)
+            check(input().strip() == "quit", "explicit observed native Quit acknowledgment required")
+        else:
+            command = 'ObjC.import("AppKit"); $.NSRunningApplication.runningApplicationWithProcessIdentifier(' + str(second.pid) + ').terminate'
+            accepted = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e", command],
+                                      env=env, capture_output=True, text=True, timeout=10)
+            check(accepted.returncode == 0 and "true" in accepted.stdout, "AppKit termination was not accepted")
         stopped(second, client.url)
         pending.close()
-        check(3 < time.monotonic() - before < 10, "stalled HTTP body did not use the bounded Quit drain")
+        if not args.operator_quit:
+            check(3 < time.monotonic() - before < 10, "stalled HTTP body did not use the bounded Quit drain")
         final, client = start("final")
         same_identity(client)
         final.send_signal(signal.SIGTERM)
@@ -366,9 +373,10 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
             check(entry["args"] == expected, "candidate attempted an unrequested client mutation")
         (root / "result.json").write_text(json.dumps({"status": "passed", "node_id": fixture["node_id"],
             "native_decline_observed_and_verified": args.decline_first,
+            "operator_native_quit_observed": args.operator_quit,
             "supported_framing_upgrade": args.old_framing, "canonical_32_conversion_tested": args.legacy32_writer is not None,
             "checks": ["authenticated HTTP", "explicit workspace", "native item tools", "duplicate refusal",
-                       "stdio forwarding only", "Quit closes listener and forwarder", "bounded AppKit drain", "same identity on relaunch"]}, indent=2) + "\n")
+                       "stdio forwarding only", "Quit closes listener and forwarder", "native Quit with bounded cleanup wait" if args.operator_quit else "bounded AppKit drain", "same identity on relaunch"]}, indent=2) + "\n")
         print("isolated candidate acceptance passed; no fixture app left running")
     finally:
         for process in reversed(children):
