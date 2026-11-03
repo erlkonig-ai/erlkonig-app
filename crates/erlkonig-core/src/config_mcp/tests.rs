@@ -1100,7 +1100,7 @@ fn native_grants_list_by_workspace_anchor_and_enroll_without_bootstrap() {
 }
 
 #[test]
-fn native_grants_refuse_withdrawn_anchors_and_report_name_derived_or_missing_roles() {
+fn native_grants_refuse_withdrawn_anchors_and_require_explicit_routes_without_declarations() {
     use triblespace::core::capability::policy;
     use triblespace::core::collection::{Collection, records};
     use triblespace::core::metadata::MetaDescribe;
@@ -1123,8 +1123,8 @@ fn native_grants_refuse_withdrawn_anchors_and_report_name_derived_or_missing_rol
     assert!(recipient.enroll_pending(&original.anchor, &root_handles(&original), Some("Local")).is_err(), "repeat cannot resurrect a withdrawn workspace");
     assert_eq!(after, recipient.inspect());
     // Descriptors created before roles were declared, and descriptors that
-    // name no role at all, are shared the same way; the role derivation is
-    // reported rather than hidden.
+    // name no role at all, are shared the same way. A recognizable suffix
+    // is display text, so both need explicit routes.
     let legacy_anchor = genid().id;
     let bare_anchor = genid().id;
     let compass = workspace::roles().into_iter().find(|(_, name)| *name == "compass").unwrap().0;
@@ -1140,7 +1140,7 @@ fn native_grants_refuse_withdrawn_anchors_and_report_name_derived_or_missing_rol
         }).unwrap();
         collection.handle()
     };
-    let legacy_root = register(legacy_anchor, "Legacy · compass");
+    let legacy_root = register(legacy_anchor, "X · archive");
     let bare_root = register(bare_anchor, "Two independent roots");
     let mut legacy = Workspace::new("Legacy");
     legacy.anchor = legacy_anchor;
@@ -1165,20 +1165,101 @@ fn native_grants_refuse_withdrawn_anchors_and_report_name_derived_or_missing_rol
     assert_eq!(shares.len(), 3);
     let share_of = |anchor: Id| shares.iter().find(|share| share["anchor"] == format!("{anchor:X}")).unwrap().clone();
     let legacy_share = share_of(legacy_anchor);
-    assert_eq!(legacy_share["label"], "Legacy");
-    assert_eq!(legacy_share["enrollable"], true);
-    assert_eq!(legacy_share["collections"][0]["role"], "compass");
-    assert_eq!(legacy_share["collections"][0]["role_source"], "name");
+    assert_eq!(legacy_share["label"], "X · archive", "no declared role to shorten the label");
+    assert_eq!(legacy_share["enrollable"], false);
+    assert!(legacy_share["collections"][0]["role"].is_null());
+    assert!(legacy_share["collections"][0]["role_source"].is_null());
     let bare_share = share_of(bare_anchor);
     assert_eq!(bare_share["label"], "Two independent roots");
     assert_eq!(bare_share["enrollable"], false);
     assert!(bare_share["collections"][0]["role"].is_null());
     assert!(bare_share["collections"][0]["role_source"].is_null());
     assert!(recipient.enroll_pending(&bare_anchor, &recipient.shown_roots(&bare_anchor), Some("Bare")).is_err(), "a root without an understood role needs explicit routes");
-    let accepted = recipient.enroll_pending(&legacy_anchor, &recipient.shown_roots(&legacy_anchor), Some("Legacy local")).unwrap();
-    let local = recipient.workspace(&accepted["workspace"]["workspace"]);
-    assert_eq!(local.routes, legacy.routes);
-    assert_eq!(recipient.list_pending()["shares"].as_array().unwrap().len(), 2);
+    let before = recipient.inspect();
+    let proofs = recipient.proofs();
+    assert!(recipient.enroll_pending(&legacy_anchor, &recipient.shown_roots(&legacy_anchor), Some("Legacy local")).is_err(), "a current display-name suffix establishes no role");
+    assert_eq!(recipient.inspect(), before);
+    let local_id = recipient.call("config_create_workspace", json!({
+        "observation":before["observation"], "label":"Chosen locally",
+        "routes":[{"role":"compass", "root":format!("blake3:{}", hex::encode(legacy_root.raw))}],
+    })).unwrap()["workspace"].clone();
+    let local = recipient.workspace(&local_id);
+    assert_eq!(local.routes, legacy.routes, "explicit routes may disagree with a display name");
+    assert_eq!(recipient.admission(&local), [(true, false)]);
+    let edited = recipient.call("config_edit_workspace", json!({
+        "observation":recipient.inspect()["observation"], "workspace":local_id,
+        "routes":[
+            {"role":"compass", "root":format!("blake3:{}", hex::encode(legacy_root.raw))},
+            {"role":"wiki", "root":format!("blake3:{}", hex::encode(bare_root.raw))},
+        ],
+    })).unwrap()["workspace"].clone();
+    let wiki = workspace::roles().into_iter().find(|(_, name)| *name == "wiki").unwrap().0;
+    let local = recipient.workspace(&edited);
+    assert_eq!(local.routes, BTreeMap::from([(compass, legacy_root), (wiki, bare_root)]));
+    assert_eq!(recipient.admission(&local), [(true, false), (true, false)]);
+    assert_eq!(recipient.proofs(), proofs, "routing never grants permissions");
+}
+
+#[test]
+fn native_grants_use_only_understood_declared_roles_independently_of_names() {
+    use triblespace::core::capability::policy;
+    use triblespace::core::collection::{Collection, records};
+    use triblespace::core::metadata::MetaDescribe;
+    let owner = Fixture::new();
+    let recipient = Fixture::new();
+    let compass = workspace::roles().into_iter().find(|(_, name)| *name == "compass").unwrap().0;
+    let wiki = workspace::roles().into_iter().find(|(_, name)| *name == "wiki").unwrap().0;
+    let unknown = genid().id;
+    for (name, declared, expected) in [
+        ("An arbitrary title", vec![compass], Some("compass")),
+        ("X · archive", vec![compass, unknown], Some("compass")),
+        ("X · compass", vec![compass, wiki], None),
+        ("X · archive", vec![unknown], None),
+    ] {
+        let anchor = genid().id;
+        let mut guard = owner.config.node.lock().unwrap();
+        let node = guard.as_mut().unwrap();
+        let signer = node.signer.verifying_key();
+        let collection: Collection<blobencodings::SimpleArchive> = node.pile.register_collection(entity! {
+            metadata::tag*: [records::KIND_COLLECTION_DESCRIPTOR, anchor],
+            metadata::name: "unrelated metadata",
+            records::collection_name: name,
+            records::collection_representation*: <blobencodings::SimpleArchive as MetaDescribe>::describe(),
+            policy::resource_policy*: faculties::collection_names::private_policy(signer).fragment(),
+            attrs::collection_role*: declared,
+        }).unwrap();
+        let mut original = Workspace::new(name);
+        original.anchor = anchor;
+        original.id = anchor;
+        original.routes.insert(compass, collection.handle());
+        let view = node.config().unwrap();
+        let revision = node.put_workspace(&view, &original).unwrap();
+        drop(guard);
+        owner.share(&json!(format!("{revision:X}")), &recipient, "read_only", None).unwrap();
+        owner.repair_authority_to(&recipient, &original);
+        owner.publish_descriptors_to(&recipient, &original);
+        let before = recipient.inspect();
+        let pending = recipient.list_pending();
+        let share = pending["shares"].as_array().unwrap().iter()
+            .find(|share| share["anchor"] == format!("{anchor:X}")).unwrap();
+        let row = &share["collections"][0];
+        assert_eq!(row["name"], name);
+        assert_eq!(row["role"], json!(expected), "{row}");
+        assert_eq!(row["role_source"], json!(expected.map(|_| "declared")));
+        assert_eq!(row["admitted"], json!({"read":true,"write":false}));
+        assert_eq!(share["enrollable"], expected.is_some());
+        assert_eq!(share["label"], name, "a suffix alone cannot change the role or label");
+        assert_eq!(recipient.inspect(), before, "listing changes no binding");
+        let accepted = recipient.enroll_pending(&anchor, &recipient.shown_roots(&anchor), Some("Local"));
+        if expected.is_some() {
+            let local = recipient.workspace(&accepted.unwrap()["workspace"]["workspace"]);
+            assert_eq!(local.routes, original.routes);
+            assert_eq!(recipient.admission(&local), [(true, false)]);
+        } else {
+            assert!(accepted.is_err(), "unknown or conflicting roles require explicit routes");
+            assert_eq!(recipient.inspect(), before);
+        }
+    }
 }
 
 #[test]

@@ -10,9 +10,9 @@
 //!
 //! A descriptor carries the issuing workspace's anchor among its tags and,
 //! since 2026-10-13, the faculty role it was created for. Older descriptors
-//! declare no role; for those the role is read from the `label · role`
-//! suffix of the descriptor name and reported as such, so a reader can see
-//! which derivation it is trusting.
+//! declare no role and need explicit routes. Display names never establish
+//! a faculty role. Unknown declarations are ignored; distinct understood
+//! declarations leave the automatic role unresolved.
 //!
 //! The reader is open world. A proof may name a resource that is no
 //! collection at all; a descriptor may arrive before the name blob it
@@ -34,7 +34,7 @@
 //! the whole granted group: a root already routed by another local
 //! workspace is disclosed in the listing and routed here only when given.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{Context, Result, bail};
 use faculties::schemas::config::config;
@@ -57,24 +57,6 @@ fn handle_hex(root: &CollectionHandle) -> String {
     format!("blake3:{}", hex::encode(root.raw))
 }
 
-/// Where a collection's faculty role was read from.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RoleSource {
-    /// `collection_role` on the descriptor.
-    Declared,
-    /// The `label · role` suffix of the descriptor name.
-    Name,
-}
-
-impl RoleSource {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Declared => "declared",
-            Self::Name => "name",
-        }
-    }
-}
-
 /// One collection some resident proof grants to this node. A projection of
 /// one snapshot, recomputed per request; nothing here is persisted.
 #[derive(Clone, Debug)]
@@ -86,7 +68,8 @@ pub(crate) struct GrantedCollection {
     pub reason: Option<String>,
     /// The single non-kind tag of the descriptor, when there is exactly one.
     pub anchor: Option<Id>,
-    pub role: Option<(Id, RoleSource)>,
+    /// The sole understood declared role, if unambiguous.
+    pub role: Option<Id>,
     /// Keys that signed the edge naming this node, as public identities.
     pub issuers: BTreeSet<[u8; 32]>,
     /// Actions the resident definitions of those edges claim. A claim says
@@ -198,7 +181,8 @@ fn note(reason: &mut Option<String>, text: String) {
     }
 }
 
-/// The `label` of a `label · role` descriptor name, when `role` is known.
+/// Presentation only: shorten a name using its already-declared role.
+/// This label never participates in role resolution.
 fn label_of(name: &str, role: Option<Id>) -> String {
     role.and_then(faculties::collection_names::name_for)
         .and_then(|suffix| name.strip_suffix(suffix))
@@ -336,6 +320,8 @@ impl NodeStore {
             }
         }
         let mut skipped = 0;
+        let known_roles: HashSet<Id> = faculties::collection_names::table()
+            .into_iter().map(|(role, _)| role).collect();
         let mut collections = Vec::with_capacity(rows.len());
         for (root, mut row) in rows {
             if !snapshot.contains_blob(root)? {
@@ -379,19 +365,13 @@ impl NodeStore {
                     note(&mut row.reason, format!("routed in local workspace {:X}", route.workspace));
                 }
             }
-            let declared: BTreeSet<Id> =
-                find!(role: Id, pattern!(&facts, [{ entity @ attrs::collection_role: ?role }])).collect();
+            let declared: BTreeSet<Id> = find!(role: Id, and!(
+                known_roles.has(role),
+                pattern!(&facts, [{ entity @ attrs::collection_role: ?role }]),
+            )).collect();
             row.role = match declared.into_iter().collect::<Vec<_>>()[..] {
-                [role] if faculties::collection_names::name_for(role).is_some() => {
-                    Some((role, RoleSource::Declared))
-                }
-                _ => row.name.as_deref().and_then(|name| {
-                    let (_, suffix) = name.rsplit_once(" · ")?;
-                    let (role, _) = faculties::collection_names::table()
-                        .into_iter()
-                        .find(|(_, candidate)| *candidate == suffix)?;
-                    Some((role, RoleSource::Name))
-                }),
+                [role] => Some(role),
+                _ => None,
             };
             row.admitted = Collection::<blobencodings::SimpleArchive>::open(&snapshot, row.root)
                 .ok()
@@ -450,7 +430,7 @@ impl NodeStore {
                 share.label = row
                     .name
                     .as_deref()
-                    .map(|name| label_of(name, row.role.map(|(role, _)| role)));
+                    .map(|name| label_of(name, row.role));
             }
             share.collections.push(row);
         }
@@ -533,9 +513,9 @@ impl NodeStore {
         let mut write = true;
         let mut delegate = true;
         for collection in share.collections.iter().filter(|row| roots.contains(&row.root)) {
-            let (role, _) = collection.role.with_context(|| {
+            let role = collection.role.with_context(|| {
                 format!(
-                    "granted collection blake3:{} declares no understood faculty role; enroll it with explicit routes",
+                    "granted collection blake3:{} declares no unambiguous understood faculty role; enroll it with explicit routes",
                     hex::encode(collection.root.raw)
                 )
             })?;

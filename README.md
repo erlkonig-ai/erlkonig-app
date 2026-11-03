@@ -233,7 +233,10 @@ Without a bootstrap, inspect native grant evidence with
 The pending listing groups resident evidence by issuer workspace and reports
 exact roots, descriptor names, role hints, proof claims and native admission
 separately. Names and declared roles inform the model's choice of faculty
-routes; they do not dictate that choice or grant access.
+routes; they do not dictate that choice or grant access. Automatic enrollment
+uses only an unambiguous understood role declared on the descriptor, never a
+display-name suffix. Unknown declarations coexist with understood roles;
+conflicting understood declarations require explicit routes.
 
 For the requested work, the model chooses explicit `{role, root}` routes over
 the existing admitted collections. A deliberate subset is valid. Use
