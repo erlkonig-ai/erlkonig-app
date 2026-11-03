@@ -228,42 +228,39 @@ definition bodies, keys or member data. It is metadata discovery, not authority
 delivery: native grant exchange and collection repair supply proofs, and
 ordinary exact-handle acquisition supplies their definitions.
 
-Without a bootstrap, the same enrollment follows the native grant exchange.
-When the issuer's node connects, the grant's proofs reach the recipient's
-node and land once their descriptors are resident. `config_list_pending_shares`
-lists, read-only, the collections resident proofs grant to this node that no
-current local workspace routes, grouped by the issuing workspace anchor found
-among each descriptor's tags, with the descriptor name, faculty role (declared
-on descriptors created since 2026-10-13, otherwise read from the name's role
-suffix, and `role_source` says which), issuer identities, the actions the
-proof edges claim (`claimed`, `claimed_access`, `claimed_delegate`) and,
-separately, what native admission under the resident descriptor grants this
-node (`admitted` per root, `admitted_access` and `admitted_any` per group);
-a claim is never presented as effective, so a chain no policy admits reads
-claimed read_write with admitted_access none. A root whose descriptor is not
-yet resident is listed by handle as descriptor pending, with nothing
-inferred; a resident descriptor whose name blob has not arrived, or whose
-tags offer no single anchor, keeps its entry and says why in `reason`;
-granted resources that are resident but no collection descriptor are counted
-under `skipped`; and roots the sync daemon holds grants for in memory only
-appear under `sync_memory_pending`. `config_enroll_pending_share` then
-publishes a local workspace over exactly the roots given as `roots`, the
-consent unit, which are the roots the listing showed: if a root arrived under
-the anchor since the listing, or a given root is not granted under it, the
-call refuses and names the difference instead of widening or narrowing
-silently; the published routes are exactly the roots given, never the whole
-granted group. A granted root that another local workspace already routes
-stays listed, with that workspace in `routed_in`, may be left out of
-`roots`, and is routed here only when given; an empty `roots` is refused,
-there is nothing to enroll. A first enrollment needs a
-label; roots that arrive later under an enrolled anchor are listed beside it
-(`local_workspace` enrolled) and enrolling them extends the workspace with a
-new revision over the union of routes, label preserved unless given; the
-identical already-routed set is idempotent, and a changed or withdrawn local
-workspace is never overwritten. A proof edge whose definition is not
-resident or does not decode contributes no claim and is counted under
-`definitions_pending`. The bootstrap tools remain the fallback when the
-nodes have not connected yet.
+Without a bootstrap, inspect native grant evidence with
+`config_list_pending_shares` and local roots with `config_list_collections`.
+The pending listing groups resident evidence by issuer workspace and reports
+exact roots, descriptor names, role hints, proof claims and native admission
+separately. Names and declared roles inform the model's choice of faculty
+routes; they do not dictate that choice or grant access.
+
+For the requested work, the model chooses explicit `{role, root}` routes over
+the existing admitted collections. A deliberate subset is valid. Use
+`config_create_workspace` with those routes for a new local binding, or
+`config_edit_workspace` for an existing binding. Creation without routes
+creates fresh private collections instead; editing with routes replaces the
+complete binding, so retain the routes the user still wants. These operations
+check the known faculty role, resident named descriptor and independent native
+READ or WRITE admission. They require neither matching descriptor names nor
+the entire issuer bundle, and do not change roots or grant permissions.
+
+`config_list_pending_shares` currently reports `enrollable:false` when its
+automatic helper lacks an inferred role or cannot overwrite a changed or
+withdrawn local binding. This is not a general inability to join. Unknown
+role hints can be handled by explicit model-selected routes. Missing descriptor
+bytes and missing native admission are separate conditions that explicit
+routing does not fix. A root already used by a local workspace is disclosed
+in `routed_in`; inspect that binding before creating another one.
+
+`config_enroll_pending_share` remains an optional convenience for a complete
+group whose inferred mappings already match the intended binding. Only that
+helper requires every currently unrouted granted root and rejects a set that
+changed since listing; explicit create/edit supports the chosen subset.
+Its later extensions union the given roots with its existing binding, while
+a changed or withdrawn binding is never overwritten. Listing alone fetches,
+grants and selects nothing. The JSON bootstrap remains a signed metadata
+handoff when useful; it is not a prerequisite for explicit local routing.
 
 Sync peering and Full hydration follow the pile's native collection-selection
 registers, not all admitted record/proof roots. Creating a workspace, adding

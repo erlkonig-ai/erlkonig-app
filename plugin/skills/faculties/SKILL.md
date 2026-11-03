@@ -59,30 +59,45 @@ or copied data cannot be made unread, whether or not delegation is enabled.
 Ask about the consequence in ordinary language, not capability jargon.
 
 The normal flow needs no handoff. The owner runs `config_share_workspace`;
-native grant exchange delivers the proofs to the recipient's node when the
-two nodes connect, and sync delivers the descriptors. On the recipient's node,
-call `config_list_pending_shares` (read-only, no workspace needed). It groups
-the collections resident grants name for this node by the issuing workspace,
-and per collection shows the exact root, the descriptor name and role, the
-access the proof edges claim (`claimed`, `claimed_access`) and, separately,
-what native admission grants right now (`admitted`, `admitted_access`); a
-claim is never effective access, so say both in ordinary language. The role
-is the one declared on the descriptor, or, for older descriptors, read from
-the name's role suffix, and `role_source` (declared or name) says which. A
-root whose descriptor has not arrived is listed as pending with nothing
-inferred; a root another local workspace already routes says so in
-`routed_in`. Explain exactly the roots shown and the disk/network/maintenance
-consequences, and choose a friendly **local alias** with the person. Then
-`config_inspect` and `config_enroll_pending_share` with the latest
-observation, the anchor, that alias and exactly the roots shown: it publishes
-a local workspace over those roots under the existing node key and selects
-them for native sync. If a root arrived or disappeared since the listing, it
-refuses and names the difference; list again rather than guessing. Later,
-when the listing shows new roots beside an enrolled workspace, enrolling
-exactly those roots extends it with a new revision; never pass roots the
-listing did not show. Rights already existed: nothing is acknowledged or
-approved toward the source, no key is copied, no menu is involved, and a
-grant alone neither enrolls nor selects anything.
+native grant exchange delivers proofs to the recipient's node when the nodes
+connect, and sync delivers descriptors. On the recipient's node, inspect
+`config_list_pending_shares` and `config_list_collections` (both read-only,
+no workspace needed). Keep proof claims (`claimed`, `claimed_access`)
+separate from effective native access (`admitted`, `admitted_access`, and
+the collection's independent `read`/`write` values).
+
+The model chooses collection-to-faculty mappings for the requested work.
+Descriptor names, declared roles and `role_source` are evidence for that
+choice, not authority or a mandatory mapping. An unknown role or
+`enrollable:false` does not mean the recipient cannot use an admitted root.
+That field describes the automatic `config_enroll_pending_share` helper:
+its inferred mapping is incomplete, or that helper cannot overwrite an
+existing changed/withdrawn binding. Explain the actual reason. A missing
+descriptor or missing native admission is a different condition; explicit
+routing does not fetch the descriptor or grant permission.
+
+Choose the exact roots and faculty roles needed within the user's scope;
+an intentional subset of the shared bundle is valid. Explain those selected
+roots and their disk/network/maintenance consequences, and choose a friendly
+**local alias** with the person when creating a binding. With a fresh
+`config_inspect` observation, use `config_create_workspace` with explicit
+`routes: [{role, root}, ...]`, or `config_edit_workspace` for an existing
+local binding. Supply `routes` when joining existing data: omitting it on
+creation creates fresh private roots. On edit, supplied routes replace the
+complete bundle, so include the existing routes the user wants to retain.
+The tools check the known faculty role, exact resident named root and native
+READ or WRITE admission; the model supplies the semantic mapping. Explicit
+routing does not require every granted root or matching descriptor names.
+
+The automatic `config_enroll_pending_share` helper remains available when
+its inferred mappings and complete-root selection already match the intended
+binding. Its exact-root checks apply to that helper, not to explicit
+create/edit. `routed_in` identifies roots already used by another local
+workspace; reuse or edit an intended existing binding rather than creating a
+duplicate. Successful binding publication separately selects newly added
+roots for native sync. Rights already existed: no acknowledgement, key copy
+or new grant is involved, and a grant alone neither creates a binding nor
+selects its collections.
 
 The JSON handoff is the fallback for when the nodes have not connected yet.
 Hand the opaque returned `bootstrap` unchanged to the intended recipient only

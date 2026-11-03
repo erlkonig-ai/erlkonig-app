@@ -63,14 +63,24 @@ remain available with zero workspaces. They inspect the public identity and
 typed settings, discover local collection choices, and create/edit/remove
 bundles. `config_share_workspace` grants native access immediately to an exact
 current bundle, invoke-only by default; onward delegation requires explaining
-consequences and the user's opt-in. The normal flow is then recipient-local:
-`config_list_pending_shares` lists the collections resident native grants name
-for this node, grouped by the issuing workspace, with the exact roots, the
-claimed and the admitted access and the role (declared, or from the name
-suffix, as `role_source` says), and `config_enroll_pending_share` publishes a
-local label over exactly the roots shown, refusing a set that changed since
-the listing; a later extension takes only roots the listing shows beside the
-enrolled workspace. The JSON handoff is the fallback for nodes that have not
+consequences and the user's opt-in. The recipient inspects
+`config_list_pending_shares` and `config_list_collections`, keeping claimed
+access separate from native admission. Descriptor names and declared/name-derived
+roles are evidence for the model's mapping, not mandatory routing or authority.
+The model chooses exact existing roots and faculty roles for the requested
+work, including an intentional subset, and uses `config_create_workspace`
+with explicit routes or `config_edit_workspace` for an existing binding.
+Creation without routes creates fresh roots; edit routes replace the complete
+binding, so retain intended existing routes. Exact resident roots and native
+READ or WRITE admission are checked independently of names.
+
+The pending listing's `enrollable:false` describes the automatic helper's
+unresolved mapping or protected changed/withdrawn binding, not a general
+inability to use admitted collections. `config_enroll_pending_share` is an
+optional convenience when its inferred mappings and complete-root selection
+already match the intended binding. Its exact-all-root checks do not apply
+to explicit create/edit. Reuse an existing local binding rather than making
+a duplicate. The JSON handoff is the fallback for nodes that have not
 connected yet: `config_probe_workspace_share` verifies the bounded signed
 role/root/name metadata without mutation (the signature/recipient binding,
 not collection admission; no proof or definition payload travels in the
