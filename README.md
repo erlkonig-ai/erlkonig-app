@@ -245,10 +245,10 @@ check the known faculty role, resident named descriptor and independent native
 READ or WRITE admission. They require neither matching descriptor names nor
 the entire issuer bundle, and do not change roots or grant permissions.
 
-`config_list_pending_shares` currently reports `enrollable:false` when its
-automatic helper lacks an inferred role or cannot overwrite a changed or
-withdrawn local binding. This is not a general inability to join. Unknown
-role hints can be handled by explicit model-selected routes. Missing descriptor
+`config_list_pending_shares` reports `enrollable` for its automatic helper,
+not the recipient's general ability to use a root. When it is false, inspect
+the reported metadata and reason. Unknown role hints can be handled by
+explicit model-selected routes. Missing descriptor
 bytes and missing native admission are separate conditions that explicit
 routing does not fix. A root already used by a local workspace is disclosed
 in `routed_in`; inspect that binding before creating another one.

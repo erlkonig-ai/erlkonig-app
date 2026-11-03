@@ -70,9 +70,9 @@ The model chooses collection-to-faculty mappings for the requested work.
 Descriptor names, declared roles and `role_source` are evidence for that
 choice, not authority or a mandatory mapping. An unknown role or
 `enrollable:false` does not mean the recipient cannot use an admitted root.
-That field describes the automatic `config_enroll_pending_share` helper:
-its inferred mapping is incomplete, or that helper cannot overwrite an
-existing changed/withdrawn binding. Explain the actual reason. A missing
+That field is a status for the automatic `config_enroll_pending_share`
+helper, not the general ability to bind a collection. Inspect the reported
+metadata and explain the actual reason. A missing
 descriptor or missing native admission is a different condition; explicit
 routing does not fetch the descriptor or grant permission.
 

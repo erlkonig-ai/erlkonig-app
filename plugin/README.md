@@ -74,9 +74,9 @@ Creation without routes creates fresh roots; edit routes replace the complete
 binding, so retain intended existing routes. Exact resident roots and native
 READ or WRITE admission are checked independently of names.
 
-The pending listing's `enrollable:false` describes the automatic helper's
-unresolved mapping or protected changed/withdrawn binding, not a general
-inability to use admitted collections. `config_enroll_pending_share` is an
+The pending listing's `enrollable` is a status for the automatic helper,
+not a general ability to use admitted collections; when false, inspect the
+reported metadata and reason. `config_enroll_pending_share` is an
 optional convenience when its inferred mappings and complete-root selection
 already match the intended binding. Its exact-all-root checks do not apply
 to explicit create/edit. Reuse an existing local binding rather than making
