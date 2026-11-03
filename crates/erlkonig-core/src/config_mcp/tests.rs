@@ -1382,6 +1382,7 @@ fn native_grants_list_descriptors_with_ambiguous_or_missing_anchor_tags_ungroupe
     let mut register = |tags: Vec<Id>, name: &str| -> triblespace::core::collection::CollectionHandle {
         let collection: Collection<blobencodings::SimpleArchive> = node.pile.register_collection(entity! {
             metadata::tag*: tags,
+            attrs::collection_role: compass,
             records::collection_name: name,
             records::collection_representation*: <blobencodings::SimpleArchive as MetaDescribe>::describe(),
             policy::resource_policy*: faculties::collection_names::private_policy(signer).fragment(),
@@ -1421,11 +1422,13 @@ fn native_grants_list_descriptors_with_ambiguous_or_missing_anchor_tags_ungroupe
     assert_eq!(ambiguous_row["descriptor"], "resident");
     assert_eq!(ambiguous_row["name"], "Ambiguous · compass");
     assert_eq!(ambiguous_row["role"], "compass");
+    assert_eq!(ambiguous_row["role_source"], "declared");
     assert_eq!(ambiguous_row["reason"], "descriptor carries 2 candidate anchors");
     let unanchored_row = row_of(unanchored_root);
     assert_eq!(unanchored_row["descriptor"], "resident");
     assert_eq!(unanchored_row["name"], "Unanchored · compass");
     assert_eq!(unanchored_row["role"], "compass");
+    assert_eq!(unanchored_row["role_source"], "declared");
     assert_eq!(unanchored_row["reason"], "descriptor carries no candidate anchor");
     assert!(recipient.enroll_pending(&ambiguous_anchor, &[format!("blake3:{}", hex::encode(ambiguous_root.raw))], Some("Ambiguous")).is_err(), "an ungrouped root needs explicit routes");
     let accepted = recipient.enroll_pending(&grouped.anchor, &recipient.shown_roots(&grouped.anchor), Some("Local")).unwrap();
