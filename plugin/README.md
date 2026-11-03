@@ -65,7 +65,7 @@ bundles. `config_share_workspace` grants native access immediately to an exact
 current bundle, invoke-only by default; onward delegation requires explaining
 consequences and the user's opt-in. The recipient inspects
 `config_list_pending_shares` and `config_list_collections`, keeping claimed
-access separate from native admission. Descriptor names and declared/name-derived
+access separate from native admission. Descriptor names and declared
 roles are evidence for the model's mapping, not mandatory routing or authority.
 The model chooses exact existing roots and faculty roles for the requested
 work, including an intentional subset, and uses `config_create_workspace`
