@@ -13,6 +13,13 @@ The client invokes the app binary's `mcp-stdio` mode; that transport only
 forwards to an already-running app. Quit closes the owning backend, and the
 transport must never relaunch it or acquire a pile itself.
 
+HTTP sessions expire after idle periods. On the native backend's explicit
+missing-session response, the stdio adapter initializes a fresh protocol session
+on its existing connection. It reports the rejected request as not executed;
+it does not replay it. Later requests use the renewed session. Network failures
+and owner shutdown remain terminal because an admitted operation may already
+have completed. Session renewal never reconnects to a replacement app owner.
+
 The Mac's **Integrations** menu detects installed desktop apps through public
 `NSWorkspace` bundle lookup (no app launch), and executable management CLIs
 through the local resolver. Detection runs at startup and on **Refresh plugin

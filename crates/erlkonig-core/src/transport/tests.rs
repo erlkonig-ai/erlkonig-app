@@ -360,6 +360,284 @@ async fn real_native_shutdown_closes_idle_transport_with_stdin_open() {
 }
 
 #[tokio::test]
+async fn expired_native_session_rejects_call_without_replay_then_accepts_future_call() {
+    use faculties::mcp::{Faculty, Tool};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct Counter(Arc<AtomicUsize>);
+    impl Faculty for Counter {
+        fn tools(&self) -> &[Tool] {
+            &[Tool {
+                name: "count",
+                description: "Count actual executions",
+                input_schema: r#"{"type":"object"}"#,
+            }]
+        }
+        fn call(
+            &self,
+            _: &str,
+            _: faculties::mcp::Bytes,
+            out: &mut faculties::out::Out<'_>,
+        ) -> Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            out.text("executed")?;
+            Ok(())
+        }
+    }
+
+    let (_dir, layout) = scratch();
+    let token = credentials::load(&layout.dir.join("mcp.token")).unwrap();
+    let mut config = http::Config::new(
+        "127.0.0.1:0".parse().unwrap(),
+        http::BearerToken::new(&token).unwrap(),
+    );
+    config.session_idle_timeout = Duration::from_millis(100);
+    let endpoint = http::Endpoint::bind(config).unwrap();
+    let url = format!("http://{}/", endpoint.local_addr().unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Counter(calls.clone());
+    let (stop, stopped) = oneshot::channel();
+    let native = std::thread::spawn(move || {
+        endpoint.serve_until(&[&counter], async {
+            let _ = stopped.await;
+        })
+    });
+    let (mut client, mut output, task) = bridge(layout, url);
+    send(&mut client, INITIALIZE).await;
+    line(&mut output).await;
+    send(&mut client, INITIALIZED).await;
+    send(&mut client, r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#).await;
+    line(&mut output).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    send(&mut client, r#"{"jsonrpc":"2.0","id":"expired","method":"tools/call","params":{"name":"count","arguments":{}}}"#).await;
+    let rejected = line(&mut output).await;
+    assert_eq!(rejected["id"], "expired");
+    assert_eq!(rejected["error"]["code"], -32000);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "expired call must never execute or replay"
+    );
+    send(&mut client, r#"{"jsonrpc":"2.0","id":"future","method":"tools/call","params":{"name":"count","arguments":{}}}"#).await;
+    let accepted = line(&mut output).await;
+    assert_eq!(accepted["id"], "future");
+    assert!(accepted.get("result").is_some(), "{accepted}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(client);
+    finished(task).await.unwrap();
+    stop.send(()).unwrap();
+    native.join().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn session_renewal_uses_same_socket_and_never_replays_requests_or_notifications() {
+    for (rejected, already_initialized) in [
+        (
+            r#"{"jsonrpc":"2.0","id":90071992547409931234567890,"method":"tools/call","params":{"name":"side_effect","arguments":{}}}"#,
+            true,
+        ),
+        (CANCELLED, true),
+        (INITIALIZED, false),
+    ] {
+        let (_dir, layout) = scratch();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let native = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            initialize(&mut socket).await;
+            if already_initialized {
+                assert_eq!(post(&mut socket).await.body, INITIALIZED);
+                reply(&mut socket, "202 Accepted", "", "").await;
+            }
+            let expired = post(&mut socket).await;
+            assert_eq!(expired.body, rejected);
+            assert_eq!(expired.headers[SESSION_HEADER], "fixture");
+            reply(
+                &mut socket,
+                "404 Not Found",
+                "",
+                "private error text must not escape",
+            )
+            .await;
+            let initialization = post(&mut socket).await;
+            assert_eq!(initialization.body, INITIALIZE);
+            assert!(!initialization.headers.contains_key(SESSION_HEADER));
+            reply(
+                &mut socket,
+                "200 OK",
+                "Content-Type: application/json\r\nMcp-Session-Id: renewed\r\n",
+                INIT_RESPONSE,
+            )
+            .await;
+            let initialized = post(&mut socket).await;
+            assert_eq!(initialized.body, INITIALIZED);
+            assert_eq!(initialized.headers[SESSION_HEADER], "renewed");
+            reply(&mut socket, "202 Accepted", "", "").await;
+            // The only next application frame must be the newly submitted ping.
+            let future = post(&mut socket).await;
+            assert_eq!(future.body, r#"{"jsonrpc":"2.0","id":42,"method":"ping"}"#);
+            assert_eq!(future.headers[SESSION_HEADER], "renewed");
+            reply(
+                &mut socket,
+                "200 OK",
+                "Content-Type: application/json\r\n",
+                r#"{"jsonrpc":"2.0","id":42,"result":{}}"#,
+            )
+            .await;
+            let deletion = post(&mut socket).await;
+            assert_eq!(deletion.method, "DELETE");
+            assert_eq!(deletion.headers[SESSION_HEADER], "renewed");
+            reply(&mut socket, "204 No Content", "", "").await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let (mut client, mut output, task) = bridge(layout, url);
+        send(&mut client, INITIALIZE).await;
+        line(&mut output).await;
+        if already_initialized {
+            send(&mut client, INITIALIZED).await;
+        }
+        send(&mut client, rejected).await;
+        if rejected != CANCELLED && rejected != INITIALIZED {
+            let mut response = String::new();
+            tokio::time::timeout(Duration::from_secs(2), output.read_line(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(response.contains(r#""id":90071992547409931234567890"#));
+            assert!(response.contains(r#""code":-32000"#));
+            assert!(!response.contains("private error text"));
+        }
+        send(&mut client, r#"{"jsonrpc":"2.0","id":42,"method":"ping"}"#).await;
+        assert_eq!(
+            line(&mut output).await["id"],
+            42,
+            "no notification response or internal initialization leaks"
+        );
+        drop(client);
+        finished(task).await.unwrap();
+        native.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn initial_404_and_interrupted_expiry_response_are_terminal() {
+    for established in [false, true] {
+        let (_dir, layout) = scratch();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let native = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            if established {
+                initialize(&mut socket).await;
+            }
+            post(&mut socket).await;
+            if established {
+                // The status alone must not trigger recovery before a complete
+                // bounded response has been consumed on the pinned connection.
+                socket
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 100\r\n\r\nshort")
+                    .await
+                    .unwrap();
+            } else {
+                reply(&mut socket, "404 Not Found", "", "unknown endpoint").await;
+            }
+            drop(socket);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let (mut client, mut output, task) = bridge(layout, url);
+        send(&mut client, INITIALIZE).await;
+        if established {
+            line(&mut output).await;
+            send(&mut client, r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#).await;
+        }
+        assert!(finished(task).await.is_err());
+        let mut remainder = String::new();
+        output.read_to_string(&mut remainder).await.unwrap();
+        assert!(remainder.is_empty());
+        native.await.unwrap();
+    }
+}
+
+#[test]
+fn session_recovery_preserves_invalid_initialization_and_message_boundaries() {
+    for frame in [
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":null}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized","id":null}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized","result":null}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized","error":null}"#,
+    ] {
+        assert!(
+            !serde_json::from_str::<Message<'_>>(frame)
+                .unwrap()
+                .initialized()
+        );
+    }
+    assert!(
+        expired_response(br#"{"jsonrpc":"2.0","id":2,"result":{}}"#)
+            .unwrap()
+            .is_none()
+    );
+    assert!(expired_response(CANCELLED.as_bytes()).unwrap().is_none());
+    assert!(expired_response(br#"{"jsonrpc":"2.0","id":true,"method":"ping"}"#).is_err());
+    assert!(expired_response(br#"{"jsonrpc":"2.0","id":1,"id":2,"method":"ping"}"#).is_err());
+}
+
+#[tokio::test]
+async fn failed_session_renewal_is_terminal_without_another_attempt() {
+    let (_dir, layout) = scratch();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let native = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        initialize(&mut socket).await;
+        post(&mut socket).await;
+        reply(&mut socket, "404 Not Found", "", "expired").await;
+        let renewal = post(&mut socket).await;
+        assert_eq!(renewal.body, INITIALIZE);
+        assert!(!renewal.headers.contains_key(SESSION_HEADER));
+        reply(&mut socket, "404 Not Found", "", "renewal refused").await;
+        let mut remainder = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            socket.read_to_string(&mut remainder),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(remainder.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let (mut client, mut output, task) = bridge(layout, url);
+    send(&mut client, INITIALIZE).await;
+    line(&mut output).await;
+    send(&mut client, r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#).await;
+    assert!(finished(task).await.is_err());
+    let mut remainder = String::new();
+    output.read_to_string(&mut remainder).await.unwrap();
+    assert!(remainder.is_empty());
+    native.await.unwrap();
+}
+
+#[tokio::test]
 async fn final_json_response_is_flushed_before_owner_close() {
     let (_dir, layout) = scratch();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
