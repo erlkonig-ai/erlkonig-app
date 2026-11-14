@@ -24,11 +24,12 @@ fn main() {
         }
         return;
     }
-    let wiki_browser_mode = args.len() == 2 && args[1] == "--wiki-browser";
+    let faculties_browser_mode = args.len() == 2 && args[1] == "--faculties-browser";
+    let wiki_browser_mode = faculties_browser_mode || (args.len() == 2 && args[1] == "--wiki-browser");
     let old_framing = args.len() == 2 && args[1] == "--old-framing";
     let legacy32 = args.len() == 2 && args[1] == "--legacy32-input";
     assert!(args.len() == 1 || old_framing || legacy32 || wiki_browser_mode,
-        "usage: accept-fixture ABSOLUTE_NEW_FIXTURE_ROOT [--old-framing | --legacy32-input | --wiki-browser] OR accept-fixture --inspect-pile ABSOLUTE_PILE");
+        "usage: accept-fixture ABSOLUTE_NEW_FIXTURE_ROOT [--old-framing | --legacy32-input | --wiki-browser | --faculties-browser] OR accept-fixture --inspect-pile ABSOLUTE_PILE");
     let root = PathBuf::from(&args[0]);
     assert!(root.is_absolute() && root.is_dir());
     for (name, relative) in [
@@ -66,11 +67,11 @@ fn main() {
     .unwrap();
     let view = node.config().unwrap();
     let workspace = node
-        .create_workspace(&view, if wiki_browser_mode { "Design" } else { "Synthetic acceptance fixture" })
+        .create_workspace(&view, if faculties_browser_mode { "AMBER fixture" } else if wiki_browser_mode { "Design" } else { "Synthetic acceptance fixture" })
         .unwrap();
     node.close().unwrap();
     let wiki_browser = if wiki_browser_mode {
-        Some(wiki_browser_fixture::seed(&bootstrap, workspace).unwrap())
+        Some(wiki_browser_fixture::seed(&bootstrap, workspace, faculties_browser_mode).unwrap())
     } else {
         None
     };

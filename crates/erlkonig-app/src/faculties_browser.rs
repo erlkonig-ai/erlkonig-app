@@ -37,26 +37,26 @@ pub(crate) struct BrowserChild {
 impl BrowserChild {
     pub(crate) fn open(binding: &NodeBinding) -> Result<Self, String> {
         let mut handoff = serde_json::to_vec(binding)
-            .map_err(|_| "Cannot prepare the Wiki browser.".to_owned())?;
+            .map_err(|_| "Cannot prepare the Faculties viewer.".to_owned())?;
         if handoff.len() >= HANDOFF_LIMIT {
-            return Err("Node paths are too long for the Wiki browser.".into());
+            return Err("Node paths are too long for the Faculties viewer.".into());
         }
         handoff.push(b'\n');
         let executable = std::env::current_exe()
             .map_err(|_| "Cannot locate this Erlkonig executable.".to_owned())?;
         let mut child = Command::new(executable)
-            .arg("browse-wiki")
+            .arg("browse-faculties")
             .env_remove("GORBIE_EDITOR")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|_| "Cannot open the Wiki browser.".to_owned())?;
+            .map_err(|_| "Cannot open the Faculties viewer.".to_owned())?;
         let mut lifetime = child.stdin.take().expect("piped child stdin");
         if lifetime.write_all(&handoff).is_err() {
             let _ = child.kill();
             let _ = child.wait();
-            return Err("The Wiki browser did not accept its node binding.".into());
+            return Err("The Faculties viewer did not accept its node binding.".into());
         }
         Ok(Self {
             child,
@@ -97,27 +97,27 @@ fn read_handoff(input: &mut impl Read) -> Result<NodeBinding, String> {
             .map_err(|_| "Erlkonig is unavailable.".to_owned())?
             == 0
         {
-            return Err("Erlkonig is unavailable. Open the Wiki browser from its menu.".into());
+            return Err("Erlkonig is unavailable. Open the Faculties viewer from its menu.".into());
         }
         if byte[0] == b'\n' {
             break;
         }
         if bytes.len() == HANDOFF_LIMIT {
-            return Err("Invalid Wiki browser handoff.".into());
+            return Err("Invalid Faculties viewer handoff.".into());
         }
         bytes.push(byte[0]);
     }
-    serde_json::from_slice(&bytes).map_err(|_| "Invalid Wiki browser handoff.".into())
+    serde_json::from_slice(&bytes).map_err(|_| "Invalid Faculties viewer handoff.".into())
 }
 
 /// Must be dispatched before the node CLI, native menu or Runtime startup.
 /// No default paths, ambient Faculty variables, token or locator fallback.
 pub fn run(args: &[std::ffi::OsString]) -> Result<bool, String> {
-    if args.first().is_none_or(|arg| arg != "browse-wiki") {
+    if args.first().is_none_or(|arg| arg != "browse-faculties") {
         return Ok(false);
     }
     if args.len() != 1 {
-        return Err("The Wiki browser is opened from Erlkonig's menu.".into());
+        return Err("The Faculties viewer is opened from Erlkonig's menu.".into());
     }
     let binding = read_handoff(&mut std::io::stdin())?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -125,7 +125,7 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<bool, String> {
     let watching = stop.clone();
     let closing = window.clone();
     let monitor = std::thread::Builder::new()
-        .name("wiki-parent".into())
+        .name("faculties-parent".into())
         .spawn(move || {
             let mut input = std::io::stdin();
             while !watching.load(Ordering::Relaxed) {

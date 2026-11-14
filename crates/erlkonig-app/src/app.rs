@@ -101,7 +101,7 @@ pub(crate) struct Items {
     pub(crate) pause_sync: Control,
     pub(crate) retry_services: Control,
     pub(crate) storage_folder: Control,
-    pub(crate) browse_wiki: Control,
+    pub(crate) browse_faculties: Control,
     pub(crate) quit: Control,
     pub(crate) get_update: Control,
     pub(crate) update_visible: bool,
@@ -169,7 +169,7 @@ impl Items {
             pause_sync: entry("erlkonig.sync", "Pause sync", false, None),
             retry_services: entry("erlkonig.retry", "Retry services", false, None),
             storage_folder: entry("erlkonig.storage", "Show storage folder", false, None),
-            browse_wiki: entry("erlkonig.wiki", "Browse Wiki…", false, None),
+            browse_faculties: entry("erlkonig.faculties", "Browse Faculties…", false, None),
             quit: entry("erlkonig.quit", "Quit Erlkonig", true, None),
             get_update: entry("erlkonig.get-update", "Get update…", true, None),
             update_visible: false,
@@ -237,7 +237,7 @@ pub struct View {
     pub retry: Option<Control>,
     pub integrations: Vec<Control>,
     pub storage: Control,
-    pub browse_wiki: Control,
+    pub browse_faculties: Control,
     pub login: Control,
     pub quit: Control,
     pub prompt: Option<Prompt>,
@@ -247,7 +247,7 @@ pub struct App<S: Shell> {
     pub shell: S,
     layout: Layout,
     runtime: Option<Runtime>,
-    wiki_browser: Option<crate::wiki_browser::BrowserChild>,
+    faculties_browser: Option<crate::faculties_browser::BrowserChild>,
     update_notice: Option<crate::update_notice::UpdateNotice>,
     startup_task: Option<StartupTask>,
     startup_prompt: Option<StartupPrompt>,
@@ -331,7 +331,7 @@ impl<S: Shell> App<S> {
             shell,
             layout,
             runtime: None,
-            wiki_browser: None,
+            faculties_browser: None,
             update_notice: None,
             startup_task: None,
             startup_prompt: None,
@@ -560,7 +560,7 @@ impl<S: Shell> App<S> {
                 .filter_map(|row| items.row(*row).cloned())
                 .collect(),
             storage: items.storage_folder.clone(),
-            browse_wiki: items.browse_wiki.clone(),
+            browse_faculties: items.browse_faculties.clone(),
             login: items.login.clone(),
             quit: items.quit.clone(),
             prompt: self.prompts.front().cloned(),
@@ -586,11 +586,11 @@ impl<S: Shell> App<S> {
             self.quit();
         }
         self.finish_startup_task();
-        if self.wiki_browser.as_mut().is_some_and(|child| child.finished()) {
-            self.wiki_browser = None;
+        if self.faculties_browser.as_mut().is_some_and(|child| child.finished()) {
+            self.faculties_browser = None;
         }
-        self.items.browse_wiki.enabled = self.runtime.is_some() && self.wiki_browser.is_none() && self.quitting.is_none();
-        self.items.browse_wiki.label = if self.wiki_browser.is_some() { "Wiki browser open" } else { "Browse Wiki…" }.into();
+        self.items.browse_faculties.enabled = self.runtime.is_some() && self.faculties_browser.is_none() && self.quitting.is_none();
+        self.items.browse_faculties.label = if self.faculties_browser.is_some() { "Faculties viewer open" } else { "Browse Faculties…" }.into();
         if let Some(since) = self.quitting {
             let mut exit = false;
             if self.startup_task.is_none() && since.elapsed() >= Duration::from_secs(15) {
@@ -600,7 +600,7 @@ impl<S: Shell> App<S> {
                 eprintln!(
                     "Erlkonig: 15-second shutdown grace elapsed; terminating this application process"
                 );
-                self.wiki_browser = None; // Force-stop/reap, not a claim of reader drain.
+                self.faculties_browser = None; // Force-stop/reap, not a claim of reader drain.
                 std::process::exit(1);
             }
             self.items.quit.label = if since.elapsed() < Duration::from_secs(5) {
@@ -611,7 +611,7 @@ impl<S: Shell> App<S> {
             .into();
             if self.runtime.as_ref().is_none_or(Runtime::is_finished)
                 && self.startup_task.is_none()
-                && self.wiki_browser.is_none()
+                && self.faculties_browser.is_none()
                 && self.update_notice.as_ref().is_none_or(crate::update_notice::UpdateNotice::is_finished)
                 && self
                     .plugin_task
@@ -734,7 +734,7 @@ impl<S: Shell> App<S> {
 
     pub fn quit(&mut self) {
         self.quitting.get_or_insert_with(Instant::now);
-        if let Some(child) = &mut self.wiki_browser { child.stop(); }
+        if let Some(child) = &mut self.faculties_browser { child.stop(); }
         if let Some(notice) = &self.update_notice { notice.cancel(); }
         self.shell.stop_crown(); // Invalidate display callbacks before service teardown.
         // Quit is final: unanswered prompts no longer lead anywhere.
@@ -752,7 +752,7 @@ impl<S: Shell> App<S> {
             &mut items.cowork,
             &mut items.refresh_plugins,
             &mut items.storage_folder,
-            &mut items.browse_wiki,
+            &mut items.browse_faculties,
             &mut items.quit,
             &mut items.get_update,
             &mut items.login,
@@ -777,7 +777,7 @@ impl<S: Shell> App<S> {
         // AppKit can bypass quit(); cancel and join the advisory request here too.
         self.update_notice = None;
         self.shell.stop_crown();
-        if let Some(child) = &mut self.wiki_browser { child.stop(); }
+        if let Some(child) = &mut self.faculties_browser { child.stop(); }
         if let Some(task) = &self.startup_task { task.control.cancel(); }
         self.startup_prompt = None;
         // A converter may be finishing one native blob/branch operation.
@@ -797,14 +797,14 @@ impl<S: Shell> App<S> {
             runtime.begin_shutdown();
         }
         let since = self.quitting.unwrap_or_else(Instant::now);
-        while self.wiki_browser.as_mut().is_some_and(|child| !child.finished()) {
+        while self.faculties_browser.as_mut().is_some_and(|child| !child.finished()) {
             if since.elapsed() >= Duration::from_secs(15) {
-                self.wiki_browser = None; // Drop kills/reaps before the final exit.
+                self.faculties_browser = None; // Drop kills/reaps before the final exit.
                 std::process::exit(1);
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        self.wiki_browser = None;
+        self.faculties_browser = None;
         while self
             .plugin_task
             .as_ref()
@@ -1319,12 +1319,12 @@ impl<S: Shell> App<S> {
                     Then::Nothing,
                 );
             }
-        } else if id == &self.items.browse_wiki.id {
-            if self.quitting.is_none() && self.wiki_browser.is_none() {
+        } else if id == &self.items.browse_faculties.id {
+            if self.quitting.is_none() && self.faculties_browser.is_none() {
                 if let Some(runtime) = &self.runtime {
-                    match crate::wiki_browser::BrowserChild::open(runtime.binding()) {
-                        Ok(child) => self.wiki_browser = Some(child),
-                        Err(error) => self.ask("Wiki browser unavailable", &error, &["OK"], Then::Nothing),
+                    match crate::faculties_browser::BrowserChild::open(runtime.binding()) {
+                        Ok(child) => self.faculties_browser = Some(child),
+                        Err(error) => self.ask("Faculties viewer unavailable", &error, &["OK"], Then::Nothing),
                     }
                 }
             }
@@ -1551,13 +1551,13 @@ mod tests {
     }
 
     #[test]
-    fn wiki_browser_requires_the_existing_runtime() {
+    fn faculties_browser_requires_the_existing_runtime() {
         let mut app = app(Fake::default());
-        assert!(!app.view().browse_wiki.enabled);
-        app.on_menu(MenuEvent { id: app.items.browse_wiki.id.clone() });
-        assert!(app.wiki_browser.is_none());
+        assert!(!app.view().browse_faculties.enabled);
+        app.on_menu(MenuEvent { id: app.items.browse_faculties.id.clone() });
+        assert!(app.faculties_browser.is_none());
         app.quit();
-        assert!(!app.view().browse_wiki.enabled);
+        assert!(!app.view().browse_faculties.enabled);
     }
 
     #[test]
@@ -1713,7 +1713,7 @@ mod tests {
                 row("Pause sync", false, None),
                 sep(),
                 row("Integrations", true, None),
-                row("Browse Wiki…", false, None),
+                row("Browse Faculties…", false, None),
                 row("Show storage folder", false, None),
                 sep(),
                 row("Open at login", true, Some(false)),

@@ -9,12 +9,12 @@ use triblespace::core::collection::CollectionCommit;
 use triblespace::core::repo::StoreSnapshot;
 use triblespace::prelude::*;
 
-pub fn seed(bootstrap: &Bootstrap, first: Id) -> Result<Value> {
+pub fn seed(bootstrap: &Bootstrap, first: Id, full_viewer: bool) -> Result<Value> {
     let signer = triblespace::core::signing_key_file::load_existing(&bootstrap.key)?;
     let public = signer.verifying_key();
     let mut node = NodeStore::open(&bootstrap.pile, signer)?;
     let view = node.config()?;
-    let second = node.create_workspace(&view, "Design")?;
+    let second = node.create_workspace(&view, if full_viewer { "BLUE fixture · partial access" } else { "Design" })?;
     let view = node.config()?;
     let choices = [view.workspace(first)?.unwrap(), view.workspace(second)?.unwrap()];
     node.close()?;
@@ -76,6 +76,30 @@ pub fn seed(bootstrap: &Bootstrap, first: Id) -> Result<Value> {
                 &format!("= {marker} acceptance index\n#link(\"wiki:{original:x}\")[Exact old revision]\n\n#link(\"wiki:entry:{original:x}\")[Current design]\n\n#link(\"wiki:entry:{fork_root:x}\")[Both concurrent BOM tips]\n\n#link(\"files:{file:x}\")[Workspace BOM file]"),
                 &[], false,
             )?;
+            if full_viewer {
+                faculties::relations::Relations::with_storage(storage.clone()).add(
+                    faculties::relations::ProfileInput {
+                        label: "liora-gpt".into(),
+                        display_name: Some("Liora · synthetic fixture author".into()),
+                        ..Default::default()
+                    }, None, &[],
+                )?;
+                let compass = faculties::compass::Compass::with_storage(storage.clone());
+                for (title, status) in [("Inspect workspace graph", "doing"), ("Check file preview", "todo"), ("Seed synthetic content", "done")] {
+                    compass.add(&format!("{marker} {title}"), faculties::compass::AddOptions {
+                        status, persona: Some("liora-gpt"), note: Some("PUBLIC SYNTHETIC fixture only"),
+                        ..Default::default()
+                    })?;
+                }
+                let mut previous = landing;
+                for number in 1..=40 {
+                    previous = page.create(
+                        &format!("{marker} graph note {number:02}"),
+                        &format!("= {marker} graph note {number:02}\nPUBLIC SYNTHETIC graph fixture.\n#link(\"wiki:entry:{previous:x}\")[Previous note]\n#link(\"wiki:entry:{landing:x}\")[Acceptance index]"),
+                        &[], false,
+                    )?;
+                }
+            }
             Ok(json!({"workspace":format!("{:X}", choice.id), "label":choice.label,
                 "marker":marker, "file":format!("{file:x}"), "filename":"bom.txt",
                 "original":format!("{original:x}"), "changed":format!("{changed:x}"),
@@ -102,6 +126,31 @@ pub fn seed(bootstrap: &Bootstrap, first: Id) -> Result<Value> {
         drop(ui_clone);
         anyhow::ensure!(frozen.contains_blob(handle)?, "last UI clone lost frozen bytes");
         example["frozen_snapshot_after_worker_close"] = json!(true);
+        if full_viewer && index == 1 {
+            // Keep readable Wiki/Files/Compass while exact Messages READ is denied
+            // and Mail is unconfigured. Never select a readable default instead.
+            let signer = triblespace::core::signing_key_file::load_existing(&bootstrap.key)?;
+            let storage = Storage::shared_local(bootstrap.pile.clone(), Some(bootstrap.key.clone()))
+                .with_expected_signer(public);
+            let denied = storage.with_store(|store, signer, _| {
+                use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+                let other = ed25519_dalek::SigningKey::from_bytes(&[71; 32]).verifying_key();
+                Ok(store.collection("messages", CollectionPolicy::new(
+                    AdmissionPolicy::direct(other), AdmissionPolicy::direct(signer.verifying_key()),
+                ))?.handle())
+            })?;
+            storage.close()?;
+            let mut node = NodeStore::open(&bootstrap.pile, signer)?;
+            let view = node.config()?;
+            let mut partial = view.workspace(choice.id)?.unwrap();
+            partial.routes.remove(&faculties::schemas::mail::DEFAULT_SCOPE_ID);
+            partial.routes.insert(faculties::schemas::message::DEFAULT_SCOPE_ID, denied);
+            let revision = node.put_workspace(&view, &partial)?;
+            node.close()?;
+            example["workspace"] = json!(format!("{revision:X}"));
+            example["unconfigured_role"] = json!("Mail");
+            example["denied_role"] = json!("Messages");
+        }
         examples.push(example);
     }
     Ok(json!({"examples":examples,

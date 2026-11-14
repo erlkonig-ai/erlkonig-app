@@ -726,48 +726,50 @@ The adjacent native dependency repositories must be the frozen source cohort
 recorded by the validation run. See `TESTING-for-JP.md` for the remaining
 interactive checks; automated success is not a claim those checks occurred.
 
-## Wiki browser candidate
+## Faculties viewer candidate
 
-Choose **Browse Wiki…** from the crown menu, then choose a named workspace.
-Duplicate names have distinct revision suffixes; selection always binds the exact
-current workspace value. The window reuses the Faculty Wiki search, graph and
-rendered Typst cards. It shows every concurrent frontier tip, and exact revision
-links keep their original meaning. A configured Files route enables file links.
-There is no new history editor, source editor, or revision-diff interface.
+Choose **Browse Faculties…** from the crown menu, then choose a named workspace.
+Duplicate names have distinct revision suffixes; selection binds the exact
+current workspace value. The window reuses the existing Faculties notebook and
+its ordered cards, including Wiki, Compass, Messages, Files and Memory. The
+Wiki graph, search and Typst pages retain their existing layout and exact
+revision links. Expand the sections you want to inspect.
 
-This first browser shows a **local snapshot**. Choose **Refresh** to read newer
-synced content. Initial observation and explicit refresh run on its own reader
-worker; Typst layout and local body reads still run on the window thread. Missing
-local pages or files show an unavailable message. The browser does not fetch from
-peers: the resident app's existing sync/maintenance supplies local content. An
-unconfigured Files route does not fall back to a default collection. Files open
-in the system viewer via a temporary preview folder separated by content hash,
-so different files with the same name cannot overwrite one another. Missing
-optional Files metadata never prevents locally readable Wiki pages from opening.
+The viewer shows a **local snapshot**. Choose **Refresh** to read newer synced
+content. Initial observation and explicit refresh run on its reader worker;
+existing widget queries over frozen data and Typst rendering still run on the
+window thread. Each view uses its explicitly configured workspace collection.
+Missing roles are omitted, and unavailable views do not hide independent readable
+views. Ordinary collections retain their READ admission; Secrets retains its
+local delivered-envelope possession semantics. No role falls back to a default
+collection. The resident app's existing sync/maintenance supplies local content;
+the viewer does not acquire data from peers or start another service.
 
-The app launches the same executable in an early `browse-wiki` client mode. A
-bounded inherited pipe passes only its already-bound pile/key paths and public
+The app launches the same executable in an early `browse-faculties` client mode.
+A bounded inherited pipe passes its already-bound pile/key paths and public
 signer, then remains open for parent lifetime. No key bytes or MCP credential are
-sent. This mode never bootstraps storage, migrates, acquires the node-owner lock,
+sent. The client never bootstraps storage, migrates, acquires the node-owner lock,
 starts a backend/listener, or constructs a fresh identity. Config is read through
 one retained read-only native pile reader. One retained resident-only Faculty
-store serves the selected workspace; native observations, not copied Wiki rows,
-pass from its worker to the widget. Selection/refresh completion and file opening
-recheck the complete workspace value and existing signer. A transient request
-generation rejects old completions even after Refresh or choosing A → B → A.
-File actions run on the same worker against the exact clicked Files observation;
-they resolve the selector there and revalidate immediately before export. An
-already-admitted export may finish after a later selection change or window
-close; requests are never replayed automatically. Changed or removed
-bindings clear the view on the next explicit observation; the window does not
-claim continuous Config monitoring.
+store serves the selected workspace. Native frozen observations pass from its
+worker to the shared cards. Selection and refresh recheck the complete workspace
+value and existing signer. A transient request generation rejects old completions
+and resets card navigation after Refresh or choosing A → B → A.
 
-Only one browser is open per app process; its menu row is disabled while open.
-Close the window to choose **Browse Wiki…** again. Quit/parent-pipe EOF closes the
-window and its reader; the parent reaps the child. If the app's existing
-15-second final shutdown grace expires, it force-stops/reaps the child before
-exiting. That fallback does not claim a clean reader drain. Closing the window
-leaves the resident app running.
+Wiki links and Files preview actions run on the worker against the exact clicked
+Files observation. Every export gets a fresh owned preview folder. Actions check
+selection and cancellation before filesystem effects and again immediately before
+launching the system viewer. Failed or cancelled exports remove their own partial
+folder; successful previews remain available to the external viewer. Requests are
+never replayed automatically. Changed or removed bindings clear the view on the
+next explicit observation; the window does not continuously monitor Config.
+
+Only one viewer is open per app process; its menu row is disabled while open.
+Close the window to choose **Browse Faculties…** again. Quit/parent-pipe EOF closes
+the window and its reader, and the parent reaps the child. If the existing
+15-second final shutdown grace expires, the parent force-stops/reaps the child
+before exiting. That fallback does not claim a clean reader drain. Closing the
+viewer leaves the resident app running.
 
 Enabling widgets also makes the already-registered **viewer_capture** operation
 available. This is a named capability change: explicit calls still select an exact
@@ -775,7 +777,7 @@ workspace and target through the existing dispatcher, validate bounded image
 output before rendering, and return PNGs. No GUI/GPU is opened during discovery or
 startup. Capture remains synchronous; disconnect does not cancel an admitted
 call, and the app's existing shutdown grace applies. Its image-byte bounds do not
-bound all GPU allocations or total render time. No new MCP tool or schema is added.
+bound all GPU allocations or total render time. The viewer window adds no MCP tool. The pinned Faculty upgrade also brings upstream catalog changes, including Alarm; release acceptance compares tool names and schemas against the preceding app.
 
 The same early command dispatch is present in the Linux executable, and its
 common menu/status window exposes the action. macOS is the validation target; Linux has not been built or exercised in this lane. The existing

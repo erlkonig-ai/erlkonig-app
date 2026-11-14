@@ -233,24 +233,28 @@ Rust parser checks and Linux tests do not establish AppKit correctness. Local
 MCP runs on the host through Desktop; Cowork's shell VM is a separate execution
 environment. No remote Connector or public tunnel is configured by this app.
 
-## Wiki browser candidate
+## Faculties viewer candidate
 
 Use an isolated candidate and synthetic pile/key/profile, never the installed
 app or production pile for the following acceptance. The original app41 lock is
 retained separately; the candidate adds the named Lissajous/widget dependency
 closure. Source tests alone do not establish GUI acceptance.
 
-- Crown → Browse Wiki opens one window without another backend/listener. The
+- Crown → Browse Faculties opens one window without another backend/listener. The
   menu disables while open; close/reopen and app Quit leave no child process.
 - An empty configuration shows an honest empty state. Two identically named
   workspaces remain distinguishable and route to different synthetic pages.
   Nothing is selected implicitly, and no pile/key/hex-input form appears.
+- Expand Wiki, Compass, Messages, Files and Memory in the same window. Verify
+  the original card interactions and whole-graph dots. A missing or denied
+  optional route leaves other readable cards usable; missing roles never
+  select default roots. Return A → B → A and verify card navigation resets.
 - Search/open a design/BOM page, follow an exact old revision and an entry link,
   and show both tips of a concurrent fork. Files open only from that workspace's
   configured Files route. Missing text/file bytes have visible unavailable
   messages; a missing optional Files descriptor/frontier leaves Wiki usable.
-  Two different files sharing a leaf name have distinct content preview paths.
-  There is no peer acquisition from the browser.
+  Every file action has its own preview root. Replay directory R(X, privateY) in workspace A then R(X) in B and verify B cannot retain A’s privateY. Cancel after a write and verify no launch or partial export remains.
+  There is no peer acquisition from the viewer.
 - While the window holds an old observation, edit/remove its workspace. Refresh
   clears stale content, and a file click rejects the changed binding before
   exporting anything. Reselect during a slow load: its completion cannot replace

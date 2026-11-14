@@ -28,6 +28,6 @@ pub mod workspace_dispatch;
 mod workspace_grants;
 mod workspace_sharing;
 
-pub mod wiki_browser;
+pub mod faculties_browser;
 
 pub mod update_catalog;

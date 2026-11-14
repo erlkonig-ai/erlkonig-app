@@ -217,7 +217,7 @@ fn draw(ui: &mut egui::Ui, view: &View, actions: &mut Vec<Action>) {
                 control(ui, row, actions);
             }
             ui.separator();
-            control(ui, &view.browse_wiki, actions);
+            control(ui, &view.browse_faculties, actions);
             control(ui, &view.storage, actions);
             control(ui, &view.login, actions);
             ui.separator();

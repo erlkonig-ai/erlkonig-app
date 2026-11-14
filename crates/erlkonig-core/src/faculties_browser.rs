@@ -1,4 +1,4 @@
-//! Read-only configuration access for the app-launched Wiki window.
+//! Read-only configuration access for the app-launched Faculties window.
 //! No Runtime, bootstrap, descriptor publication, endpoint or maintenance owner.
 use anyhow::{Result, bail};
 use triblespace::core::collection::Collection;

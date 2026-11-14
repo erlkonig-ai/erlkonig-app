@@ -1,7 +1,9 @@
-//! Workspace choice and an independent Wiki instrument over native observations.
-use erlkonig_core::{config::NodeBinding, wiki_browser::ConfigReader, workspace::Workspace};
+//! Workspace choice and the shared Faculties viewer over native observations.
+use GORBIE::{prelude::CardCtx, state::StateId};
+use erlkonig_core::{config::NodeBinding, faculties_browser::ConfigReader, workspace::Workspace};
 use faculties::storage::Storage;
-use faculties::widgets::{SourceKey, StorageState, WikiViewer};
+use faculties::viewer::{self, FileAction, Host, Target};
+use faculties::widgets::{FilesViewer, SourceKey, StorageState, WidgetContext, WikiViewer};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -13,12 +15,10 @@ use std::time::Duration;
 struct Observation {
     generation: u64,
     ready: bool,
-    choices: Vec<Workspace>, // transient choice labels/routes, never Wiki rows
+    choices: Vec<Workspace>, // transient choice labels/routes, never faculty rows
     unavailable: usize,
     requested: Option<Workspace>,
-    wiki: Option<Arc<StorageState>>,
-    files: Option<Arc<StorageState>>,
-    files_error: Option<String>,
+    data: Option<Arc<StorageState>>,
     file_status: Option<String>,
     error: Option<String>,
     invalidated: bool,
@@ -34,13 +34,13 @@ enum Request {
         generation: u64,
         selected: Workspace,
         files: Arc<StorageState>,
-        selector: String,
+        action: FileAction,
     },
     Stop,
 }
 
 /// This source cell owns selection, its worker and immutable observations.
-/// The Wiki cell owns graph/search/open-page state independently.
+/// Each shared card owns its navigation state independently.
 struct Source {
     selected: Option<Workspace>,
     notice: Option<String>,
@@ -59,12 +59,13 @@ impl Source {
         let desired = generation.clone();
         let worker_stop = stop.clone();
         let worker = std::thread::Builder::new()
-            .name("wiki-observation".into())
+            .name("faculties-observation".into())
             .spawn(move || work(node, worker_stop, desired, receiver, shared));
         let worker = match worker {
             Ok(worker) => Some(worker),
             Err(_) => {
-                output.lock().unwrap().error = Some("Cannot start the local Wiki reader.".into());
+                output.lock().unwrap().error =
+                    Some("Cannot start the local Faculties reader.".into());
                 None
             }
         };
@@ -110,7 +111,7 @@ impl Source {
             let mut output = self.output.lock().unwrap_or_else(|e| e.into_inner());
             output.ready = true;
             output.error = Some(
-                "The Wiki reader stopped. Close this window and choose Browse Wiki again.".into(),
+                "The Faculties reader stopped. Close this window and choose Browse Faculties again.".into(),
             );
         }
     }
@@ -138,7 +139,7 @@ fn retire_owner(owner: &mut Option<(Workspace, Storage)>) -> Result<(), String> 
         // clones then contain no owner to close on their eventual drop;
         // native frozen snapshots keep their resident bytes readable.
         storage.close().map_err(|error| {
-            eprintln!("Wiki reader close failed: {error:#}");
+            eprintln!("Faculties reader close failed: {error:#}");
             "The previous workspace could not close cleanly. Close this browser and reopen it from Erlkonig.".to_owned()
         })?;
     }
@@ -184,12 +185,6 @@ fn observe(
             result.invalidated = true;
             return Err("Workspace changed; choose it again.".into());
         }
-        if !choice
-            .routes
-            .contains_key(&faculties::schemas::wiki::DEFAULT_SCOPE_ID)
-        {
-            return Err("This workspace has no Wiki collection.".into());
-        }
         // Create and retain the actual store on this worker. Nothing acquires
         // a serving endpoint or peer data; the app remains the sync owner.
         if owner.as_ref().is_none_or(|(binding, _)| binding != choice) {
@@ -202,31 +197,14 @@ fn observe(
             *owner = Some((choice.clone(), storage));
         }
         let storage = owner.as_ref().unwrap().1.clone();
-        let mut wiki = StorageState::with_storage(storage.clone(), [SourceKey::Wiki]);
-        wiki.refresh();
-        if wiki.error().is_some() {
+        let mut data = StorageState::for_workspace(storage)?;
+        data.refresh();
+        if data.error().is_some() {
             return Err(
-                "These pages are not available on this device yet. Wait for sync, then Refresh."
-                    .into(),
+                "These views are unavailable on this device. Wait for sync, then Refresh.".into(),
             );
         }
-        result.wiki = Some(Arc::new(wiki));
-        // Optional Files failure must never hide a locally readable Wiki.
-        if choice
-            .routes
-            .contains_key(&faculties::schemas::files::DEFAULT_SCOPE_ID)
-        {
-            let mut files = StorageState::with_storage(storage, [SourceKey::Files]);
-            files.refresh();
-            if files.error().is_none() {
-                result.files = Some(Arc::new(files));
-            } else {
-                result.files_error = Some(
-                    "Files are not available on this device yet. Wait for sync, then Refresh."
-                        .into(),
-                );
-            }
-        }
+        result.data = Some(Arc::new(data));
         reader.revalidate(choice).map_err(|e| {
             result.invalidated = true;
             e.to_string()
@@ -235,10 +213,28 @@ fn observe(
     })();
     if let Err(error) = read {
         result.error = Some(error);
-        result.wiki = None;
-        result.files = None;
+        result.data = None;
     }
     result
+}
+
+// Both file entry points use the same cancellation and exact-binding gate.
+fn admit_file_action(
+    stop: &AtomicBool,
+    desired: &AtomicU64,
+    generation: u64,
+    revalidate: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let cancelled =
+        || stop.load(Ordering::Acquire) || generation != desired.load(Ordering::Acquire);
+    if cancelled() {
+        return Err("The file request was cancelled.".into());
+    }
+    revalidate()?;
+    if cancelled() {
+        return Err("The file request was cancelled.".into());
+    }
+    Ok(())
 }
 
 fn work(
@@ -291,7 +287,7 @@ fn work(
                 generation,
                 selected,
                 files,
-                selector,
+                action,
             } => {
                 if generation != desired.load(Ordering::Acquire) {
                     continue;
@@ -304,29 +300,26 @@ fn work(
                     let view = sources
                         .dataset(SourceKey::Files)
                         .ok_or_else(|| "Files are unavailable in this workspace.".to_owned())?;
-                    WikiViewer::open_file_with(view, &selector, || {
-                        // This is admission, after resolving/reading exact
-                        // bytes and immediately before writing/opening them.
-                        if stop.load(Ordering::Acquire)
-                            || generation != desired.load(Ordering::Acquire)
-                        {
-                            return Err("The file request was cancelled.".into());
+                    let mut before_export = || {
+                        admit_file_action(&stop, &desired, generation, || {
+                            reader
+                                .as_mut()
+                                .ok_or_else(|| "Workspaces are unavailable.".to_owned())?
+                                .revalidate(&selected)
+                                .map_err(|e| {
+                                    binding_invalidated = true;
+                                    e.to_string()
+                                })
+                        })
+                    };
+                    match action {
+                        FileAction::WikiLink(selector) => {
+                            WikiViewer::open_file_with(view, &selector, &mut before_export)
                         }
-                        reader
-                            .as_mut()
-                            .ok_or_else(|| "Workspaces are unavailable.".to_owned())?
-                            .revalidate(&selected)
-                            .map_err(|e| {
-                                binding_invalidated = true;
-                                e.to_string()
-                            })?;
-                        if stop.load(Ordering::Acquire)
-                            || generation != desired.load(Ordering::Acquire)
-                        {
-                            return Err("The file request was cancelled.".into());
+                        FileAction::Entity(entity) => {
+                            FilesViewer::open_entity_with(view, entity, &mut before_export)
                         }
-                        Ok(())
-                    })
+                    }
                 })();
                 let mut output = output.lock().unwrap_or_else(|e| e.into_inner());
                 if !stop.load(Ordering::Acquire)
@@ -340,8 +333,7 @@ fn work(
                     if binding_invalidated {
                         output.invalidated = true;
                         output.error = output.file_status.clone();
-                        output.wiki = None;
-                        output.files = None;
+                        output.data = None;
                     }
                 }
             }
@@ -376,14 +368,64 @@ fn label(workspace: &Workspace, choices: &[Workspace]) -> String {
     }
 }
 
-#[derive(Default)]
-struct WikiCell {
-    binding: Option<Workspace>,
-    viewer: WikiViewer,
+#[derive(Clone, Copy)]
+struct WorkspaceHost(StateId<Source>);
+
+impl Host for WorkspaceHost {
+    fn with_context(
+        &self,
+        ctx: &mut CardCtx<'_>,
+        render: impl FnOnce(
+            &mut CardCtx<'_>,
+            WidgetContext<'_>,
+            u64,
+            &mut dyn FnMut(FileAction) -> Result<(), String>,
+        ),
+    ) {
+        let (selected, observed, generation, sender, output) = {
+            let source = self.0.read(ctx);
+            (
+                source.selected.clone(),
+                source.snapshot(),
+                source.generation.load(Ordering::Acquire),
+                source.sender.clone(),
+                source.output.clone(),
+            )
+        };
+        let Some(selected) = selected else {
+            return;
+        };
+        if observed.generation != generation || observed.requested.as_ref() != Some(&selected) {
+            return;
+        }
+        let Some(data) = observed.data else {
+            return;
+        };
+        let mut open = |action| {
+            if !data.loaded_context().contains(SourceKey::Files) {
+                return Err("Files are unavailable in this workspace.".into());
+            }
+            output.lock().unwrap_or_else(|e| e.into_inner()).file_status =
+                Some("Opening file…".into());
+            sender
+                .send(Request::File {
+                    generation,
+                    selected: selected.clone(),
+                    files: data.clone(),
+                    action,
+                })
+                .map_err(|_| "The file reader is unavailable.".to_owned())
+        };
+        render(ctx, data.loaded_context(), generation, &mut open);
+    }
 }
 
-pub(super) fn run(node: NodeBinding, stop: Arc<AtomicBool>, window: Arc<OnceLock<egui::Context>>) -> Result<(), String> {
-    GORBIE::NotebookConfig::new("Erlkonig · Wiki").run(move |nb| {
+pub(super) fn run(
+    node: NodeBinding,
+    stop: Arc<AtomicBool>,
+    window: Arc<OnceLock<egui::Context>>,
+) -> Result<(), String> {
+    GORBIE::NotebookConfig::new("Erlkonig · Faculties").run(move |nb| {
         let closing = stop.clone();
         let window = window.clone();
         let source = nb.state("workspace", || Source::new(node.clone(), stop.clone()), move |ctx, source| {
@@ -394,7 +436,8 @@ pub(super) fn run(node: NodeBinding, stop: Arc<AtomicBool>, window: Arc<OnceLock
                 source.select(None);
                 source.notice = observed.error.clone();
             }
-            ctx.heading("Wiki");
+            ctx.heading("Faculties");
+            ctx.set_default_section_open(false);
             ctx.label("Local snapshot · choose Refresh to see new synced content.");
             if let Some(selected) = source.selected.clone() {
                 ctx.label(format!("Workspace: {}", label(&selected, &observed.choices)));
@@ -418,34 +461,22 @@ pub(super) fn run(node: NodeBinding, stop: Arc<AtomicBool>, window: Arc<OnceLock
             if let Some(notice) = &source.notice { ctx.label(egui::RichText::new(notice).color(egui::Color32::LIGHT_RED)); }
             if observed.unavailable > 0 { ctx.label(format!("{} workspace revision(s) are unavailable.", observed.unavailable)); }
             if let Some(error) = &observed.error { ctx.label(egui::RichText::new(error).color(egui::Color32::LIGHT_RED)); }
-            if let Some(error) = &observed.files_error { ctx.label(error); }
+            if let Some(data) = &observed.data {
+                let unavailable: Vec<_> = data.unavailable_labels().collect();
+                if !unavailable.is_empty() {
+                    ctx.label(format!("Unavailable in this workspace: {}.", unavailable.join(", ")));
+                }
+                if !SourceKey::ALL.into_iter().any(|key| data.loaded_context().contains(key)) {
+                    ctx.label("No views are available in this workspace.");
+                }
+            } else if source.selected.is_some() && observed.error.is_none() {
+                ctx.label("Loading views…");
+            }
             if let Some(status) = &observed.file_status { ctx.label(status); }
             ctx.ctx().request_repaint_after(Duration::from_millis(250));
         });
-        nb.state("wiki", WikiCell::default, move |ctx, wiki| {
-            let (selected, observed, generation, sender, output) = {
-                let source = source.read(ctx);
-                (source.selected.clone(), source.snapshot(), source.generation.load(Ordering::Acquire), source.sender.clone(), source.output.clone())
-            };
-            if wiki.binding != selected { wiki.binding = selected.clone(); wiki.viewer = WikiViewer::default(); }
-            let Some(selected) = selected else { return; };
-            if observed.generation != generation || observed.requested.as_ref() != Some(&selected) { ctx.label("Loading Wiki…"); return; }
-            let Some(data) = observed.wiki else { if observed.error.is_none() { ctx.label("Loading Wiki…"); } return; };
-            let sources = data.loaded_context();
-            let Some(view) = sources.dataset(SourceKey::Wiki) else { return; };
-            let file_sources = observed.files.as_ref().map(|files| files.loaded_context());
-            let files_view = file_sources.as_ref().and_then(|sources| sources.dataset(SourceKey::Files));
-            wiki.viewer.render_with_file_action(ctx, view, files_view, |selector| {
-                let files = observed.files.clone().ok_or_else(|| observed.files_error.clone().unwrap_or_else(|| "This workspace has no Files collection.".into()))?;
-                output.lock().unwrap_or_else(|e| e.into_inner()).file_status = Some("Opening file…".into());
-                if sender.send(Request::File { generation, selected: selected.clone(), files, selector: selector.to_owned() }).is_err() {
-                    output.lock().unwrap_or_else(|e| e.into_inner()).file_status = None;
-                    return Err("The file reader is unavailable.".into());
-                }
-                Ok(())
-            });
-        });
-    }).map_err(|_| "The Wiki window could not be opened.".to_owned())
+        viewer::compose_hosted(nb, Target::Dashboard, WorkspaceHost(source));
+    }).map_err(|_| "The Faculties window could not be opened.".to_owned())
 }
 
 #[cfg(test)]
@@ -466,6 +497,35 @@ mod tests {
             receiver,
         )
     }
+    #[test]
+    fn stale_file_action_never_revalidates_or_crosses_the_export_gate() {
+        let stop = AtomicBool::new(false);
+        let desired = AtomicU64::new(3);
+        assert!(admit_file_action(&stop, &desired, 1, || panic!("stale action")).is_err());
+        stop.store(true, Ordering::Release);
+        assert!(admit_file_action(&stop, &desired, 3, || panic!("stopped action")).is_err());
+    }
+
+    #[test]
+    fn selection_or_stop_during_revalidation_cancels_export() {
+        let stop = AtomicBool::new(false);
+        let desired = AtomicU64::new(1);
+        assert!(
+            admit_file_action(&stop, &desired, 1, || {
+                desired.store(2, Ordering::Release);
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(
+            admit_file_action(&stop, &desired, 2, || {
+                stop.store(true, Ordering::Release);
+                Ok(())
+            })
+            .is_err()
+        );
+    }
+
     #[test]
     fn duplicate_labels_have_distinct_choice_text() {
         let first = Workspace::new("Design");
@@ -517,6 +577,6 @@ mod tests {
                 .unwrap()
                 .contains("reader stopped")
         );
-        assert!(source.snapshot().wiki.is_none());
+        assert!(source.snapshot().data.is_none());
     }
 }

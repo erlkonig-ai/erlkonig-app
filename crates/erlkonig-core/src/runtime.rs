@@ -769,7 +769,7 @@ fn maintenance_driver<R: StoreSnapshot>(
     targets: impl IntoIterator<Item = Target>,
 ) -> Result<Driver<R, ((), faculties::maintenance::Mappings)>> {
     Ok(Driver::new(targets, true, SuccinctBackend::Cpu)?
-        .with_attached(faculties::maintenance::mappings()))
+        .with_registered(faculties::maintenance::mappings()))
 }
 
 fn maintenance_observer<'a>(

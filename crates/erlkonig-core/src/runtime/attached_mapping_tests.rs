@@ -43,7 +43,7 @@ fn registered_archive_mapping_retargets_with_ordinary_app_targets() {
         assert!(selected.maintenance.contains(&ordinary.handle()));
         assert!(selected.maintenance.contains(&ordinary_index.handle()));
         let mut driver = maintenance_driver(selected.maintenance.into_iter().map(Target::Handle)).unwrap();
-        assert_eq!(registered_targets(&snapshot, driver.mappings()).unwrap().len(), 1);
+        assert_eq!(registered_targets(&snapshot, driver.registered()).unwrap().len(), 1);
         drop(snapshot);
         let mut events = Vec::new();
         let pass = driver.tick(&mut store, &host, &mut |event| events.push(event)).await.unwrap().unwrap();
