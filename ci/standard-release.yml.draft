@@ -1,0 +1,144 @@
+# INACTIVE: not under .github/workflows. All referenced source must first be
+# integrated into accepted public commits. No PR/main event can publish.
+name: standard-native-release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: standard-release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  inputs:
+    if: github.repository == 'erlkonig-ai/erlkonig-app'
+    runs-on: ubuntu-24.04
+    outputs:
+      mac_runner: ${{ steps.inputs.outputs.mac_runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: erlkonig-app
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require accepted immutable site implementation and signing runner
+        id: inputs
+        env:
+          SITE_COMMIT: ${{ vars.ERLKONIG_SITE_INTEGRATION_COMMIT }}
+          MAC_RUNNER: ${{ vars.ERLKONIG_RELEASE_MAC_RUNNER_JSON }}
+          MAC_SIGN_IDENTITY: ${{ vars.ERLKONIG_MAC_SIGN_IDENTITY }}
+          MAC_NOTARY_PROFILE: ${{ vars.ERLKONIG_MAC_NOTARY_PROFILE }}
+        run: |
+          python3 - <<'PY'
+          import json,os,re
+          assert re.fullmatch('[0-9a-f]{40}',os.environ['SITE_COMMIT']), 'accepted site integration commit required'
+          labels=json.loads(os.environ['MAC_RUNNER'])
+          assert isinstance(labels,list) and labels and all(isinstance(x,str) and re.fullmatch('[A-Za-z0-9_-]+',x) for x in labels)
+          assert os.environ['MAC_SIGN_IDENTITY'].startswith('Developer ID Application: ')
+          assert os.environ['MAC_NOTARY_PROFILE'].strip()
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out: out.write('mac_runner='+json.dumps(labels)+'\n')
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: erlkonig-ai/sites
+          ref: ${{ vars.ERLKONIG_SITE_INTEGRATION_COMMIT }}
+          path: site
+          persist-credentials: false
+      - name: Refuse unresolved source/version/probe inputs before native jobs
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 erlkonig-app/scripts/ci/release_inputs.py --app erlkonig-app --site site --tag "$RELEASE_TAG"
+          # Retained X11 probe adapted to current public catalog; current
+          # native execution remains an activation validation obligation.
+          test -f erlkonig-app/scripts/accept/linux_isolated_app.py
+          python3 -m unittest discover -s site/tests -q
+  native:
+    needs: inputs
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, aarch64-apple-darwin]
+    runs-on: ${{ matrix.target == 'aarch64-apple-darwin' && fromJSON(needs.inputs.outputs.mac_runner) || matrix.target == 'aarch64-unknown-linux-gnu' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 240
+    env:
+      MAC_SIGN_IDENTITY: ${{ vars.ERLKONIG_MAC_SIGN_IDENTITY }}
+      MAC_NOTARY_PROFILE: ${{ vars.ERLKONIG_MAC_NOTARY_PROFILE }}
+      RETAINED_RUST_ROOT: ${{ vars.ERLKONIG_LINUX_RUST_ROOT }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: erlkonig-app
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: erlkonig-ai/sites
+          ref: ${{ vars.ERLKONIG_SITE_INTEGRATION_COMMIT }}
+          path: site
+          persist-credentials: false
+      - name: Native tests and package from this tag checkout
+        run: bash erlkonig-app/scripts/ci/native-build.sh '${{ matrix.target }}' "$RUNNER_TEMP/build-output"
+      - name: Sign Mac and accept the final distributed bytes
+        run: bash erlkonig-app/scripts/ci/accept-release.sh "$PWD/site" '${{ matrix.target }}' "$RUNNER_TEMP/build-output" "$RUNNER_TEMP/release-packages"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.target }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: ${{ runner.temp }}/release-packages/
+      - name: Retain bounded native evidence without fixture credentials
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-evidence-${{ matrix.target }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/build-output/*.txt
+            ${{ runner.temp }}/build-output/source-inputs.json
+            ${{ runner.temp }}/release-runtime/runtime/result.json
+  publish:
+    needs: [inputs, native]
+    concurrency:
+      group: standard-release-publication
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: erlkonig-app
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: erlkonig-ai/sites
+          ref: ${{ vars.ERLKONIG_SITE_INTEGRATION_COMMIT }}
+          path: site
+          persist-credentials: false
+      - name: Download only this run and attempt's three accepted packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            gh run download "$GITHUB_RUN_ID" --repo erlkonig-ai/erlkonig-app \
+              --name "release-$target-$GITHUB_RUN_ATTEMPT" --dir "$RUNNER_TEMP/transfers/$target"
+          done
+      - name: Publish complete verified release and dispatch site source refresh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          # UNBOUND capability seam: SITE_DISPATCH_TOKEN must be supplied by the
+          # existing accepted cross-repository credential mechanism. No guessed
+          # secret name/value, auth workaround, or credentials creation here.
+          # publish_release.py refuses before draft creation while it is absent.
+        run: |
+          python3 erlkonig-app/scripts/ci/publish_release.py --app erlkonig-app --site site \
+            --transfers "$RUNNER_TEMP/transfers" --output "$RUNNER_TEMP/published" \
+            --tag "$RELEASE_TAG" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+# Signing runner must be ephemeral, trusted, ARM64, with an interactive AppKit
+# session and preprovisioned accepted identity/profile. No personal/live profile.
+# Source tests do not establish this runner or perform real signing/runtime QA.

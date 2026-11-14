@@ -1,0 +1,52 @@
+{
+  "repository": "AppImage/type2-runtime",
+  "release_id": 417724209,
+  "tag": "continuous",
+  "target_commitish": "fedfad51acc2860b2916a1eef32ba4a500ff31ef",
+  "published_at": "2026-10-19T20:37:20Z",
+  "html_url": "https://github.com/AppImage/type2-runtime/releases/tag/continuous",
+  "assets": [
+    {
+      "id": 657373827,
+      "name": "runtime-aarch64",
+      "size": 936456,
+      "digest": "sha256:9a72a744d221576c9347ec074243acc5c3c7568896b12714e0e82e9f0bf47900",
+      "browser_download_url": "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-aarch64"
+    },
+    {
+      "id": 657373880,
+      "name": "runtime-aarch64.debug",
+      "size": 1420616,
+      "digest": "sha256:429bcb842c764cab993532d8b213997cc3651f53c45df0cb20c478a6df12d6f7",
+      "browser_download_url": "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-aarch64.debug"
+    },
+    {
+      "id": 657373931,
+      "name": "runtime-aarch64.sig",
+      "size": 119,
+      "digest": "sha256:f081454c3af7fb43404949b6a08620971f4147cb05bc3ff8a91681be788f803f",
+      "browser_download_url": "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-aarch64.sig"
+    },
+    {
+      "id": 657374641,
+      "name": "runtime-x86_64",
+      "size": 944632,
+      "digest": "sha256:617aa77314d57c8b8e4fae9c3f0b35af7b30d5529cb69e98f64f92510ed98a46",
+      "browser_download_url": "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64"
+    },
+    {
+      "id": 657374685,
+      "name": "runtime-x86_64.debug",
+      "size": 1361136,
+      "digest": "sha256:193dd7abf4af95a5cb930ff9b7989524bf625049b1274ad03c702aba77326cc3",
+      "browser_download_url": "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64.debug"
+    },
+    {
+      "id": 657374763,
+      "name": "runtime-x86_64.sig",
+      "size": 119,
+      "digest": "sha256:4c38bbfd3c8fe7b43cd37483544e5aa682b5932674d89e53fcccd2d3fc3a8f12",
+      "browser_download_url": "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64.sig"
+    }
+  ]
+}

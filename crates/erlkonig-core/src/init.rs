@@ -1,0 +1,82 @@
+//! Native first-start setup. No CLI invocation or ambient pile/key selection.
+
+use crate::config::Bootstrap;
+use std::fs::{self, OpenOptions};
+use std::io;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
+use triblespace::core::signing_key_file;
+
+pub fn ensure_pile(pile: &Path, create: bool) -> Result<(), String> {
+    if create && fs::symlink_metadata(pile).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(
+            "the node pile is a symlink; the fixed application root must be a regular file".into(),
+        );
+    }
+    match fs::metadata(pile) {
+        Ok(meta) if meta.is_file() => return Ok(()),
+        Ok(_) => return Err(format!("{} is not a file", pile.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound && create => {}
+        Err(e) => return Err(format!("cannot open pile {}: {e}", pile.display())),
+    }
+    OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(pile)
+        .map_err(|e| format!("cannot create pile {}: {e}", pile.display()))?;
+    Ok(())
+}
+
+pub fn prepare(config: &Bootstrap) -> Result<ed25519_dalek::SigningKey, String> {
+    if fs::metadata(&config.pile).is_ok_and(|meta| meta.len() > 0) && !config.key.exists() {
+        return Err(
+            "existing pile has no signing key; refusing to generate a replacement identity".into(),
+        );
+    }
+    ensure_pile(&config.pile, true)?;
+    if fs::symlink_metadata(&config.key).is_err() {
+        signing_key_file::init(&config.key)
+            .map_err(|e| format!("cannot initialize signing identity: {e}"))?;
+    }
+    signing_key_file::load_existing(&config.key)
+        .map_err(|e| format!("cannot load signing identity: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn defaults_are_private_stable_and_named_paths_are_never_created() {
+        let d = tempfile::tempdir().unwrap();
+        let r = Bootstrap::new(d.path());
+        let first = prepare(&r).unwrap();
+        assert_eq!(first.to_bytes(), prepare(&r).unwrap().to_bytes());
+        let named = d.path().join("missing.pile");
+        assert!(ensure_pile(&named, false).is_err());
+        assert!(!named.exists());
+    }
+    #[test]
+    fn default_pile_never_follows_a_link() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("target");
+        let path = d.path().join("self.pile");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(ensure_pile(&path, true).is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn existing_data_never_gets_a_replacement_key() {
+        let d = tempfile::tempdir().unwrap();
+        let bootstrap = Bootstrap::new(d.path());
+        fs::write(&bootstrap.pile, b"retained existing data").unwrap();
+        assert!(prepare(&bootstrap).is_err());
+        assert!(!bootstrap.key.exists());
+        assert_eq!(
+            fs::read(&bootstrap.pile).unwrap(),
+            b"retained existing data"
+        );
+    }
+}
