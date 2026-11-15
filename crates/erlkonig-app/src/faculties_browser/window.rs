@@ -2,7 +2,8 @@
 use GORBIE::{prelude::CardCtx, state::StateId};
 use erlkonig_core::{config::NodeBinding, faculties_browser::ConfigReader, workspace::Workspace};
 use faculties::storage::Storage;
-use faculties::viewer::{self, FileAction, Host, Target};
+use faculties::compass::Compass;
+use faculties::viewer::{self, Host, HostAction, Target};
 use faculties::widgets::{FilesViewer, SourceKey, StorageState, WidgetContext, WikiViewer};
 use std::sync::{
     Arc, Mutex, OnceLock,
@@ -34,7 +35,7 @@ enum Request {
         generation: u64,
         selected: Workspace,
         files: Arc<StorageState>,
-        action: FileAction,
+        action: HostAction,
     },
     Stop,
 }
@@ -296,10 +297,8 @@ fn work(
                 // the person, not the result of a later Refresh/selection.
                 let sources = files.loaded_context();
                 let mut binding_invalidated = false;
+                let wrote = matches!(action, HostAction::Prioritize { .. });
                 let result = (|| {
-                    let view = sources
-                        .dataset(SourceKey::Files)
-                        .ok_or_else(|| "Files are unavailable in this workspace.".to_owned())?;
                     let mut before_export = || {
                         admit_file_action(&stop, &desired, generation, || {
                             reader
@@ -312,21 +311,38 @@ fn work(
                                 })
                         })
                     };
+                    let files_view = || {
+                        sources
+                            .dataset(SourceKey::Files)
+                            .ok_or_else(|| "Files are unavailable in this workspace.".to_owned())
+                    };
                     match action {
-                        FileAction::WikiLink(selector) => {
-                            WikiViewer::open_file_with(view, &selector, &mut before_export)
+                        HostAction::WikiLink(selector) => {
+                            WikiViewer::open_file_with(files_view()?, &selector, &mut before_export)
                         }
-                        FileAction::Entity(entity) => {
-                            FilesViewer::open_entity_with(view, entity, &mut before_export)
+                        HostAction::Entity(entity) => {
+                            FilesViewer::open_entity_with(files_view()?, entity, &mut before_export)
+                        }
+                        // A priority answer is an ordinary Compass write into
+                        // the same exact, revalidated workspace binding.
+                        HostAction::Prioritize { higher, lower } => {
+                            before_export()?;
+                            Compass::with_storage(files.storage().clone())
+                                .prioritize(&format!("{higher:x}"), &format!("{lower:x}"), None)
+                                .map(drop)
+                                .map_err(|e| format!("{e:#}"))
                         }
                     }
                 })();
+                let output_handle = output.clone();
                 let mut output = output.lock().unwrap_or_else(|e| e.into_inner());
                 if !stop.load(Ordering::Acquire)
                     && generation == desired.load(Ordering::Acquire)
                     && output.generation == generation
                 {
+                    let succeeded = result.is_ok();
                     output.file_status = Some(match result {
+                        Ok(()) if wrote => "Priority recorded.".into(),
                         Ok(()) => "Sent to the system viewer.".into(),
                         Err(error) => error,
                     });
@@ -334,6 +350,15 @@ fn work(
                         output.invalidated = true;
                         output.error = output.file_status.clone();
                         output.data = None;
+                    }
+                    if wrote && succeeded && !binding_invalidated {
+                        // Observe again so the next frame reads the new edge.
+                        drop(output);
+                        let result =
+                            observe(&node, &mut reader, &mut owner, generation, Some(selected));
+                        if !stop.load(Ordering::Acquire) {
+                            publish(&output_handle, &desired, result);
+                        }
                     }
                 }
             }
@@ -379,7 +404,7 @@ impl Host for WorkspaceHost {
             &mut CardCtx<'_>,
             WidgetContext<'_>,
             u64,
-            &mut dyn FnMut(FileAction) -> Result<(), String>,
+            &mut dyn FnMut(HostAction) -> Result<(), String>,
         ),
     ) {
         let (selected, observed, generation, sender, output) = {
@@ -401,12 +426,17 @@ impl Host for WorkspaceHost {
         let Some(data) = observed.data else {
             return;
         };
-        let mut open = |action| {
-            if !data.loaded_context().contains(SourceKey::Files) {
-                return Err("Files are unavailable in this workspace.".into());
-            }
-            output.lock().unwrap_or_else(|e| e.into_inner()).file_status =
-                Some("Opening file…".into());
+        let mut open = |action: HostAction| {
+            let status = match action {
+                HostAction::Prioritize { .. } => "Recording priority…",
+                HostAction::WikiLink(_) | HostAction::Entity(_) => {
+                    if !data.loaded_context().contains(SourceKey::Files) {
+                        return Err("Files are unavailable in this workspace.".into());
+                    }
+                    "Opening file…"
+                }
+            };
+            output.lock().unwrap_or_else(|e| e.into_inner()).file_status = Some(status.into());
             sender
                 .send(Request::File {
                     generation,
