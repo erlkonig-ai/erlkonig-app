@@ -358,6 +358,13 @@ fn work(
                             observe(&node, &mut reader, &mut owner, generation, Some(selected));
                         if !stop.load(Ordering::Acquire) {
                             publish(&output_handle, &desired, result);
+                            // The fresh observation starts without a status;
+                            // keep the answer's confirmation on screen.
+                            let mut output =
+                                output_handle.lock().unwrap_or_else(|e| e.into_inner());
+                            if output.generation == generation {
+                                output.file_status = Some("Priority recorded.".into());
+                            }
                         }
                     }
                 }
