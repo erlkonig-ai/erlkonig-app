@@ -127,12 +127,23 @@ pub fn seed(bootstrap: &Bootstrap, first: Id, full_viewer: bool) -> Result<Value
                     store.commit(destination, signer, fragment)?;
                     anyhow::ensure!(!store.snapshot()?.contains_blob(body_handle)?, "body must start absent");
                     let segment = bootstrap.pile.with_file_name("pending-viewer-body.pile");
-                    anyhow::ensure!(!segment.exists(), "refuse an existing delayed-body segment");
+                    // Pile opens existing files; creation belongs to its caller.
+                    // Exclusive creation also refuses an existing segment or link.
+                    std::fs::File::create_new(&segment)?;
                     let mut pending = Pile::open_as(&segment, signer.verifying_key())?;
                     pending.put::<blobencodings::UTF8String, _>(body)?;
+                    anyhow::ensure!(pending.snapshot()?.contains_blob(body_handle)?, "segment body missing");
                     pending.close()?;
+                    let mut records = triblespace::core::repo::pile::PileRecords::open(&segment)?;
+                    anyhow::ensure!(matches!(records.next().transpose()?.map(|record| record.content),
+                        Some(triblespace::core::repo::pile::PileRecordContent::Blob { hash, data_len, .. })
+                            if hash.raw == body_handle.raw && data_len == content.len()),
+                        "segment must contain the exact delayed body");
+                    anyhow::ensure!(records.next().is_none(), "segment must contain only one blob record");
+                    anyhow::ensure!(!store.snapshot()?.contains_blob(body_handle)?, "main body must remain absent");
                     Ok(json!({"revision":format!("{revision:x}"), "segment":segment,
-                        "body_handle":hex::encode(body_handle.raw), "expected_text":content}))
+                        "body_handle":hex::encode(body_handle.raw), "expected_text":content,
+                        "main_body_absent":true, "segment_only_exact_body":true}))
                 })?)
             } else { None };
             Ok(json!({"workspace":format!("{:X}", choice.id), "label":choice.label,
