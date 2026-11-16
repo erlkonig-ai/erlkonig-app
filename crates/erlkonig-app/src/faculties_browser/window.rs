@@ -1,12 +1,11 @@
 //! Workspace choice and the shared Faculties viewer over native observations.
 use GORBIE::{prelude::CardCtx, state::StateId};
-use erlkonig_core::{config::NodeBinding, faculties_browser::ConfigReader, workspace::Workspace};
-use faculties::storage::Storage;
-use faculties::compass::Compass;
+use erlkonig_core::{runtime::Runtime, faculties_browser::{ViewerNode, ViewerWorker}, workspace::Workspace};
+use faculties::widgets::storage::WorkspaceObservation;
 use faculties::viewer::{self, Host, HostAction, Target};
-use faculties::widgets::{FilesViewer, SourceKey, StorageState, WidgetContext, WikiViewer};
+use faculties::widgets::{FilesViewer, SourceKey, WidgetContext, WikiViewer};
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
@@ -19,7 +18,7 @@ struct Observation {
     choices: Vec<Workspace>, // transient choice labels/routes, never faculty rows
     unavailable: usize,
     requested: Option<Workspace>,
-    data: Option<Arc<StorageState>>,
+    data: Option<Arc<WorkspaceObservation>>,
     file_status: Option<String>,
     error: Option<String>,
     invalidated: bool,
@@ -34,13 +33,14 @@ enum Request {
     File {
         generation: u64,
         selected: Workspace,
-        files: Arc<StorageState>,
+        files: Arc<WorkspaceObservation>,
         action: HostAction,
     },
     Stop,
 }
 
-/// This source cell owns selection, its worker and immutable observations.
+/// This source cell owns selection, cancellation and immutable observations.
+/// Runtime owns the worker's join; the window retains its completion receipt.
 /// Each shared card owns its navigation state independently.
 struct Source {
     selected: Option<Workspace>,
@@ -49,19 +49,19 @@ struct Source {
     stop: Arc<AtomicBool>,
     output: Arc<Mutex<Observation>>,
     sender: mpsc::Sender<Request>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    worker: Option<ViewerWorker>,
 }
 impl Source {
-    fn new(node: NodeBinding, stop: Arc<AtomicBool>) -> Self {
+    fn new(runtime: &mut Runtime, stop: Arc<AtomicBool>) -> Self {
         let output = Arc::new(Mutex::new(Observation::default()));
         let generation = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = mpsc::channel();
         let shared = output.clone();
         let desired = generation.clone();
         let worker_stop = stop.clone();
-        let worker = std::thread::Builder::new()
-            .name("faculties-observation".into())
-            .spawn(move || work(node, worker_stop, desired, receiver, shared));
+        let worker = runtime.spawn_faculties(stop.clone(), move |node| {
+            work(node, worker_stop, desired, receiver, shared);
+        });
         let worker = match worker {
             Ok(worker) => Some(worker),
             Err(_) => {
@@ -121,9 +121,7 @@ impl Drop for Source {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         let _ = self.sender.send(Request::Stop);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        // Runtime owns the join handle and settles it before NodeStore closes.
     }
 }
 
@@ -134,88 +132,43 @@ fn publish(output: &Mutex<Observation>, desired: &AtomicU64, result: Observation
     }
 }
 
-fn retire_owner(owner: &mut Option<(Workspace, Storage)>) -> Result<(), String> {
-    if let Some((_, storage)) = owner.take() {
-        // close takes the shared Session before closing it. UI-held Storage
-        // clones then contain no owner to close on their eventual drop;
-        // native frozen snapshots keep their resident bytes readable.
-        storage.close().map_err(|error| {
-            eprintln!("Faculties reader close failed: {error:#}");
-            "The previous workspace could not close cleanly. Close this browser and reopen it from Erlkonig.".to_owned()
-        })?;
-    }
-    Ok(())
-}
-
 fn observe(
-    node: &NodeBinding,
-    reader: &mut Option<ConfigReader>,
-    owner: &mut Option<(Workspace, Storage)>,
+    node: &ViewerNode,
+    stop: &AtomicBool,
+    desired: &AtomicU64,
     generation: u64,
     selected: Option<Workspace>,
 ) -> Observation {
     let mut result = Observation {
-        generation,
-        ready: true,
-        requested: selected.clone(),
-        ..Default::default()
+        generation, ready: true, requested: selected.clone(), ..Default::default()
     };
+    let cancelled = || stop.load(Ordering::Acquire) || generation != desired.load(Ordering::Acquire);
     let read = (|| -> Result<(), String> {
-        if reader.is_none() {
-            *reader = Some(ConfigReader::open(node).map_err(|e| e.to_string())?);
-        }
-        let reader = reader.as_mut().unwrap();
-        let config = reader.config().map_err(|e| e.to_string())?;
-        for id in config
-            .workspace_ids()
-            .map_err(|_| "Workspace choices are unavailable.".to_owned())?
-        {
+        let config = node.config(cancelled).map_err(|_| "Workspaces are unavailable.".to_owned())?;
+        for id in config.workspace_ids().map_err(|_| "Workspace choices are unavailable.".to_owned())? {
             match config.workspace(id) {
                 Ok(Some(workspace)) => result.choices.push(workspace),
                 _ => result.unavailable += 1,
             }
         }
-        result
-            .choices
-            .sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
-        let Some(choice) = selected.as_ref() else {
-            retire_owner(owner)?;
-            return Ok(());
-        };
+        result.choices.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
+        let Some(choice) = selected.as_ref() else { return Ok(()); };
         if config.workspace(choice.id).ok().flatten().as_ref() != Some(choice) {
             result.invalidated = true;
             return Err("Workspace changed; choose it again.".into());
         }
-        // Create and retain the actual store on this worker. Nothing acquires
-        // a serving endpoint or peer data; the app remains the sync owner.
-        if owner.as_ref().is_none_or(|(binding, _)| binding != choice) {
-            retire_owner(owner)?;
-            let public = ed25519_dalek::VerifyingKey::from_bytes(&node.signer)
-                .map_err(|_| "Erlkonig’s local data cannot be opened.".to_owned())?;
-            let storage = Storage::shared_local(node.pile.clone(), Some(node.key.clone()))
-                .with_collections(choice.routes.clone())
-                .with_expected_signer(public);
-            *owner = Some((choice.clone(), storage));
-        }
-        let storage = owner.as_ref().unwrap().1.clone();
-        let mut data = StorageState::for_workspace(storage)?;
-        data.refresh();
-        if data.error().is_some() {
-            return Err(
-                "These views are unavailable on this device. Wait for sync, then Refresh.".into(),
-            );
-        }
-        result.data = Some(Arc::new(data));
-        reader.revalidate(choice).map_err(|e| {
+        let data = node.with_workspace(choice, cancelled, |pile, signer| {
+            pollster::block_on(WorkspaceObservation::observe(pile, signer, &choice.routes))
+                .map_err(|error| std::io::Error::other(error).into())
+        }).map_err(|_| "These views are unavailable on this device. Wait for sync, then Refresh.".to_owned())?;
+        node.revalidate(choice, cancelled).map_err(|_| {
             result.invalidated = true;
-            e.to_string()
+            "Workspace changed; choose it again.".to_owned()
         })?;
+        result.data = Some(Arc::new(data));
         Ok(())
     })();
-    if let Err(error) = read {
-        result.error = Some(error);
-        result.data = None;
-    }
+    if let Err(error) = read { result.error = Some(error); result.data = None; }
     result
 }
 
@@ -239,28 +192,26 @@ fn admit_file_action(
 }
 
 fn work(
-    node: NodeBinding,
+    node: ViewerNode,
     stop: Arc<AtomicBool>,
     desired: Arc<AtomicU64>,
     requests: mpsc::Receiver<Request>,
     output: Arc<Mutex<Observation>>,
 ) {
-    // Construct/retain the native reader and store on their actual worker.
-    let mut reader = None;
-    let mut owner = None;
+    // All storage observations and writes borrow the existing app owner.
     let mut initial = Some(Request::Observe {
         generation: 0,
         selected: None,
     });
     'work: loop {
-        if stop.load(Ordering::Acquire) {
+        if stop.load(Ordering::Acquire) || node.is_stopping() {
             break;
         }
         let request = if let Some(initial) = initial.take() {
             initial
         } else {
             loop {
-                if stop.load(Ordering::Acquire) {
+                if stop.load(Ordering::Acquire) || node.is_stopping() {
                     break 'work;
                 }
                 match requests.recv_timeout(Duration::from_millis(250)) {
@@ -279,7 +230,7 @@ fn work(
                 if generation != desired.load(Ordering::Acquire) {
                     continue;
                 }
-                let result = observe(&node, &mut reader, &mut owner, generation, selected);
+                let result = observe(&node, &stop, &desired, generation, selected);
                 if !stop.load(Ordering::Acquire) {
                     publish(&output, &desired, result);
                 }
@@ -301,10 +252,7 @@ fn work(
                 let result = (|| {
                     let mut before_export = || {
                         admit_file_action(&stop, &desired, generation, || {
-                            reader
-                                .as_mut()
-                                .ok_or_else(|| "Workspaces are unavailable.".to_owned())?
-                                .revalidate(&selected)
+                            node.revalidate(&selected, || stop.load(Ordering::Acquire) || generation != desired.load(Ordering::Acquire))
                                 .map_err(|e| {
                                     binding_invalidated = true;
                                     e.to_string()
@@ -327,10 +275,18 @@ fn work(
                         // the same exact, revalidated workspace binding.
                         HostAction::Prioritize { higher, lower } => {
                             before_export()?;
-                            Compass::with_storage(files.storage().clone())
-                                .prioritize(&format!("{higher:x}"), &format!("{lower:x}"), None)
-                                .map(drop)
-                                .map_err(|e| format!("{e:#}"))
+                            let cancelled = || stop.load(Ordering::Acquire)
+                                || node.is_stopping() || generation != desired.load(Ordering::Acquire);
+                            node.with_workspace(&selected, cancelled, |pile, signer| {
+                                let route = selected.routes.get(&faculties::schemas::compass::DEFAULT_SCOPE_ID)
+                                    .ok_or_else(|| std::io::Error::other("Compass is unavailable in this workspace."))?;
+                                pollster::block_on(faculties::compass::operations::prioritize_in(
+                                    pile, signer, *route, higher, lower, || {
+                                        if cancelled() { return Err(std::io::Error::other("The priority request was cancelled.").into()); }
+                                        Ok(())
+                                    },
+                                )).map(drop)
+                            }).map_err(|e| format!("{e:#}"))
                         }
                     }
                 })();
@@ -355,7 +311,7 @@ fn work(
                         // Observe again so the next frame reads the new edge.
                         drop(output);
                         let result =
-                            observe(&node, &mut reader, &mut owner, generation, Some(selected));
+                            observe(&node, &stop, &desired, generation, Some(selected));
                         if !stop.load(Ordering::Acquire) {
                             publish(&output_handle, &desired, result);
                             // The fresh observation starts without a status;
@@ -371,7 +327,6 @@ fn work(
             }
         }
     }
-    let _ = retire_owner(&mut owner); // Detailed failure is reported on the worker.
 }
 
 fn label(workspace: &Workspace, choices: &[Workspace]) -> String {
@@ -457,16 +412,16 @@ impl Host for WorkspaceHost {
     }
 }
 
-pub(super) fn run(
-    node: NodeBinding,
+pub(super) fn notebook(
+    runtime: &mut Runtime,
+    context: &egui::Context,
     stop: Arc<AtomicBool>,
-    window: Arc<OnceLock<egui::Context>>,
-) -> Result<(), String> {
-    GORBIE::NotebookConfig::new("Erlkonig · Faculties").run(move |nb| {
-        let closing = stop.clone();
-        let window = window.clone();
-        let source = nb.state("workspace", || Source::new(node.clone(), stop.clone()), move |ctx, source| {
-            super::attach_window(&closing, &window, ctx.ctx());
+) -> (GORBIE::Notebook, Option<ViewerWorker>) {
+    let source = Source::new(runtime, stop);
+    let worker = source.worker.clone();
+    let mut source = Some(source);
+    let notebook = GORBIE::NotebookConfig::new("Erlkonig · Faculties").without_editor().embedded(context, move |nb| {
+        let source = nb.state("workspace", || source.take().expect("source initialized once"), move |ctx, source| {
             let observed = source.snapshot();
             let current = source.generation.load(Ordering::Acquire);
             if observed.invalidated && observed.generation == current {
@@ -513,7 +468,8 @@ pub(super) fn run(
             ctx.ctx().request_repaint_after(Duration::from_millis(250));
         });
         viewer::compose_hosted(nb, Target::Dashboard, WorkspaceHost(source));
-    }).map_err(|_| "The Faculties window could not be opened.".to_owned())
+    });
+    (notebook, worker)
 }
 
 #[cfg(test)]

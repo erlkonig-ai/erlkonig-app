@@ -247,7 +247,8 @@ pub struct App<S: Shell> {
     pub shell: S,
     layout: Layout,
     runtime: Option<Runtime>,
-    faculties_browser: Option<crate::faculties_browser::BrowserChild>,
+    faculties_browser: Option<crate::faculties_browser::BrowserWindow>,
+    open_faculties: bool,
     update_notice: Option<crate::update_notice::UpdateNotice>,
     startup_task: Option<StartupTask>,
     startup_prompt: Option<StartupPrompt>,
@@ -332,6 +333,7 @@ impl<S: Shell> App<S> {
             layout,
             runtime: None,
             faculties_browser: None,
+            open_faculties: false,
             update_notice: None,
             startup_task: None,
             startup_prompt: None,
@@ -545,6 +547,15 @@ impl<S: Shell> App<S> {
         self.ask(title, sentence, &["OK"], Then::Nothing);
     }
 
+    /// Worker cleanup must never open a modal: one raised before Quit can
+    /// block a later Quit just as surely as one raised during shutdown.
+    fn viewer_failed(&mut self, error: String) {
+        let diagnostic = format!("Faculties viewer: {error}");
+        eprintln!("Erlkonig: {diagnostic}");
+        self.problem = Some(diagnostic);
+        self.next_refresh = Instant::now();
+    }
+
     /// The menu as it is right now, plus the oldest unanswered prompt.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn view(&self) -> View {
@@ -570,7 +581,27 @@ impl<S: Shell> App<S> {
     pub fn refresh(&mut self, event_loop: &ActiveEventLoop) {
         if self.tick() {
             event_loop.exit();
+            return;
         }
+        if std::mem::take(&mut self.open_faculties) && self.quitting.is_none() {
+            if let Some(runtime) = &mut self.runtime {
+                match crate::faculties_browser::BrowserWindow::open(event_loop, runtime) {
+                    Ok(window) => self.faculties_browser = Some(window),
+                    // A spawn can also reap a prior failed worker. Keep that
+                    // route passive too, rather than opening a Mac modal.
+                    Err(error) => self.viewer_failed(error),
+                }
+            }
+        }
+    }
+
+    /// Route only the Faculties window; platform status windows remain separate.
+    pub fn faculties_window_event(&mut self, id: winit::window::WindowId, event: &winit::event::WindowEvent) -> bool {
+        self.faculties_browser.as_mut().is_some_and(|window| window.on_event(id, event))
+    }
+
+    pub fn next_wake(&self) -> Instant {
+        self.faculties_browser.as_ref().map_or(self.next_refresh, |window| window.next_wake(self.next_refresh))
     }
 
     /// One refresh step; true once the event loop should exit. The native
@@ -586,6 +617,11 @@ impl<S: Shell> App<S> {
             self.quit();
         }
         self.finish_startup_task();
+        if let Some(runtime) = &mut self.runtime {
+            if let Err(error) = runtime.reap_faculties() {
+                self.viewer_failed(format!("{error:#}"));
+            }
+        }
         if self.faculties_browser.as_mut().is_some_and(|child| child.finished()) {
             self.faculties_browser = None;
         }
@@ -600,7 +636,7 @@ impl<S: Shell> App<S> {
                 eprintln!(
                     "Erlkonig: 15-second shutdown grace elapsed; terminating this application process"
                 );
-                self.faculties_browser = None; // Force-stop/reap, not a claim of reader drain.
+                // Process termination is not a claim that native work drained.
                 std::process::exit(1);
             }
             self.items.quit.label = if since.elapsed() < Duration::from_secs(5) {
@@ -734,6 +770,7 @@ impl<S: Shell> App<S> {
 
     pub fn quit(&mut self) {
         self.quitting.get_or_insert_with(Instant::now);
+        self.open_faculties = false;
         if let Some(child) = &mut self.faculties_browser { child.stop(); }
         if let Some(notice) = &self.update_notice { notice.cancel(); }
         self.shell.stop_crown(); // Invalidate display callbacks before service teardown.
@@ -799,7 +836,8 @@ impl<S: Shell> App<S> {
         let since = self.quitting.unwrap_or_else(Instant::now);
         while self.faculties_browser.as_mut().is_some_and(|child| !child.finished()) {
             if since.elapsed() >= Duration::from_secs(15) {
-                self.faculties_browser = None; // Drop kills/reaps before the final exit.
+                // Runtime still owns the worker; only process termination can
+                // abandon an uncooperative admitted native operation.
                 std::process::exit(1);
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -1320,13 +1358,8 @@ impl<S: Shell> App<S> {
                 );
             }
         } else if id == &self.items.browse_faculties.id {
-            if self.quitting.is_none() && self.faculties_browser.is_none() {
-                if let Some(runtime) = &self.runtime {
-                    match crate::faculties_browser::BrowserChild::open(runtime.binding()) {
-                        Ok(child) => self.faculties_browser = Some(child),
-                        Err(error) => self.ask("Faculties viewer unavailable", &error, &["OK"], Then::Nothing),
-                    }
-                }
+            if self.quitting.is_none() && self.faculties_browser.is_none() && self.runtime.is_some() {
+                self.open_faculties = true;
             }
         } else if id == &self.items.storage_folder.id {
             self.show_storage_folder();
@@ -1412,6 +1445,28 @@ mod tests {
     fn app(shell: Fake) -> App<Fake> {
         let dir = std::env::temp_dir().join("erlkonig-app-tests-unused");
         App::new(shell, Layout::new(dir), Arc::new(AtomicBool::new(false)))
+    }
+
+    #[test]
+    fn viewer_panic_reporting_is_passive_before_and_during_quit() {
+        for already_quitting in [false, true] {
+            // The fake records both modal alerts and nonmodal window prompts.
+            let mut app = app(Fake::default());
+            let log = app.shell.log.clone();
+            if already_quitting { app.quit(); }
+            app.viewer_failed("Faculties viewer worker panicked".into());
+            assert!(app.details().contains("Faculties viewer worker panicked"));
+            assert!(app.prompts.is_empty());
+            if !already_quitting {
+                assert!(!app.tick());
+                assert!(app.items.status_visible);
+                assert_eq!(app.items.status.label, "Attention needed");
+                app.quit();
+            }
+            assert!(app.tick(), "a worker diagnostic never waits for acknowledgement before Quit");
+            assert!(app.prompts.is_empty());
+            assert!(!log.borrow().iter().any(|line| line.starts_with("alert ") || line == "window"));
+        }
     }
 
     #[test]

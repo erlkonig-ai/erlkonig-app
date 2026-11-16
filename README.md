@@ -752,16 +752,16 @@ local delivered-envelope possession semantics. No role falls back to a default
 collection. The resident app's existing sync/maintenance supplies local content;
 the viewer does not acquire data from peers or start another service.
 
-The app launches the same executable in an early `browse-faculties` client mode.
-A bounded inherited pipe passes its already-bound pile/key paths and public
-signer, then remains open for parent lifetime. No key bytes or MCP credential are
-sent. The client never bootstraps storage, migrates, acquires the node-owner lock,
-starts a backend/listener, or constructs a fresh identity. Config is read through
-one retained read-only native pile reader. One retained resident-only Faculty
-store serves the selected workspace. Native frozen observations pass from its
-worker to the shared cards. Selection and refresh recheck the complete workspace
-value and existing signer. A transient request generation rejects old completions
-and resets card navigation after Refresh or choosing A → B → A.
+The window lives inside the app's existing main-thread event loop. It embeds the
+same GORBIE paint renderer and `compose_hosted(Target::Dashboard)` composition;
+there is no viewer child or second event loop. Its Runtime-registered worker
+borrows the already-loaded `SharedNode`/`NodeStore.pile` for Config, frozen widget
+observations and actions. It never opens a pile path or creates a Faculty Storage,
+peer, key or independent storage owner. The borrowed pile's durable signer is
+the app's signer. Selection and refresh recheck the complete workspace value.
+A transient request generation rejects old completions and resets card navigation
+after Refresh or choosing A → B → A. Native snapshots remain frozen; missing
+resident payloads require sync followed by Refresh, not a hidden viewer fetch.
 
 Wiki links and Files preview actions run on the worker against the exact clicked
 Files observation. Every export gets a fresh owned preview folder. Actions check
@@ -771,12 +771,17 @@ folder; successful previews remain available to the external viewer. Requests ar
 never replayed automatically. Changed or removed bindings clear the view on the
 next explicit observation; the window does not continuously monitor Config.
 
+Priority answers use the same factored Compass preparation, cycle checks,
+authoring and publication operation through the app's owner. READ/WRITE admission
+and a final cancellation/generation check precede publication; successful writes
+refresh the observation. Skip publishes nothing.
+
 Only one viewer is open per app process; its menu row is disabled while open.
-Close the window to choose **Browse Faculties…** again. Quit/parent-pipe EOF closes
-the window and its reader, and the parent reaps the child. If the existing
-15-second final shutdown grace expires, the parent force-stops/reaps the child
-before exiting. That fallback does not claim a clean reader drain. Closing the
-viewer leaves the resident app running.
+Close the window to cancel its worker and release the UI observations. Once the
+worker settles, **Browse Faculties…** is enabled again; the app-owned pile stays
+open. Runtime owns every worker join and joins them before closing NodeStore.
+Quit also cancels the viewer. The existing 15-second final process-termination
+fallback does not claim that an unfinished native operation drained cleanly.
 
 Enabling widgets also makes the already-registered **viewer_capture** operation
 available. This is a named capability change: explicit calls still select an exact
@@ -786,10 +791,11 @@ startup. Capture remains synchronous; disconnect does not cancel an admitted
 call, and the app's existing shutdown grace applies. Its image-byte bounds do not
 bound all GPU allocations or total render time. The viewer window adds no MCP tool. The pinned Faculty upgrade also brings upstream catalog changes, including Alarm; release acceptance compares tool names and schemas against the preceding app.
 
-The same early command dispatch is present in the Linux executable, and its
-common menu/status window exposes the action. macOS is the validation target; Linux has not been built or exercised in this lane. The existing
-Wiki file-opening command remains Mac-oriented (`open`). There is no Windows
-executable in this workspace.
+Mac and Linux route the new window through their existing application loops.
+Linux's status window remains independent. No desktop adapter is added to iOS.
+This in-process source candidate has not been compiled or exercised on either
+desktop platform; native dashboard, GPU callback, input/repaint and close/reopen
+acceptance remain required. There is no Windows executable in this workspace.
 
 ## Native command line candidate
 

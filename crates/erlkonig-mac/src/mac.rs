@@ -319,13 +319,15 @@ impl ApplicationHandler<MenuEvent> for Mac {
         self.0.refresh(event_loop);
     }
     fn resumed(&mut self, _: &ActiveEventLoop) {}
-    fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+    fn window_event(&mut self, _: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        self.0.faculties_window_event(id, &event);
+    }
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: MenuEvent) {
         self.0.on_menu(event);
         self.0.refresh(event_loop);
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.0.next_refresh));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.0.next_wake()));
     }
     fn exiting(&mut self, _: &ActiveEventLoop) {
         self.0.finish_termination();

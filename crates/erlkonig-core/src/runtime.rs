@@ -49,6 +49,7 @@ pub struct Runtime {
     protected_access: crate::protected_access::ProtectedAccessBridge,
     local_import: crate::local_import::LocalImport,
     workers: Vec<JoinHandle<Result<()>>>,
+    viewer_workers: Vec<JoinHandle<Result<()>>>,
     lock: Option<File>,
     startup_notice: Option<String>,
 }
@@ -192,6 +193,7 @@ impl Runtime {
             protected_access: crate::protected_access::ProtectedAccessBridge::default(),
             local_import: crate::local_import::LocalImport::default(),
             workers: Vec::new(),
+            viewer_workers: Vec::new(),
             lock: Some(lock),
             startup_notice: control.notice(),
         };
@@ -276,6 +278,52 @@ impl Runtime {
         &self.binding
     }
 
+    /// Register a viewer worker in the existing service lifetime. Even when
+    /// its window closes, finish joins it before taking/closing NodeStore.
+    pub fn spawn_faculties(
+        &mut self,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        work: impl FnOnce(crate::faculties_browser::ViewerNode) + Send + 'static,
+    ) -> Result<crate::faculties_browser::ViewerWorker> {
+        if *self.stop.borrow() { bail!("application is shutting down"); }
+        self.reap_faculties()?;
+        let node = crate::faculties_browser::ViewerNode {
+            node: self.node.clone(), shutdown: self.stop.subscribe(),
+        };
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completion = done.clone();
+        let worker = std::thread::Builder::new().name("faculties-observation".into()).spawn(move || {
+            struct Completed(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Completed {
+                fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Release); }
+            }
+            let _completed = Completed(completion);
+            work(node);
+            Ok(())
+        })?;
+        self.viewer_workers.push(worker);
+        Ok(crate::faculties_browser::ViewerWorker { stop, done })
+    }
+
+    /// Called by the normal app tick, including after a window closes. Only
+    /// finished handles are joined here; running workers remain Runtime-owned.
+    pub fn reap_faculties(&mut self) -> Result<()> {
+        let mut failures = Vec::new();
+        let mut index = 0;
+        while index < self.viewer_workers.len() {
+            if !self.viewer_workers[index].is_finished() {
+                index += 1;
+                continue;
+            }
+            match self.viewer_workers.swap_remove(index).join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(format!("{error:#}")),
+                Err(_) => failures.push("Faculties viewer worker panicked".into()),
+            }
+        }
+        if failures.is_empty() { Ok(()) } else { bail!(failures.join("; ")) }
+    }
+
     pub fn put_settings(&self, expected: &ConfigView, value: &NodeSettings) -> Result<()> {
         if *self.stop.borrow() {
             bail!("application is shutting down");
@@ -349,13 +397,13 @@ impl Runtime {
         self.protected_access.take_prompt()
     }
     pub fn is_finished(&self) -> bool {
-        self.workers.iter().all(JoinHandle::is_finished)
+        self.workers.iter().chain(&self.viewer_workers).all(JoinHandle::is_finished)
     }
 
     pub fn finish(&mut self) -> Result<()> {
         self.begin_shutdown();
         let mut failures = Vec::new();
-        for worker in self.workers.drain(..) {
+        for worker in self.workers.drain(..).chain(self.viewer_workers.drain(..)) {
             match worker.join() {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => failures.push(format!("{e:#}")),
@@ -1491,6 +1539,110 @@ mod tests {
         next.put_settings(&view, &settings).unwrap();
         wait_for(&next, |s| s.node.services == ServiceState::Running);
         next.finish().unwrap();
+    }
+
+    #[test]
+    fn repeated_viewer_close_reaps_handles_without_closing_the_shared_owner() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let bootstrap = crate::config::Bootstrap::new(directory.path());
+        let signer = init::prepare(&bootstrap).unwrap();
+        let binding = NodeBinding {
+            pile: bootstrap.pile.clone(), key: bootstrap.key.clone(),
+            signer: signer.verifying_key().to_bytes(),
+        };
+        let node = Arc::new(Mutex::new(Some(NodeStore::open(&bootstrap.pile, signer).unwrap())));
+        let status = Arc::new(Mutex::new(Status::default()));
+        let (stop, _) = watch::channel(false);
+        let (services, _retries) = ServiceControl::new(status.clone(), stop.clone());
+        // No endpoint/controller, credentials or device: one synthetic owner.
+        let mut runtime = Runtime {
+            binding, status, activity: ActiveWork::default(), node: node.clone(), stop, services,
+            secret_entry: crate::secret_entry::SecretEntry::default(),
+            protected_access: crate::protected_access::ProtectedAccessBridge::default(),
+            local_import: crate::local_import::LocalImport::default(),
+            workers: Vec::new(), viewer_workers: Vec::new(), lock: None, startup_notice: None,
+        };
+        for _ in 0..32 {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let worker_cancelled = cancelled.clone();
+            let owner = node.clone();
+            let (started, ready) = mpsc::channel();
+            let (release, wait) = mpsc::channel();
+            let worker = runtime.spawn_faculties(cancelled.clone(), move |viewer| {
+                assert!(Arc::ptr_eq(&owner, &viewer.node));
+                started.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(worker_cancelled.load(Ordering::Acquire));
+                assert!(viewer.node.lock().unwrap().is_some());
+            }).unwrap();
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            runtime.reap_faculties().unwrap();
+            assert_eq!(runtime.viewer_workers.len(), 1, "running handle stays owned");
+            assert!(!runtime.is_finished());
+            worker.stop();
+            release.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !runtime.viewer_workers[0].is_finished() {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            runtime.reap_faculties().unwrap();
+            assert!(runtime.viewer_workers.is_empty(), "no handle accumulation across close/reopen");
+            assert!(worker.is_finished());
+            assert!(runtime.is_finished());
+            assert!(node.lock().unwrap().as_mut().unwrap().config().is_ok());
+        }
+        for shutting_down in [false, true] {
+            let worker = runtime.spawn_faculties(Arc::new(AtomicBool::new(false)), |_| {
+                panic!("synthetic viewer failure");
+            }).unwrap();
+            if shutting_down { runtime.begin_shutdown(); }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !runtime.viewer_workers[0].is_finished() {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            let error = runtime.reap_faculties().unwrap_err();
+            assert!(error.to_string().contains("Faculties viewer worker panicked"));
+            assert!(runtime.viewer_workers.is_empty());
+            assert!(worker.is_finished());
+            assert!(node.lock().unwrap().is_some(), "panic reaping does not close the owner");
+        }
+        runtime.finish().unwrap();
+        assert!(node.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn viewer_worker_is_joined_before_the_shared_node_closes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let layout = Layout::new(directory.path().join("data"));
+        std::fs::create_dir(&layout.dir).unwrap();
+        let signer = init::prepare(&layout.bootstrap()).unwrap();
+        let mut node = NodeStore::open(&layout.default_pile(), signer).unwrap();
+        let view = node.config().unwrap();
+        node.put_settings(&view, &NodeSettings {
+            mcp_port: 0, sync_enabled: false, maintenance_enabled: false,
+        }).unwrap();
+        node.close().unwrap();
+        let mut runtime = Runtime::start_with_guard(&layout, Arc::new(|| Ok(()))).unwrap();
+        let owner = runtime.node.clone();
+        let settled = Arc::new(AtomicBool::new(false));
+        let marker = settled.clone();
+        let (started, ready) = mpsc::channel();
+        let worker = runtime.spawn_faculties(Arc::new(AtomicBool::new(false)), move |viewer| {
+            assert!(Arc::ptr_eq(&owner, &viewer.node));
+            started.send(()).unwrap();
+            while !viewer.is_stopping() { std::thread::park_timeout(Duration::from_millis(5)); }
+            assert!(viewer.node.lock().unwrap().is_some(), "the worker settles before node close");
+            marker.store(true, Ordering::Release);
+        }).unwrap();
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        runtime.finish().unwrap();
+        assert!(settled.load(Ordering::Acquire));
+        assert!(worker.is_finished());
+        assert!(runtime.node.lock().unwrap().is_none());
     }
 
     #[test]

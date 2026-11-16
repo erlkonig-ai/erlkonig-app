@@ -229,6 +229,7 @@ impl ApplicationHandler<UserEvent> for Linux {
     fn resumed(&mut self, _: &ActiveEventLoop) {}
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if self.app.faculties_window_event(id, &event) { return; }
         let Some(window) = &mut self.window else {
             return;
         };
@@ -281,7 +282,7 @@ impl ApplicationHandler<UserEvent> for Linux {
         if let Some(window) = &mut self.window {
             window.set_view(self.app.view());
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.app.next_refresh));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.app.next_wake()));
     }
 
     fn exiting(&mut self, _: &ActiveEventLoop) {

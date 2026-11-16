@@ -16,6 +16,9 @@ erlkonig-core.workspace = true
 faculties = { workspace = true, features = ["widgets"] }
 GORBIE = { package = "lissajous", path = "../../../GORBIE", default-features = false }
 egui.workspace = true
+egui-winit.workspace = true
+egui-wgpu.workspace = true
+pollster.workspace = true
 serde_json.workspace = true
 libc.workspace = true
 ed25519-dalek.workspace = true

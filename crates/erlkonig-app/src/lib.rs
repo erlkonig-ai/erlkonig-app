@@ -16,7 +16,6 @@ pub mod faculties_browser;
 /// The command-line verbs: the node CLI and the `mcp-stdio` transport. Each
 /// binary calls this whenever it is started with arguments, before any shell.
 pub fn transport_command(args: &[std::ffi::OsString]) -> Result<(), String> {
-    if faculties_browser::run(args)? { return Ok(()); }
     if erlkonig_core::node_cli::run(args).map_err(|error| format!("{error:#}"))? {
         return Ok(());
     }
