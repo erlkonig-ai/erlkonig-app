@@ -50,6 +50,7 @@ pub struct Runtime {
     local_import: crate::local_import::LocalImport,
     workers: Vec<JoinHandle<Result<()>>>,
     viewer_workers: Vec<JoinHandle<Result<()>>>,
+    viewer_interests: crate::faculties_browser::ViewerInterests,
     lock: Option<File>,
     startup_notice: Option<String>,
 }
@@ -194,6 +195,7 @@ impl Runtime {
             local_import: crate::local_import::LocalImport::default(),
             workers: Vec::new(),
             viewer_workers: Vec::new(),
+            viewer_interests: Default::default(),
             lock: Some(lock),
             startup_notice: control.notice(),
         };
@@ -233,6 +235,7 @@ impl Runtime {
         let activity = app.activity.clone();
         let node = app.node.clone();
         let control_stop = app.stop.subscribe();
+        let viewer_interests = app.viewer_interests.clone();
         let binding = app.binding.clone();
         let identity_lock = std::env::temp_dir().join(format!(
             "erlkonig-endpoint-{}.lock",
@@ -254,6 +257,7 @@ impl Runtime {
                         retries,
                         guard,
                         fd_diagnostics,
+                        viewer_interests,
                     );
                     if let Err(error) = &result {
                         update(&state, |s| {
@@ -289,6 +293,7 @@ impl Runtime {
         self.reap_faculties()?;
         let node = crate::faculties_browser::ViewerNode {
             node: self.node.clone(), shutdown: self.stop.subscribe(),
+            interests: self.viewer_interests.clone(),
         };
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let completion = done.clone();
@@ -565,6 +570,7 @@ fn controller(
     retries: mpsc::Receiver<()>,
     guard: ResourceCheck,
     fd_diagnostics: Arc<Diagnostics>,
+    viewer_interests: crate::faculties_browser::ViewerInterests,
 ) -> Result<()> {
     let (reports, receiver) = mpsc::channel();
     let mut last_fd_sample = Instant::now() - Duration::from_secs(1);
@@ -597,7 +603,16 @@ fn controller(
         }
         let mut start = false;
         match with_node(&node, |node| {
-            node.poll_config()?.map(|view| {
+            let config = node.poll_config();
+            let interest = viewer_interests.lock().unwrap_or_else(|e| e.into_inner())
+                .as_ref().and_then(std::sync::Weak::upgrade);
+            if let Some(interest) = interest {
+                // Reuse the existing owner refresh cycle. Native snapshots
+                // compare indexed roots; no second store or history rescan.
+                let snapshot = node.pile.snapshot();
+                interest.check(snapshot.as_ref().ok(), config.is_err() || snapshot.is_err());
+            }
+            config?.map(|view| {
                 let settings = view.settings()?;
                 node.initialize_workspace_sync()?;
                 Ok(settings)

@@ -1,6 +1,6 @@
 //! Workspace choice and the shared Faculties viewer over native observations.
 use GORBIE::{prelude::CardCtx, state::StateId};
-use erlkonig_core::{runtime::Runtime, faculties_browser::{ViewerNode, ViewerWorker}, workspace::Workspace};
+use erlkonig_core::{runtime::Runtime, faculties_browser::{ViewerInterest, ViewerNode, ViewerWorker}, workspace::Workspace};
 use faculties::widgets::storage::WorkspaceObservation;
 use faculties::viewer::{self, Host, HostAction, Target};
 use faculties::widgets::{FilesViewer, SourceKey, WidgetContext, WikiViewer};
@@ -22,6 +22,7 @@ struct Observation {
     file_status: Option<String>,
     error: Option<String>,
     invalidated: bool,
+    replacement: Option<Workspace>,
 }
 
 // Request generations identify transient UI intent, not pile identities.
@@ -36,6 +37,7 @@ enum Request {
         files: Arc<WorkspaceObservation>,
         action: HostAction,
     },
+    Changed { generation: u64, observation: u64 },
     Stop,
 }
 
@@ -52,15 +54,17 @@ struct Source {
     worker: Option<ViewerWorker>,
 }
 impl Source {
-    fn new(runtime: &mut Runtime, stop: Arc<AtomicBool>) -> Self {
+    fn new(runtime: &mut Runtime, context: &egui::Context, stop: Arc<AtomicBool>) -> Self {
         let output = Arc::new(Mutex::new(Observation::default()));
         let generation = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = mpsc::channel();
         let shared = output.clone();
         let desired = generation.clone();
         let worker_stop = stop.clone();
+        let notifications = sender.clone();
+        let repaint = context.clone();
         let worker = runtime.spawn_faculties(stop.clone(), move |node| {
-            work(node, worker_stop, desired, receiver, shared);
+            work(node, worker_stop, desired, receiver, notifications, shared, repaint);
         });
         let worker = match worker {
             Ok(worker) => Some(worker),
@@ -86,6 +90,24 @@ impl Source {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+    fn reconcile(&mut self, observed: &Observation) {
+        if observed.generation != self.generation.load(Ordering::Acquire) { return; }
+        if observed.invalidated {
+            if let Some(next) = &observed.replacement {
+                // The same opaque workspace now has a different binding. Keep
+                // its selection, but cancel actions against the previous one.
+                self.select(Some(next.clone()));
+            }
+            // A removed/unreadable choice stays selected and unavailable. Never
+            // choose another workspace just because it occupies the old row.
+            self.notice = observed.error.clone();
+        } else if let (Some(selected), Some(current)) = (&self.selected, &observed.requested) {
+            if selected.id == current.id && selected.anchor == current.anchor && selected.routes == current.routes {
+                self.selected = Some(current.clone()); // Label-only update keeps navigation.
+            }
+        }
+    }
+
     fn select(&mut self, workspace: Option<Workspace>) {
         self.selected = workspace.clone();
         self.notice = None;
@@ -138,13 +160,22 @@ fn observe(
     desired: &AtomicU64,
     generation: u64,
     selected: Option<Workspace>,
+    interest: &ViewerInterest,
+    serial: u64,
 ) -> Observation {
     let mut result = Observation {
         generation, ready: true, requested: selected.clone(), ..Default::default()
     };
     let cancelled = || stop.load(Ordering::Acquire) || generation != desired.load(Ordering::Acquire);
+    // Keep this baseline fixed, including across unrelated appends. Readers
+    // add interests later while rendering. Advancing it on an idle comparison
+    // would lose a blob that arrived before its first lazy read.
+    let baseline = node.snapshot(cancelled).ok();
+    let tracker = Arc::new(Mutex::new(Default::default()));
+    let mut config_view = None;
     let read = (|| -> Result<(), String> {
         let config = node.config(cancelled).map_err(|_| "Workspaces are unavailable.".to_owned())?;
+        config_view = Some(config.clone());
         for id in config.workspace_ids().map_err(|_| "Workspace choices are unavailable.".to_owned())? {
             match config.workspace(id) {
                 Ok(Some(workspace)) => result.choices.push(workspace),
@@ -153,22 +184,35 @@ fn observe(
         }
         result.choices.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
         let Some(choice) = selected.as_ref() else { return Ok(()); };
-        if config.workspace(choice.id).ok().flatten().as_ref() != Some(choice) {
+        let current = config.workspace(choice.id).ok().flatten();
+        let Some(current) = current else {
             result.invalidated = true;
-            return Err("Workspace changed; choose it again.".into());
+            return Err("The selected workspace is unavailable.".into());
+        };
+        if current.anchor != choice.anchor || current.routes != choice.routes {
+            result.invalidated = true;
+            result.replacement = Some(current);
+            return Err("Workspace binding changed; updating its views.".into());
         }
+        result.requested = Some(current.clone());
+        let choice = &current;
         let data = node.with_workspace(choice, cancelled, |pile, signer| {
-            pollster::block_on(WorkspaceObservation::observe(pile, signer, &choice.routes))
+            pollster::block_on(WorkspaceObservation::observe_tracked(pile, signer, &choice.routes, tracker.clone()))
                 .map_err(|error| std::io::Error::other(error).into())
-        }).map_err(|_| "These views are unavailable on this device. Wait for sync, then Refresh.".to_owned())?;
+        }).map_err(|_| "These views are unavailable on this device. Waiting for local data.".to_owned())?;
         node.revalidate(choice, cancelled).map_err(|_| {
             result.invalidated = true;
             "Workspace changed; choose it again.".to_owned()
         })?;
-        result.data = Some(Arc::new(data));
+        result.data = Some(Arc::new(data.with_presentation_revision(serial)));
         Ok(())
     })();
     if let Err(error) = read { result.error = Some(error); result.data = None; }
+    if !cancelled() {
+        if node.arm(interest, generation, serial, baseline, config_view, tracker, cancelled).is_err() && !cancelled() {
+            result.error = Some("Live updates are unavailable. Close this window and choose Browse Faculties again.".into());
+        }
+    }
     result
 }
 
@@ -196,8 +240,21 @@ fn work(
     stop: Arc<AtomicBool>,
     desired: Arc<AtomicU64>,
     requests: mpsc::Receiver<Request>,
+    notifications: mpsc::Sender<Request>,
     output: Arc<Mutex<Observation>>,
+    repaint: egui::Context,
 ) {
+    let interest = match node.watch(stop.clone(), move |generation, observation| {
+        let _ = notifications.send(Request::Changed { generation, observation });
+    }) {
+        Ok(interest) => interest,
+        Err(_) => {
+            output.lock().unwrap_or_else(|e| e.into_inner()).error = Some("The local viewer is unavailable.".into());
+            repaint.request_repaint();
+            return;
+        }
+    };
+    let mut serial = 0u64;
     // All storage observations and writes borrow the existing app owner.
     let mut initial = Some(Request::Observe {
         generation: 0,
@@ -221,8 +278,17 @@ fn work(
                 }
             }
         };
+        let request = match request {
+            Request::Changed { generation, observation } => {
+                if generation != desired.load(Ordering::Acquire) || observation != serial { continue; }
+                let selected = output.lock().unwrap_or_else(|e| e.into_inner()).requested.clone();
+                Request::Observe { generation, selected }
+            }
+            request => request,
+        };
         match request {
             Request::Stop => break,
+            Request::Changed { .. } => unreachable!(),
             Request::Observe {
                 generation,
                 selected,
@@ -230,7 +296,8 @@ fn work(
                 if generation != desired.load(Ordering::Acquire) {
                     continue;
                 }
-                let result = observe(&node, &stop, &desired, generation, selected);
+                serial = serial.wrapping_add(1);
+                let result = observe(&node, &stop, &desired, generation, selected, &interest, serial);
                 if !stop.load(Ordering::Acquire) {
                     publish(&output, &desired, result);
                 }
@@ -310,8 +377,8 @@ fn work(
                     if wrote && succeeded && !binding_invalidated {
                         // Observe again so the next frame reads the new edge.
                         drop(output);
-                        let result =
-                            observe(&node, &stop, &desired, generation, Some(selected));
+                        serial = serial.wrapping_add(1);
+                        let result = observe(&node, &stop, &desired, generation, Some(selected), &interest, serial);
                         if !stop.load(Ordering::Acquire) {
                             publish(&output_handle, &desired, result);
                             // The fresh observation starts without a status;
@@ -326,6 +393,8 @@ fn work(
                 }
             }
         }
+        // Outside every owner borrow: the existing egui callback wakes winit.
+        if !stop.load(Ordering::Acquire) { repaint.request_repaint(); }
     }
 }
 
@@ -417,38 +486,34 @@ pub(super) fn notebook(
     context: &egui::Context,
     stop: Arc<AtomicBool>,
 ) -> (GORBIE::Notebook, Option<ViewerWorker>) {
-    let source = Source::new(runtime, stop);
+    let source = Source::new(runtime, context, stop);
     let worker = source.worker.clone();
     let mut source = Some(source);
     let notebook = GORBIE::NotebookConfig::new("Erlkonig · Faculties").without_editor().embedded(context, move |nb| {
         let source = nb.state("workspace", || source.take().expect("source initialized once"), move |ctx, source| {
             let observed = source.snapshot();
-            let current = source.generation.load(Ordering::Acquire);
-            if observed.invalidated && observed.generation == current {
-                source.select(None);
-                source.notice = observed.error.clone();
-            }
+            source.reconcile(&observed);
             ctx.heading("Faculties");
             ctx.set_default_section_open(false);
-            ctx.label("Local snapshot · choose Refresh to see new synced content.");
-            if let Some(selected) = source.selected.clone() {
-                ctx.label(format!("Workspace: {}", label(&selected, &observed.choices)));
-                ctx.horizontal(|ctx| {
-                    if ctx.button("Choose workspace").clicked() { source.select(None); }
-                    if ctx.button("Refresh").clicked() { source.select(source.selected.clone()); }
-                });
-            } else {
-                ctx.horizontal(|ctx| {
-                    ctx.label("Choose a workspace");
-                    if ctx.button("Refresh").clicked() { source.select(None); }
-                });
-                if !observed.ready { ctx.label("Loading workspaces…"); }
-                else if observed.choices.is_empty() && observed.error.is_none() {
-                    ctx.label("No workspaces are available. Create or enroll one through Erlkonig's connected tools.");
-                }
-                for workspace in &observed.choices {
-                    if ctx.button(label(workspace, &observed.choices)).clicked() { source.select(Some(workspace.clone())); }
-                }
+            ctx.label("Local views update as data arrives.");
+            ctx.horizontal(|ctx| {
+                let title = source.selected.as_ref().map(|workspace| label(workspace, &observed.choices))
+                    .unwrap_or_else(|| "Choose a workspace".into());
+                egui::ComboBox::from_id_salt("faculties-workspace")
+                    .selected_text(title)
+                    .show_ui(ctx, |ui| {
+                        for workspace in &observed.choices {
+                            let selected = source.selected.as_ref().is_some_and(|old| old.id == workspace.id);
+                            if ui.selectable_label(selected, label(workspace, &observed.choices)).clicked() {
+                                if source.selected.as_ref() != Some(workspace) { source.select(Some(workspace.clone())); }
+                            }
+                        }
+                    });
+                if ctx.button("Refresh").clicked() { source.select(source.selected.clone()); }
+            });
+            if !observed.ready { ctx.label("Loading workspaces…"); }
+            else if observed.choices.is_empty() && observed.error.is_none() {
+                ctx.label("No workspaces are available. Create or enroll one through Erlkonig's connected tools.");
             }
             if let Some(notice) = &source.notice { ctx.label(egui::RichText::new(notice).color(egui::Color32::LIGHT_RED)); }
             if observed.unavailable > 0 { ctx.label(format!("{} workspace revision(s) are unavailable.", observed.unavailable)); }
@@ -465,7 +530,6 @@ pub(super) fn notebook(
                 ctx.label("Loading views…");
             }
             if let Some(status) = &observed.file_status { ctx.label(status); }
-            ctx.ctx().request_repaint_after(Duration::from_millis(250));
         });
         viewer::compose_hosted(nb, Target::Dashboard, WorkspaceHost(source));
     });
@@ -490,6 +554,44 @@ mod tests {
             receiver,
         )
     }
+    #[test]
+    fn automatic_refresh_and_label_changes_preserve_selection_generation() {
+        let (mut source, _requests) = source();
+        let mut selected = Workspace::new("Before");
+        source.select(Some(selected.clone()));
+        let generation = source.generation.load(Ordering::Acquire);
+        selected.label = "After".into();
+        let observed = Observation { generation, ready: true, requested: Some(selected.clone()),
+            choices: vec![selected.clone(), Workspace::new("New choice")], ..Default::default() };
+        publish(&source.output, &source.generation, observed.clone());
+        source.reconcile(&observed);
+        assert_eq!(source.selected, Some(selected));
+        assert_eq!(source.generation.load(Ordering::Acquire), generation);
+        assert_eq!(source.snapshot().choices.len(), 2);
+    }
+
+    #[test]
+    fn removed_choice_does_not_fall_back_and_changed_binding_cancels_old_actions() {
+        let (mut source, _requests) = source();
+        let selected = Workspace::new("Selected");
+        source.select(Some(selected.clone()));
+        let generation = source.generation.load(Ordering::Acquire);
+        let mut observed = Observation { generation, ready: true, requested: Some(selected.clone()),
+            choices: vec![Workspace::new("Other")], invalidated: true,
+            error: Some("Unavailable".into()), ..Default::default() };
+        source.reconcile(&observed);
+        assert_eq!(source.selected, Some(selected.clone()));
+        assert_eq!(source.generation.load(Ordering::Acquire), generation);
+        let mut replacement = selected.clone();
+        replacement.anchor = Workspace::new("Different binding").anchor;
+        observed.replacement = Some(replacement.clone());
+        source.reconcile(&observed);
+        assert_eq!(source.selected, Some(replacement));
+        assert_eq!(source.generation.load(Ordering::Acquire), generation + 1);
+        source.reconcile(&observed); // Stale replacement cannot apply twice.
+        assert_eq!(source.generation.load(Ordering::Acquire), generation + 1);
+    }
+
     #[test]
     fn stale_file_action_never_revalidates_or_crosses_the_export_gate() {
         let stop = AtomicBool::new(false);
