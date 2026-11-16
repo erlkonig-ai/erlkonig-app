@@ -110,7 +110,12 @@ impl BrowserWindow {
             WindowEvent::RedrawRequested => ui.paint(),
             _ => false,
         };
-        if !close && ui.state.on_window_event(&ui.window, event).repaint { ui.window.request_redraw(); }
+        // A completed redraw is not fresh input. egui-winit marks it as
+        // repainting, which would otherwise schedule another frame forever.
+        if !close && !matches!(event, WindowEvent::RedrawRequested)
+            && ui.state.on_window_event(&ui.window, event).repaint {
+            ui.window.request_redraw();
+        }
         if close { self.stop(); }
         true
     }
