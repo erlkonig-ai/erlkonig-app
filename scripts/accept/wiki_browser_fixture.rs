@@ -6,7 +6,7 @@ use hifitime::Epoch;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use triblespace::core::collection::CollectionCommit;
-use triblespace::core::repo::StoreSnapshot;
+use triblespace::core::repo::{BlobStorePut, SnapshotSource, StoreSnapshot, pile::Pile};
 use triblespace::prelude::*;
 
 pub fn seed(bootstrap: &Bootstrap, first: Id, full_viewer: bool) -> Result<Value> {
@@ -100,11 +100,46 @@ pub fn seed(bootstrap: &Bootstrap, first: Id, full_viewer: bool) -> Result<Value
                     )?;
                 }
             }
+            // One exact body arrives later with no accompanying relation edit.
+            // This is acceptance-only data; the running app keeps its one owner.
+            let missing_body = if full_viewer && index == 0 {
+                Some(storage.with_store(|store, signer, runtime| {
+                    let destination = storage.open_collection_write(
+                        store, faculties::schemas::wiki::DEFAULT_SCOPE_ID,
+                        signer.verifying_key(), runtime,
+                    )?;
+                    let (mut fragment, author) = wiki::author_record(&signer.verifying_key());
+                    let instant = Epoch::from_tai_seconds(2.0);
+                    let authored_at = (instant, instant).try_to_inline()
+                        .map_err(|_| anyhow::anyhow!("synthetic timestamp encoding"))?;
+                    let content = "= AMBER arrived body\nPUBLIC SYNTHETIC payload arrived without Refresh.";
+                    let body: Blob<blobencodings::UTF8String> = content.to_blob();
+                    let body_handle = body.get_handle();
+                    let (native, revision) = wiki::revision_record(RevisionDraft {
+                        title: "AMBER delayed payload".into(), content: content.into(),
+                        predecessors: BTreeSet::new(), tags: BTreeSet::new(), author, authored_at,
+                    })?;
+                    let (_, facts, metafacts, mut blobs) = native.into_parts();
+                    let retained = blobs.snapshot()?.iter()
+                        .filter(|(handle, _)| handle.raw != body_handle.raw)
+                        .collect();
+                    fragment += Fragment::rooted_from_parts(revision, facts, metafacts, retained);
+                    store.commit(destination, signer, fragment)?;
+                    anyhow::ensure!(!store.snapshot()?.contains_blob(body_handle)?, "body must start absent");
+                    let segment = bootstrap.pile.with_file_name("pending-viewer-body.pile");
+                    anyhow::ensure!(!segment.exists(), "refuse an existing delayed-body segment");
+                    let mut pending = Pile::open_as(&segment, signer.verifying_key())?;
+                    pending.put(body)?;
+                    pending.close()?;
+                    Ok(json!({"revision":format!("{revision:x}"), "segment":segment,
+                        "body_handle":hex::encode(body_handle.raw), "expected_text":content}))
+                })?)
+            } else { None };
             Ok(json!({"workspace":format!("{:X}", choice.id), "label":choice.label,
                 "marker":marker, "file":format!("{file:x}"), "filename":"bom.txt",
                 "original":format!("{original:x}"), "changed":format!("{changed:x}"),
                 "fork_root":format!("{fork_root:x}"), "frontier":[format!("{left:x}"),format!("{right:x}")],
-                "landing":format!("{landing:x}")}))
+                "landing":format!("{landing:x}"), "missing_body":missing_body}))
         })();
         let mut example = storage.finish(result)?;
         // Exercise the public snapshot contract in this app graph, without
@@ -153,6 +188,7 @@ pub fn seed(bootstrap: &Bootstrap, first: Id, full_viewer: bool) -> Result<Value
         }
         examples.push(example);
     }
-    Ok(json!({"examples":examples,
-        "not_seeded":["missing body bytes", "configured Files descriptor/frontier absent"]}))
+    let not_seeded = if full_viewer { vec!["configured Files descriptor/frontier absent"] }
+        else { vec!["missing body bytes", "configured Files descriptor/frontier absent"] };
+    Ok(json!({"examples":examples, "not_seeded":not_seeded}))
 }
