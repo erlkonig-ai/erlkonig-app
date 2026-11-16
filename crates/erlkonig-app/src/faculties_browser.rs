@@ -24,8 +24,25 @@ struct BrowserUi {
     repaint: Arc<Mutex<Option<Instant>>>,
 }
 
+fn schedule_repaints(context: &egui::Context, wake: Box<dyn Fn() + Send + Sync>) -> Arc<Mutex<Option<Instant>>> {
+    let repaint = Arc::new(Mutex::new(None::<Instant>));
+    let scheduled = repaint.clone();
+    context.set_request_repaint_callback(move |request| {
+        let Some(deadline) = Instant::now().checked_add(request.delay) else { return; };
+        let mut pending = scheduled.lock().unwrap_or_else(|error| error.into_inner());
+        if pending.is_some_and(|old| old <= deadline) { return; }
+        *pending = Some(deadline);
+        drop(pending);
+        // egui calls this with its context locked. Window::request_redraw can
+        // synchronously dispatch to the Mac main thread, which needs that lock.
+        // Queue only; next_wake requests the actual redraw on the event loop.
+        wake();
+    });
+    repaint
+}
+
 impl BrowserWindow {
-    pub(crate) fn open(event_loop: &ActiveEventLoop, runtime: &mut Runtime) -> Result<Self, String> {
+    pub(crate) fn open(event_loop: &ActiveEventLoop, runtime: &mut Runtime, wake: Box<dyn Fn() + Send + Sync>) -> Result<Self, String> {
         let attributes = Window::default_attributes()
             .with_title("Erlkonig · Faculties")
             .with_inner_size(winit::dpi::LogicalSize::new(1200.0, 800.0))
@@ -50,20 +67,7 @@ impl BrowserWindow {
         ));
         pollster::block_on(painter.set_window(ViewportId::ROOT, Some(window.clone())))
             .map_err(|error| format!("Cannot draw the Faculties window: {error}"))?;
-        let repaint = Arc::new(Mutex::new(None::<Instant>));
-        let scheduled = repaint.clone();
-        let wake = Arc::downgrade(&window);
-        context.set_request_repaint_callback(move |request| {
-            let Some(deadline) = Instant::now().checked_add(request.delay) else { return; };
-            let mut pending = scheduled.lock().unwrap_or_else(|error| error.into_inner());
-            *pending = Some(pending.map_or(deadline, |old| old.min(deadline)));
-            drop(pending);
-            if request.delay.is_zero() {
-                if let Some(window) = wake.upgrade() { window.request_redraw(); }
-            }
-            // Delayed background requests are also noticed by the app's bounded
-            // status tick; requests during paint set the next loop deadline.
-        });
+        let repaint = schedule_repaints(&context, wake);
         let stop = Arc::new(AtomicBool::new(false));
         let (notebook, worker) = window::notebook(runtime, &context, stop.clone());
         let state = egui_winit::State::new(context, ViewportId::ROOT, &window,
@@ -129,5 +133,51 @@ impl BrowserUi {
         output.viewport_output.get(&ViewportId::ROOT).is_some_and(|viewport| {
             viewport.commands.iter().any(|command| matches!(command, egui::ViewportCommand::Close))
         })
+    }
+}
+
+#[cfg(test)]
+mod repaint_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn background_repaint_returns_before_the_main_thread_consumes_its_wake() {
+        let context = egui::Context::default();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let pending = schedule_repaints(&context, Box::new(move || { wake_tx.send(()).unwrap(); }));
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_context = context.clone();
+        let worker = std::thread::spawn(move || {
+            worker_context.request_repaint();
+            done_tx.send(()).unwrap();
+        });
+        // Do not service the event-loop queue until the worker has released
+        // egui's lock. A synchronous main-thread dispatch cannot satisfy this.
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        let _ = context.style(); // The main thread can acquire egui again.
+        assert!(pending.lock().unwrap().is_some_and(|at| at <= Instant::now()));
+        assert_eq!(wake_rx.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn delayed_repaints_wake_the_loop_and_keep_the_earliest_deadline() {
+        let context = egui::Context::default();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let pending = schedule_repaints(&context, Box::new(move || { wake_tx.send(()).unwrap(); }));
+        context.request_repaint_after(Duration::from_secs(10));
+        let first = pending.lock().unwrap().unwrap();
+        assert!(first > Instant::now());
+        context.request_repaint_after(Duration::from_secs(20));
+        assert_eq!(pending.lock().unwrap().unwrap(), first);
+        assert_eq!(wake_rx.try_iter().count(), 1);
+        context.request_repaint_after(Duration::from_secs(2));
+        assert!(pending.lock().unwrap().unwrap() < first);
+        context.request_repaint();
+        context.request_repaint();
+        assert!(pending.lock().unwrap().is_some_and(|at| at <= Instant::now()));
+        assert_eq!(wake_rx.try_iter().count(), 2);
     }
 }

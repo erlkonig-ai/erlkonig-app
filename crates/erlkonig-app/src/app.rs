@@ -31,6 +31,9 @@ pub enum Login {
 
 /// What only the platform can do. Everything else lives in [`App`].
 pub trait Shell {
+    /// Queue a wake on the existing event loop, without waiting for that thread.
+    /// Called from egui's repaint callback while its context is write-locked.
+    fn faculties_wake(&self) -> Box<dyn Fn() + Send + Sync>;
     /// A native modal answers with the pressed button's index. A shell that
     /// draws its prompts itself returns `None`: [`App`] then queues the prompt
     /// and the shell answers later through [`App::answer`].
@@ -585,7 +588,7 @@ impl<S: Shell> App<S> {
         }
         if std::mem::take(&mut self.open_faculties) && self.quitting.is_none() {
             if let Some(runtime) = &mut self.runtime {
-                match crate::faculties_browser::BrowserWindow::open(event_loop, runtime) {
+                match crate::faculties_browser::BrowserWindow::open(event_loop, runtime, self.shell.faculties_wake()) {
                     Ok(window) => self.faculties_browser = Some(window),
                     // A spawn can also reap a prior failed worker. Keep that
                     // route passive too, rather than opening a Mac modal.
@@ -1403,6 +1406,7 @@ mod tests {
     }
 
     impl Shell for Fake {
+        fn faculties_wake(&self) -> Box<dyn Fn() + Send + Sync> { Box::new(|| {}) }
         fn alert(&mut self, title: &str, _: &str, _: &[&str]) -> Option<usize> {
             self.log.borrow_mut().push(format!("alert {title}"));
             self.modal

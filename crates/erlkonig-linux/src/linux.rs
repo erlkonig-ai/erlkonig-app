@@ -19,13 +19,14 @@ use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use window::{Action, StatusWindow};
 use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::WindowId;
 use zbus::blocking::Connection;
 
 /// Everything that reaches the main loop from other threads.
 pub(crate) enum UserEvent {
     Menu(MenuEvent),
+    FacultiesWake,
     Tray(TrayIconEvent),
     /// Another launch, over the session bus, asked for the window.
     Show,
@@ -73,6 +74,7 @@ fn xdg_open(target: &OsStr) -> bool {
 }
 
 struct LinuxShell {
+    wake_proxy: EventLoopProxy<UserEvent>,
     tray: Option<TrayIcon>,
     colour: [u8; 4],
     /// The attention state of the installed icon; `None` forces a redraw.
@@ -83,6 +85,10 @@ struct LinuxShell {
 }
 
 impl Shell for LinuxShell {
+    fn faculties_wake(&self) -> Box<dyn Fn() + Send + Sync> {
+        let proxy = self.wake_proxy.clone();
+        Box::new(move || { let _ = proxy.send_event(UserEvent::FacultiesWake); })
+    }
     fn alert(&mut self, _: &str, _: &str, _: &[&str]) -> Option<usize> {
         self.want_window = true;
         None
@@ -255,6 +261,7 @@ impl ApplicationHandler<UserEvent> for Linux {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
+            UserEvent::FacultiesWake => {} // next_wake reads the pending deadline on this thread.
             UserEvent::Menu(event) => {
                 self.app.on_menu(event);
                 self.app.refresh(event_loop);
@@ -335,6 +342,7 @@ pub fn main() {
         signal_hook::flag::register(signal, terminate.clone()).expect("shutdown signal");
     }
     let shell = LinuxShell {
+        wake_proxy: proxy,
         tray: None,
         colour: crown_colour(scheme),
         shown: None,

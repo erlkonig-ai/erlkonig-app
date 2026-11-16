@@ -19,14 +19,20 @@ use tray_icon::menu::MenuEvent;
 use tray_icon::{TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::window::WindowId;
+
+enum UserEvent {
+    Menu(MenuEvent),
+    FacultiesWake,
+}
 
 struct MacShell {
     mtm: MainThreadMarker,
     tray: Option<TrayIcon>,
     crown: Option<DisplayCrown>,
+    wake_proxy: EventLoopProxy<UserEvent>,
 }
 
 fn login() -> objc2::rc::Retained<SMAppService> {
@@ -58,6 +64,10 @@ fn installed_app(bundle_id: &str, fallback_name: &str) -> Option<(PathBuf, Strin
 }
 
 impl Shell for MacShell {
+    fn faculties_wake(&self) -> Box<dyn Fn() + Send + Sync> {
+        let proxy = self.wake_proxy.clone();
+        Box::new(move || { let _ = proxy.send_event(UserEvent::FacultiesWake); })
+    }
     fn alert(&mut self, title: &str, text: &str, buttons: &[&str]) -> Option<usize> {
         let app = NSApplication::sharedApplication(self.mtm);
         #[allow(deprecated)]
@@ -291,7 +301,7 @@ impl Shell for MacShell {
 /// rule needs a local type to implement one for the other.
 struct Mac(App<MacShell>);
 
-impl ApplicationHandler<MenuEvent> for Mac {
+impl ApplicationHandler<UserEvent> for Mac {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         if cause == StartCause::Init {
             match TrayIconBuilder::new()
@@ -322,8 +332,11 @@ impl ApplicationHandler<MenuEvent> for Mac {
     fn window_event(&mut self, _: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         self.0.faculties_window_event(id, &event);
     }
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: MenuEvent) {
-        self.0.on_menu(event);
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Menu(event) => self.0.on_menu(event),
+            UserEvent::FacultiesWake => {} // next_wake reads the pending deadline on this thread.
+        }
         self.0.refresh(event_loop);
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -336,20 +349,21 @@ impl ApplicationHandler<MenuEvent> for Mac {
 
 pub fn main() {
     let mtm = MainThreadMarker::new().expect("Erlkonig starts on the main thread");
-    let event_loop = EventLoop::<MenuEvent>::with_user_event()
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
         .with_activation_policy(ActivationPolicy::Accessory)
         .build()
         .expect("event loop");
     let terminate = Arc::new(AtomicBool::new(false));
     let modal_terminate = terminate.clone();
     let proxy = event_loop.create_proxy();
+    let wake_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
         // Native menu callbacks may arrive inside NSAlert's nested loop before
         // winit can dispatch its event. Let the modal's timer observe Quit too.
         if e.id == "erlkonig.quit" {
             modal_terminate.store(true, Ordering::Relaxed);
         }
-        let _ = proxy.send_event(e);
+        let _ = proxy.send_event(UserEvent::Menu(e));
     }));
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         signal_hook::flag::register(signal, terminate.clone()).expect("shutdown signal");
@@ -358,6 +372,7 @@ pub fn main() {
         mtm,
         tray: None,
         crown: None,
+        wake_proxy,
     };
     let layout = Layout::application(paths::default_data_dir().expect("data directory"))
         .expect("node bootstrap location");
