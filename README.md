@@ -529,8 +529,15 @@ profile. Quit disconnects the transports, which never relaunch the app.
 A stored MCP-port change takes effect on the next launch. Metrics contain cumulative
 observed bytes/publications/failures by node, worker and session;
 absent counters remain unknown. Measurements are coalesced at a ten-second
-cadence, with observed failures and shutdown flushed sooner. Local-only
-maintenance does not claim a live network listener. Failed metrics
+cadence, with observed failures and shutdown flushed sooner. Successful maintenance hops with no publications emit no sample; observations
+are work evidence, not an idle heartbeat. Upkeep of this node's metrics root,
+its native derived collections and their attached indexes still runs and counts
+in live status. Targets classified from the current discovery snapshot emit no
+ordinary sample into their own sink, including when that upkeep fails. Newly
+resident descriptors are classified on the next changed snapshot. These failures remain visible in status and existing bounded
+FD diagnostics; failures for other targets retain ordinary error samples. A
+later reportable observation carries the cumulative counters for all upkeep.
+Local-only maintenance does not claim a live network listener. Failed metrics
 appends are visible in the menu and are never reported as persisted success.
 Service failures append and flush separate typed events in that existing
 `erlkonig-metrics` collection: initiating cause, startup/session failure and each
