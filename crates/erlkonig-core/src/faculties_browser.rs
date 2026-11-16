@@ -195,7 +195,7 @@ mod tests {
         let handle = body.get_handle();
         reader.with_node(|| false, |node| {
             node.pile.put::<blobencodings::UTF8String, _>("unrelated payload")?;
-            node.pile.put(body)?;
+            node.pile.put::<blobencodings::UTF8String, _>(body)?;
             Ok(())
         }).unwrap();
         let now = reader.snapshot(|| false).unwrap();

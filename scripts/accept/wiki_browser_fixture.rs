@@ -129,7 +129,7 @@ pub fn seed(bootstrap: &Bootstrap, first: Id, full_viewer: bool) -> Result<Value
                     let segment = bootstrap.pile.with_file_name("pending-viewer-body.pile");
                     anyhow::ensure!(!segment.exists(), "refuse an existing delayed-body segment");
                     let mut pending = Pile::open_as(&segment, signer.verifying_key())?;
-                    pending.put(body)?;
+                    pending.put::<blobencodings::UTF8String, _>(body)?;
                     pending.close()?;
                     Ok(json!({"revision":format!("{revision:x}"), "segment":segment,
                         "body_handle":hex::encode(body_handle.raw), "expected_text":content}))

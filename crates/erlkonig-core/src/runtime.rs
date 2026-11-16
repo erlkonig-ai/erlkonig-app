@@ -1576,7 +1576,8 @@ mod tests {
             secret_entry: crate::secret_entry::SecretEntry::default(),
             protected_access: crate::protected_access::ProtectedAccessBridge::default(),
             local_import: crate::local_import::LocalImport::default(),
-            workers: Vec::new(), viewer_workers: Vec::new(), lock: None, startup_notice: None,
+            workers: Vec::new(), viewer_workers: Vec::new(), viewer_interests: Default::default(),
+            lock: None, startup_notice: None,
         };
         for _ in 0..32 {
             let cancelled = Arc::new(AtomicBool::new(false));
