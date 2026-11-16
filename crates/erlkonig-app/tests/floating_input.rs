@@ -177,6 +177,7 @@ fn floating_layer_blocks_graph_command_wheel_zoom() {
     let modifiers = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
     fixture.frame(vec![Event::PointerMoved(at), Event::MouseWheel {
         unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, 30.0), modifiers,
+        phase: egui::TouchPhase::Move,
     }], modifiers);
     fixture.assert_graph_untouched(before);
 }
@@ -195,6 +196,7 @@ fn exposed_graph_still_accepts_drag_pinch_and_command_wheel() {
     let modifiers = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
     fixture.frame(vec![Event::MouseWheel {
         unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, 30.0), modifiers,
+        phase: egui::TouchPhase::Move,
     }], modifiers);
     assert_ne!(fixture.scene.borrow().viewport.zoom(), zoom,
         "control: exposed graph must accept command-wheel");
