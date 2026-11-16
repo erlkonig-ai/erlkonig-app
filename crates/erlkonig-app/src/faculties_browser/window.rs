@@ -101,9 +101,12 @@ impl Source {
             // A removed/unreadable choice stays selected and unavailable. Never
             // choose another workspace just because it occupies the old row.
             self.notice = observed.error.clone();
-        } else if let (Some(selected), Some(current)) = (&self.selected, &observed.requested) {
-            if selected.id == current.id && selected.anchor == current.anchor && selected.routes == current.routes {
-                self.selected = Some(current.clone()); // Label-only update keeps navigation.
+        } else {
+            if observed.ready && observed.error.is_none() { self.notice = None; }
+            if let (Some(selected), Some(current)) = (&self.selected, &observed.requested) {
+                if selected.id == current.id && selected.anchor == current.anchor && selected.routes == current.routes {
+                    self.selected = Some(current.clone()); // Label-only update keeps navigation.
+                }
             }
         }
     }
@@ -568,6 +571,24 @@ mod tests {
         assert_eq!(source.selected, Some(selected));
         assert_eq!(source.generation.load(Ordering::Acquire), generation);
         assert_eq!(source.snapshot().choices.len(), 2);
+    }
+
+    #[test]
+    fn automatic_recovery_clears_availability_notice_without_erasing_action_status() {
+        let (mut source, _requests) = source();
+        let selected = Workspace::new("Selected");
+        source.select(Some(selected.clone()));
+        let generation = source.generation.load(Ordering::Acquire);
+        source.reconcile(&Observation { generation, ready: true, invalidated: true,
+            error: Some("Unavailable".into()), ..Default::default() });
+        assert_eq!(source.notice.as_deref(), Some("Unavailable"));
+        let recovered = Observation { generation, ready: true, requested: Some(selected),
+            file_status: Some("Priority recorded.".into()), ..Default::default() };
+        publish(&source.output, &source.generation, recovered.clone());
+        source.reconcile(&recovered);
+        assert!(source.notice.is_none());
+        assert_eq!(source.snapshot().file_status.as_deref(), Some("Priority recorded."));
+        assert_eq!(source.generation.load(Ordering::Acquire), generation);
     }
 
     #[test]

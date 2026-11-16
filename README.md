@@ -735,17 +735,20 @@ interactive checks; automated success is not a claim those checks occurred.
 
 ## Faculties viewer candidate
 
-Choose **Browse Faculties…** from the crown menu, then choose a named workspace.
+Choose **Browse Faculties…** from the crown menu, then select a workspace from the dropdown.
 Duplicate names have distinct revision suffixes; selection binds the exact
 current workspace value. The window reuses the existing Faculties notebook and
 its ordered cards, including Wiki, Compass, Messages, Files and Memory. The
 Wiki graph, search and Typst pages retain their existing layout and exact
 revision links. Expand the sections you want to inspect.
 
-The viewer shows a **local snapshot**. Choose **Refresh** to read newer synced
-content. Initial observation and explicit refresh run on its reader worker;
-existing widget queries over frozen data and Typst rendering still run on the
-window thread. Each view uses its explicitly configured workspace collection.
+The viewer shows **local data** and updates as relevant content arrives. The
+app owner's existing refresh cycle checks the observation's native dependencies,
+including payload reads performed later by widgets. It queues one replacement
+observation on the reader worker; completion wakes the window. Unrelated appends
+do not reset the view. **Refresh** requests an explicit observation and resets
+card navigation. Existing widget queries over frozen data and Typst rendering
+still run on the window thread. Each view uses its explicitly configured workspace collection.
 Missing roles are omitted, and unavailable views do not hide independent readable
 views. Ordinary collections retain their READ admission; Secrets retains its
 local delivered-envelope possession semantics. No role falls back to a default
@@ -760,16 +763,20 @@ observations and actions. It never opens a pile path or creates a Faculty Storag
 peer, key or independent storage owner. The borrowed pile's durable signer is
 the app's signer. Selection and refresh recheck the complete workspace value.
 A transient request generation rejects old completions and resets card navigation
-after Refresh or choosing A → B → A. Native snapshots remain frozen; missing
-resident payloads require sync followed by Refresh, not a hidden viewer fetch.
+after Refresh or choosing A → B → A. Automatic presentation updates keep that
+generation and navigation while invalidating workspace presentation caches once
+per relevant update. Native snapshots remain frozen; a missing resident payload
+that arrives through sync triggers a fresh observation without a viewer fetch.
 
 Wiki links and Files preview actions run on the worker against the exact clicked
 Files observation. Every export gets a fresh owned preview folder. Actions check
 selection and cancellation before filesystem effects and again immediately before
 launching the system viewer. Failed or cancelled exports remove their own partial
 folder; successful previews remain available to the external viewer. Requests are
-never replayed automatically. Changed or removed bindings clear the view on the
-next explicit observation; the window does not continuously monitor Config.
+never replayed automatically. Config changes refresh the same dropdown choices.
+A changed binding clears the old view and invalidates its queued actions. A
+removed or unreadable selected workspace stays selected and unavailable; it
+never silently falls back to another workspace.
 
 Priority answers use the same factored Compass preparation, cycle checks,
 authoring and publication operation through the app's owner. READ/WRITE admission
