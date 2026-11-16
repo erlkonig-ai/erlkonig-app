@@ -2666,7 +2666,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "erlkonig-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "egui",
@@ -2685,7 +2685,7 @@ dependencies = [
 
 [[package]]
 name = "erlkonig-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "erlkonig-core",
@@ -2697,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "erlkonig-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2727,7 +2727,7 @@ dependencies = [
 
 [[package]]
 name = "erlkonig-linux"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "egui",
  "egui-wgpu",
@@ -2745,7 +2745,7 @@ dependencies = [
 
 [[package]]
 name = "erlkonig-mac"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
