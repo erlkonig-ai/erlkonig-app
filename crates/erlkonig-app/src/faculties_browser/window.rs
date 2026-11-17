@@ -137,7 +137,7 @@ impl Source {
             let mut output = self.output.lock().unwrap_or_else(|e| e.into_inner());
             output.ready = true;
             output.error = Some(
-                "The Faculties reader stopped. Close this window and choose Browse Faculties again.".into(),
+                "The Faculties reader stopped. Close this window and choose View data again.".into(),
             );
         }
     }
@@ -213,7 +213,7 @@ fn observe(
     if let Err(error) = read { result.error = Some(error); result.data = None; }
     if !cancelled() {
         if node.arm(interest, generation, serial, baseline, config_view, tracker, cancelled).is_err() && !cancelled() {
-            result.error = Some("Live updates are unavailable. Close this window and choose Browse Faculties again.".into());
+            result.error = Some("Live updates are unavailable. Close this window and choose View data again.".into());
         }
     }
     result

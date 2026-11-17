@@ -77,6 +77,16 @@ impl BrowserWindow {
         Ok(Self { ui: Some(BrowserUi { window, state, painter, notebook, repaint }), worker, stop })
     }
 
+    /// A menu request brings the existing UI forward without replacing its state.
+    /// False means only the closing worker remains; the app waits for its join.
+    pub(crate) fn raise(&self) -> bool {
+        let Some(ui) = &self.ui else { return false; };
+        ui.window.set_minimized(false);
+        ui.window.focus_window();
+        ui.window.request_redraw();
+        true
+    }
+
     pub(crate) fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(worker) = &self.worker { worker.stop(); }

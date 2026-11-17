@@ -735,7 +735,9 @@ interactive checks; automated success is not a claim those checks occurred.
 
 ## Faculties viewer candidate
 
-Choose **Browse Faculties…** from the crown menu, then select a workspace from the dropdown.
+Choose **View data** from the crown menu, then select a workspace from the dropdown.
+Choosing it again brings the same window forward; after closing it, the command
+opens a new viewer on the existing app owner.
 Duplicate names have distinct revision suffixes; selection binds the exact
 current workspace value. The window reuses the existing Faculties notebook and
 its ordered cards, including Wiki, Compass, Messages, Files and Memory. The
@@ -748,7 +750,8 @@ including payload reads performed later by widgets. It queues one replacement
 observation on the reader worker; completion wakes the window. Unrelated appends
 do not reset the view. **Refresh** requests an explicit observation and resets
 card navigation. Existing widget queries over frozen data and Typst rendering
-still run on the window thread. Each view uses its explicitly configured workspace collection.
+still run on the window thread. Activity, Gauge, Compass and Headspace defer their
+queries while collapsed; opening a large section can still be expensive. Each view uses its explicitly configured workspace collection.
 Missing roles are omitted, and unavailable views do not hide independent readable
 views. Ordinary collections retain their READ admission; Secrets retains its
 local delivered-envelope possession semantics. No role falls back to a default

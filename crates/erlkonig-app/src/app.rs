@@ -172,7 +172,7 @@ impl Items {
             pause_sync: entry("erlkonig.sync", "Pause sync", false, None),
             retry_services: entry("erlkonig.retry", "Retry services", false, None),
             storage_folder: entry("erlkonig.storage", "Show storage folder", false, None),
-            browse_faculties: entry("erlkonig.faculties", "Browse Faculties…", false, None),
+            browse_faculties: entry("erlkonig.faculties", "View data", false, None),
             quit: entry("erlkonig.quit", "Quit Erlkonig", true, None),
             get_update: entry("erlkonig.get-update", "Get update…", true, None),
             update_visible: false,
@@ -586,8 +586,13 @@ impl<S: Shell> App<S> {
             event_loop.exit();
             return;
         }
-        if std::mem::take(&mut self.open_faculties) && self.quitting.is_none() {
-            if let Some(runtime) = &mut self.runtime {
+        if self.open_faculties && self.quitting.is_none() {
+            if let Some(window) = &self.faculties_browser {
+                // A closed window can still be settling its worker. Keep the
+                // request until step() reaps it; never create a second owner.
+                if window.raise() { self.open_faculties = false; }
+            } else if let Some(runtime) = &mut self.runtime {
+                self.open_faculties = false;
                 match crate::faculties_browser::BrowserWindow::open(event_loop, runtime, self.shell.faculties_wake()) {
                     Ok(window) => self.faculties_browser = Some(window),
                     // A spawn can also reap a prior failed worker. Keep that
@@ -628,8 +633,7 @@ impl<S: Shell> App<S> {
         if self.faculties_browser.as_mut().is_some_and(|child| child.finished()) {
             self.faculties_browser = None;
         }
-        self.items.browse_faculties.enabled = self.runtime.is_some() && self.faculties_browser.is_none() && self.quitting.is_none();
-        self.items.browse_faculties.label = if self.faculties_browser.is_some() { "Faculties viewer open" } else { "Browse Faculties…" }.into();
+        self.items.browse_faculties.enabled = self.runtime.is_some() && self.quitting.is_none();
         if let Some(since) = self.quitting {
             let mut exit = false;
             if self.startup_task.is_none() && since.elapsed() >= Duration::from_secs(15) {
@@ -1361,7 +1365,7 @@ impl<S: Shell> App<S> {
                 );
             }
         } else if id == &self.items.browse_faculties.id {
-            if self.quitting.is_none() && self.faculties_browser.is_none() && self.runtime.is_some() {
+            if self.quitting.is_none() && self.runtime.is_some() {
                 self.open_faculties = true;
             }
         } else if id == &self.items.storage_folder.id {
@@ -1613,10 +1617,15 @@ mod tests {
     fn faculties_browser_requires_the_existing_runtime() {
         let mut app = app(Fake::default());
         assert!(!app.view().browse_faculties.enabled);
+        assert_eq!(app.view().browse_faculties.label, "View data");
         app.on_menu(MenuEvent { id: app.items.browse_faculties.id.clone() });
+        assert!(!app.open_faculties);
         assert!(app.faculties_browser.is_none());
         app.quit();
+        app.on_menu(MenuEvent { id: app.items.browse_faculties.id.clone() });
+        assert!(!app.open_faculties);
         assert!(!app.view().browse_faculties.enabled);
+        assert_eq!(app.view().browse_faculties.label, "View data");
     }
 
     #[test]
@@ -1772,7 +1781,7 @@ mod tests {
                 row("Pause sync", false, None),
                 sep(),
                 row("Integrations", true, None),
-                row("Browse Faculties…", false, None),
+                row("View data", false, None),
                 row("Show storage folder", false, None),
                 sep(),
                 row("Open at login", true, Some(false)),
