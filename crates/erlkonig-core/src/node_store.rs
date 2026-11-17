@@ -289,7 +289,11 @@ impl NodeStore {
     /// Open only an already-prepared node pile. The passed signer is the
     /// bootstrap key, not an ambient environment variable or a managed key.
     pub fn open(path: &Path, signer: SigningKey) -> Result<Self> {
-        let mut pile = faculties::storage::open_pile_strict_as(path, signer.verifying_key())?;
+        let pile = faculties::storage::open_pile_strict_as(path, signer.verifying_key())?;
+        Self::from_pile(pile, signer)
+    }
+
+    pub(crate) fn from_pile(mut pile: Pile, signer: SigningKey) -> Result<Self> {
         let config = faculties::collection_names::open(
             &mut pile,
             faculties::schemas::config::DEFAULT_SCOPE_ID,

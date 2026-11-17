@@ -30,10 +30,11 @@ use triblespace::core::{
     id::{Id, genid},
     patch::{Entry, IdentitySchema, PATCH},
     repo::{SnapshotSource, StorageClose, StoreChanges, StoreSnapshot},
+    repo::pile::{Pile, PileSnapshot, ReadError},
     signing_key_file,
 };
 use triblespace_net::peer::{Peer, PeerConfig};
-use triblespace_net::reconcile::ReplicationMode;
+use triblespace_net::reconcile::{CLIMB_STEP_BYTES, Hydration, ReplicationMode, climb};
 
 pub(crate) type SharedNode = Arc<Mutex<Option<NodeStore>>>;
 type ResourceCheck = Arc<dyn Fn() -> Result<()> + Send + Sync>;
@@ -155,7 +156,15 @@ impl Runtime {
         };
         let binding = crate::pile_upgrade::prepare(layout, binding, &signer, control)?;
         control.progress("Opening local services…")?;
-        let mut node = NodeStore::open(&binding.pile, signer.clone())?;
+        let mut pile = Pile::open_as(&binding.pile, signer.verifying_key())
+            .with_context(|| format!("open node pile {}", binding.pile.display()))?;
+        let replay = replay_local(&mut pile, CLIMB_STEP_BYTES, || !control.is_cancelled())
+            .map_err(|error| faculties::storage::pile_read_error(&binding.pile, error))
+            .and_then(|_| control.check());
+        if let Err(error) = replay {
+            return Err(with_close_error(error, pile.close().context("close node pile")));
+        }
+        let mut node = NodeStore::from_pile(pile, signer.clone())?;
         let port = node.config().and_then(|view| view.mcp_port())
             .unwrap_or_else(|_| NodeSettings::default().mcp_port);
         let token = credentials::load_or_create(&layout.dir.join("mcp.token"))
@@ -941,6 +950,44 @@ fn maintenance_observer<'a>(
     }
 }
 
+// A local-only handle needs the file index, without a hydration observation.
+fn replay_local(
+    pile: &mut Pile,
+    step_bytes: u64,
+    mut running: impl FnMut() -> bool,
+) -> Result<bool, ReadError> {
+    while running() {
+        if pile.refresh_step(step_bytes)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn climb_until_stopped(
+    store: &mut Pile,
+    signer: ed25519_dalek::VerifyingKey,
+    stop: watch::Receiver<Option<StopCause>>,
+    step_bytes: u64,
+) -> Result<Option<Hydration<PileSnapshot>>> {
+    tokio::select! {
+        biased;
+        _ = session_stopping(stop) => Ok(None),
+        result = climb(
+            store, step_bytes,
+            |snapshot| crate::workspace::selected_sync_roots(snapshot, signer),
+            |_, _| {},
+        ) => result.map(Some),
+    }
+}
+
+fn with_close_error(error: anyhow::Error, close: Result<()>) -> anyhow::Error {
+    match close {
+        Ok(()) => error,
+        Err(close) => error.context(format!("cleanup also failed: {close:#}")),
+    }
+}
+
 fn node_session(
     binding: &NodeBinding,
     signer: &ed25519_dalek::SigningKey,
@@ -955,6 +1002,9 @@ fn node_session(
     attempt: Attempt,
     entered: &mut bool,
 ) -> Result<()> {
+    if stop.borrow().is_some() {
+        return Ok(());
+    }
     // This lock guards endpoint identity, NEVER exclusive access to the pile.
     // Other native appenders and readers are legitimate concurrent users.
     let _endpoint_lease = if settings.sync_enabled {
@@ -971,12 +1021,44 @@ fn node_session(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let store = faculties::storage::open_pile_strict_as(&binding.pile, signer.verifying_key())?;
     let metrics_root = with_node(&node, |node| Ok(node.metrics.handle()))?;
     let mut metrics_targets = PATCH::new();
     metrics_targets.insert(&Entry::new(&metrics_root.raw));
     let mut observer = maintenance_observer(signer.verifying_key(), session, status, activity, metrics, diagnostics);
+    let mut store = Pile::open_as(&binding.pile, signer.verifying_key())
+        .with_context(|| format!("open service pile {}", binding.pile.display()))?;
+    let mut hydration = None;
+    let replay = if settings.sync_enabled {
+        runtime.block_on(climb_until_stopped(
+            &mut store, signer.verifying_key(), stop.clone(), CLIMB_STEP_BYTES,
+        )).map(|climbed| {
+            hydration = climbed;
+            hydration.is_some()
+        })
+    } else {
+        replay_local(&mut store, CLIMB_STEP_BYTES, || stop.borrow().is_none())
+            .map_err(anyhow::Error::from)
+    };
+    match replay {
+        Ok(true) if stop.borrow().is_none() => {}
+        result => {
+            let closed = session_result(Ok(()), [(CleanupFailure::StoreCloseFailed,
+                store.close().context("close service pile during startup"))],
+                status, &node, attempt, stop.borrow().as_ref());
+            return match result {
+                Ok(_) => closed,
+                Err(error) => {
+                    let error = match error.downcast::<ReadError>() {
+                        Ok(error) => faculties::storage::pile_read_error(&binding.pile, error),
+                        Err(error) => error,
+                    };
+                    Err(with_close_error(error, closed))
+                }
+            };
+        }
+    };
     let result = if settings.sync_enabled {
+        let mut driver = maintenance_driver([])?;
         let mut peer = Peer::new(
             store,
             signer.clone(),
@@ -989,7 +1071,6 @@ fn node_session(
         )
         .context("cannot start native node endpoint")?;
         *entered = true;
-        let mut driver = maintenance_driver([])?;
         let mut selection = AllAccessible::default();
         let mut previous_snapshot = None;
         let mut previous_sent = 0u64;
@@ -1040,6 +1121,9 @@ fn node_session(
                             if previous_snapshot.is_none() || selection.sync != next.sync {
                                 peer.set_replication(ReplicationMode::Full, next.sync.iter().copied());
                                 peer.activate_collections(next.sync.iter().copied());
+                                if let Some(climbed) = hydration.take() {
+                                    peer.adopt_hydration(climbed);
+                                }
                             }
                             if settings.maintenance_enabled {
                                 driver.retarget(next.maintenance.iter().copied().map(Target::Handle));
@@ -1084,7 +1168,6 @@ fn node_session(
             (CleanupFailure::StoreCloseFailed, closed),
         ], status, &node, attempt, stop.borrow().as_ref())
     } else {
-        let mut store = store;
         let mut driver = maintenance_driver([])?;
         let mut previous_snapshot = None;
         *entered = true;
@@ -1968,6 +2051,38 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_leaves_both_local_replay_and_sync_climb_at_a_prefix() {
+        use std::task::{Context as TaskContext, Waker};
+
+        let dir = tempfile::tempdir().unwrap();
+        let bootstrap = crate::config::Bootstrap::new(dir.path());
+        let signer = init::prepare(&bootstrap).unwrap();
+        NodeStore::open(&bootstrap.pile, signer.clone()).unwrap().close().unwrap();
+        let length = std::fs::metadata(&bootstrap.pile).unwrap().len();
+        let authority = signer.verifying_key();
+
+        let mut local = Pile::open_as(&bootstrap.pile, authority).unwrap();
+        let mut turns = 0;
+        assert!(!replay_local(&mut local, 1, || {
+            turns += 1;
+            turns == 1
+        }).unwrap());
+        assert!((1..length).contains(&local.replayed_length()));
+        local.close().unwrap();
+
+        let mut sync = Pile::open_as(&bootstrap.pile, authority).unwrap();
+        let (cancel, stop) = watch::channel(None);
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+            let mut climb = std::pin::pin!(climb_until_stopped(&mut sync, authority, stop, 1));
+            assert!(climb.as_mut().poll(&mut TaskContext::from_waker(Waker::noop())).is_pending());
+            cancel.send_replace(Some(StopCause::new("quit", ServiceCode::ApplicationShutdown)));
+            assert!(climb.await.unwrap().is_none());
+        });
+        assert!((1..length).contains(&sync.replayed_length()));
+        sync.close().unwrap();
+    }
+
+    #[test]
     fn guard_cancellation_before_startup_status_keeps_its_explanation() {
         for sync_enabled in [true, false] {
             let dir = tempfile::tempdir().unwrap();
@@ -2015,7 +2130,8 @@ mod tests {
             .unwrap();
 
             let state = status.lock().unwrap();
-            assert_eq!(state.node.sessions_started, 1);
+            assert_eq!(state.node.sessions_started, 0);
+            assert!(!state.node.sync_running && !state.node.maintenance_running);
             assert_eq!(
                 state.node.stop_reason.as_deref(),
                 Some(reason.as_str()),
