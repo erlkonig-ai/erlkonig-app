@@ -51,9 +51,10 @@ deployment=$(otool -l "$binary" | awk '/LC_BUILD_VERSION/{block=1} block && $1 =
 name=Erlkonig-$version-$build-macos-$arch-development.dmg
 # Fail closed on extra resources, including personal plugin caches or user state.
 # The hidden provider manifest directories below are intentional source templates.
-python3 -I - "$app" <<'PY'
-import pathlib, stat, sys
+python3 -I - "$app" "$repo/notices" <<'PY'
+import hashlib, json, pathlib, stat, sys
 app = pathlib.Path(sys.argv[1])
+notices = pathlib.Path(sys.argv[2])
 files = {
     "Contents/Info.plist", "Contents/PkgInfo", "Contents/MacOS/erlkonig",
     "Contents/_CodeSignature/CodeResources", "Contents/Resources/Erlkonig.icns",
@@ -62,6 +63,34 @@ files = {
 plugin_files = {"README.md", ".codex-plugin/plugin.json", ".claude-plugin/plugin.json",
                 "skills/faculties/SKILL.md"}
 files |= {"Contents/Resources/plugin/" + p for p in plugin_files}
+# Trust the selected source notice manifest, never a modified bundled manifest.
+# Supporting evidence has exact source bytes too; neither side may add files.
+notice_files = {"manifest.json", "README.txt", "asset-evidence.json"}
+assert notices.is_dir() and not notices.is_symlink(), "invalid source notice directory"
+for path in notices.rglob("*"):
+    mode = path.lstat().st_mode
+    assert not stat.S_ISLNK(mode), "unexpected source notice symlink"
+    assert stat.S_ISDIR(mode) or stat.S_ISREG(mode), "unexpected source notice type"
+manifest = json.loads((notices / "manifest.json").read_text())
+for item in manifest["files"]:
+    relative = item["path"]
+    path = pathlib.PurePosixPath(relative)
+    assert not path.is_absolute() and ".." not in path.parts and str(path) == relative, "invalid notice path"
+    assert relative not in notice_files, "duplicate notice path"
+    notice_files.add(relative)
+    assert hashlib.sha256((notices / relative).read_bytes()).hexdigest() == item["sha256"], f"source notice hash mismatch: {relative}"
+notice_dirs = {str(parent) for p in notice_files for parent in pathlib.PurePosixPath(p).parents if str(parent) != "."}
+seen_notices = set()
+for path in notices.rglob("*"):
+    relative, mode = str(path.relative_to(notices)), path.lstat().st_mode
+    assert not stat.S_ISLNK(mode), f"unexpected source notice symlink: {relative}"
+    if stat.S_ISDIR(mode):
+        assert relative in notice_dirs, f"unexpected source notice directory: {relative}"
+    else:
+        assert stat.S_ISREG(mode) and relative in notice_files, f"unexpected source notice file: {relative}"
+        seen_notices.add(relative)
+assert seen_notices == notice_files, "missing source notices"
+files |= {"Contents/Resources/notices/" + p for p in notice_files}
 optional = {"Contents/Resources/binary-provenance.txt"}
 dirs = {str(parent) for p in files for parent in pathlib.PurePath(p).parents if str(parent) != "."}
 seen = set()
@@ -74,6 +103,8 @@ for p in app.rglob("*"):
         assert stat.S_ISREG(mode) and rel in files | optional, f"unexpected bundle file: {rel}"
         seen.add(rel)
 assert files <= seen, f"missing bundle files: {sorted(files - seen)}"
+for relative in notice_files:
+    assert (app / "Contents/Resources/notices" / relative).read_bytes() == (notices / relative).read_bytes(), f"not the source notice: {relative}"
 PY
 for file in README.md .codex-plugin/plugin.json .claude-plugin/plugin.json skills/faculties/SKILL.md; do
     cmp -s "$app/Contents/Resources/plugin/$file" "$repo/plugin/$file" || fail "not the source plugin template: $file"

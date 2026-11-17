@@ -11,6 +11,7 @@ pub mod app;
 mod native_menu;
 
 pub mod crown;
+pub mod faculties_browser;
 
 /// The command-line verbs: the node CLI and the `mcp-stdio` transport. Each
 /// binary calls this whenever it is started with arguments, before any shell.
@@ -30,3 +31,5 @@ pub fn transport_command(args: &[std::ffi::OsString]) -> Result<(), String> {
     erlkonig_core::transport::stdio(&erlkonig_core::paths::Layout::new(dir), url)
         .map_err(|error| error.to_string())
 }
+
+mod update_notice;

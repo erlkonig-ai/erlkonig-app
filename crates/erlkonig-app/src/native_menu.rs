@@ -22,7 +22,10 @@ pub(crate) struct NativeMenu {
     pause_sync: MenuItem,
     retry_services: MenuItem,
     storage_folder: MenuItem,
+    browse_faculties: MenuItem,
     quit: MenuItem,
+    get_update: MenuItem,
+    update_shown: bool,
     status_shown: bool,
     retry_shown: bool,
     /// The rows the Integrations submenu holds now.
@@ -89,7 +92,10 @@ impl NativeMenu {
             pause_sync: item(&items.pause_sync),
             retry_services: item(&items.retry_services),
             storage_folder: item(&items.storage_folder),
+            browse_faculties: item(&items.browse_faculties),
             quit: item(&items.quit),
+            get_update: item(&items.get_update),
+            update_shown: false,
             status_shown: false,
             retry_shown: false,
             rows: Vec::new(),
@@ -101,6 +107,7 @@ impl NativeMenu {
                 &native.pause_sync,
                 &PredefinedMenuItem::separator(),
                 &native.integrations,
+                &native.browse_faculties,
                 &native.storage_folder,
                 &PredefinedMenuItem::separator(),
                 &native.login,
@@ -123,7 +130,7 @@ impl NativeMenu {
         }
         let before = self.applied.take();
         let before = before.as_ref();
-        let plain: [(&MenuItem, fn(&Items) -> &Control); 9] = [
+        let plain: [(&MenuItem, fn(&Items) -> &Control); 11] = [
             (&self.status, |i| &i.status),
             (&self.no_clients, |i| &i.no_clients),
             (&self.openai_manual, |i| &i.openai_manual),
@@ -132,7 +139,9 @@ impl NativeMenu {
             (&self.pause_sync, |i| &i.pause_sync),
             (&self.retry_services, |i| &i.retry_services),
             (&self.storage_folder, |i| &i.storage_folder),
+            (&self.browse_faculties, |i| &i.browse_faculties),
             (&self.quit, |i| &i.quit),
+            (&self.get_update, |i| &i.get_update),
         ];
         for (item, field) in plain {
             sync_item(item, field(items), before.map(field));
@@ -176,6 +185,15 @@ impl NativeMenu {
                     .expect("remove retry item");
             }
             self.retry_shown = items.retry_visible;
+        }
+        if items.update_visible != self.update_shown {
+            if items.update_visible {
+                let position = self.menu.items().len().saturating_sub(2);
+                self.menu.insert(&self.get_update, position).expect("insert update item");
+            } else {
+                self.menu.remove(&self.get_update).expect("remove update item");
+            }
+            self.update_shown = items.update_visible;
         }
         if self.rows != items.rows {
             while self.integrations.remove_at(0).is_some() {}

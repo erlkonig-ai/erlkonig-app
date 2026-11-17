@@ -1,18 +1,17 @@
-//! Enrollment from natively exchanged grants, with no metadata handoff.
+//! Local workspace enrollment from natively exchanged grants.
 //!
 //! Native grant exchange delivers a proof naming this node when a peer
 //! holding it connects. A landed proof is resident in the pile; its
 //! descriptor becomes resident once sync or repair fetched it. This module
 //! projects those resident proofs and descriptors into an enrollment prompt
-//! and publishes a local workspace over exactly the granted roots, the way
-//! bootstrap enrollment does, but reading what native exchange delivered
-//! instead of a signed handoff. It fetches, grants and imports nothing.
+//! and publishes a local workspace over exactly the selected granted roots.
+//! Listing and enrollment fetch, grant and import nothing.
 //!
 //! A descriptor carries the issuing workspace's anchor among its tags and,
 //! since 2026-10-13, the faculty role it was created for. Older descriptors
-//! declare no role; for those the role is read from the `label · role`
-//! suffix of the descriptor name and reported as such, so a reader can see
-//! which derivation it is trusting.
+//! declare no role and need explicit routes. Display names never establish
+//! a faculty role. Unknown declarations are ignored; distinct understood
+//! declarations leave the automatic role unresolved.
 //!
 //! The reader is open world. A proof may name a resource that is no
 //! collection at all; a descriptor may arrive before the name blob it
@@ -34,7 +33,7 @@
 //! the whole granted group: a root already routed by another local
 //! workspace is disclosed in the listing and routed here only when given.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{Context, Result, bail};
 use faculties::schemas::config::config;
@@ -57,24 +56,6 @@ fn handle_hex(root: &CollectionHandle) -> String {
     format!("blake3:{}", hex::encode(root.raw))
 }
 
-/// Where a collection's faculty role was read from.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RoleSource {
-    /// `collection_role` on the descriptor.
-    Declared,
-    /// The `label · role` suffix of the descriptor name.
-    Name,
-}
-
-impl RoleSource {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Declared => "declared",
-            Self::Name => "name",
-        }
-    }
-}
-
 /// One collection some resident proof grants to this node. A projection of
 /// one snapshot, recomputed per request; nothing here is persisted.
 #[derive(Clone, Debug)]
@@ -86,7 +67,8 @@ pub(crate) struct GrantedCollection {
     pub reason: Option<String>,
     /// The single non-kind tag of the descriptor, when there is exactly one.
     pub anchor: Option<Id>,
-    pub role: Option<(Id, RoleSource)>,
+    /// The sole understood declared role, if unambiguous.
+    pub role: Option<Id>,
     /// Keys that signed the edge naming this node, as public identities.
     pub issuers: BTreeSet<[u8; 32]>,
     /// Actions the resident definitions of those edges claim. A claim says
@@ -198,9 +180,10 @@ fn note(reason: &mut Option<String>, text: String) {
     }
 }
 
-/// The `label` of a `label · role` descriptor name, when `role` is known.
+/// Presentation only: shorten a name using its already-declared role.
+/// This label never participates in role resolution.
 fn label_of(name: &str, role: Option<Id>) -> String {
-    role.and_then(faculties::collection_names::name_for)
+    role.and_then(crate::workspace::role_name)
         .and_then(|suffix| name.strip_suffix(suffix))
         .and_then(|stem| stem.strip_suffix(" · "))
         .unwrap_or(name)
@@ -231,34 +214,6 @@ fn local_workspace(
         }
     }
     Ok(LocalWorkspace::ChangedOrWithdrawn)
-}
-
-/// The current local workspace equal to `workspace`, when repeat enrollment
-/// is a no-op. Any other local revision for the anchor refuses: a later edit
-/// or withdrawal is never overwritten.
-pub(crate) fn existing_enrollment(
-    expected: &ConfigView,
-    workspace: &Workspace,
-) -> Result<Option<Workspace>> {
-    let anchor = workspace.anchor;
-    let local = expected.facts()?;
-    let order = ObservationOrder::new(&local, metadata::supersedes.id());
-    let existing: Vec<_> = find!(id: Id, and!(
-        pattern!(&local, [{ ?id @ metadata::tag: attrs::WORKSPACE, config::anchor: anchor }]),
-        maximal(id, &order),
-    ))
-    .collect();
-    if existing.is_empty() {
-        return Ok(None);
-    }
-    if existing.len() == 1 {
-        if let Some(value) = expected.workspace(existing[0])? {
-            if value.label == workspace.label && value.routes == workspace.routes {
-                return Ok(Some(value));
-            }
-        }
-    }
-    bail!("this share's local workspace was changed or withdrawn; enrollment will not overwrite it")
 }
 
 impl NodeStore {
@@ -336,6 +291,8 @@ impl NodeStore {
             }
         }
         let mut skipped = 0;
+        let known_roles: HashSet<Id> = crate::workspace::roles()
+            .into_iter().map(|(role, _)| role).collect();
         let mut collections = Vec::with_capacity(rows.len());
         for (root, mut row) in rows {
             if !snapshot.contains_blob(root)? {
@@ -379,19 +336,13 @@ impl NodeStore {
                     note(&mut row.reason, format!("routed in local workspace {:X}", route.workspace));
                 }
             }
-            let declared: BTreeSet<Id> =
-                find!(role: Id, pattern!(&facts, [{ entity @ attrs::collection_role: ?role }])).collect();
+            let declared: BTreeSet<Id> = find!(role: Id, and!(
+                known_roles.has(role),
+                pattern!(&facts, [{ entity @ attrs::collection_role: ?role }]),
+            )).collect();
             row.role = match declared.into_iter().collect::<Vec<_>>()[..] {
-                [role] if faculties::collection_names::name_for(role).is_some() => {
-                    Some((role, RoleSource::Declared))
-                }
-                _ => row.name.as_deref().and_then(|name| {
-                    let (_, suffix) = name.rsplit_once(" · ")?;
-                    let (role, _) = faculties::collection_names::table()
-                        .into_iter()
-                        .find(|(_, candidate)| *candidate == suffix)?;
-                    Some((role, RoleSource::Name))
-                }),
+                [role] => Some(role),
+                _ => None,
             };
             row.admitted = Collection::<blobencodings::SimpleArchive>::open(&snapshot, row.root)
                 .ok()
@@ -450,7 +401,7 @@ impl NodeStore {
                 share.label = row
                     .name
                     .as_deref()
-                    .map(|name| label_of(name, row.role.map(|(role, _)| role)));
+                    .map(|name| label_of(name, row.role));
             }
             share.collections.push(row);
         }
@@ -466,17 +417,19 @@ impl NodeStore {
     }
 
     /// Publish a local workspace over exactly the granted roots of one
-    /// anchor and select them, as bootstrap enrollment does. No proof,
+    /// anchor and select them. No proof,
     /// descriptor or key is imported, copied or created.
     ///
-    /// `roots` are the handles the listing showed for the anchor. Every
-    /// shown root that no local workspace routes must be given (a root that
-    /// arrived since the listing refuses, naming it); a root the listing
-    /// disclosed as routed by another local workspace may be left out; a
-    /// root not granted under the anchor refuses, naming it. The published
-    /// routes are exactly the roots given, or their union with the enrolled
-    /// workspace's routes. A label is required for a first enrollment and
-    /// preserved otherwise unless given.
+    /// `roots` are the handles the listing showed for the anchor. An empty
+    /// list refuses: there is nothing to enroll (the MCP schema says
+    /// minItems 1; this is where it is enforced). Every shown root that no
+    /// local workspace routes must be given (a root that arrived since the
+    /// listing refuses, naming it); a root the listing disclosed as routed
+    /// by another local workspace may be left out; a root not granted under
+    /// the anchor refuses, naming it. The published routes are exactly the
+    /// roots given, or their union with the enrolled workspace's routes. A
+    /// label is required for a first enrollment and preserved otherwise
+    /// unless given.
     pub(crate) fn enroll_pending_share(
         &mut self,
         expected: &ConfigView,
@@ -484,6 +437,11 @@ impl NodeStore {
         roots: &BTreeSet<CollectionHandle>,
         label: Option<&str>,
     ) -> Result<Enrolled> {
+        if roots.is_empty() {
+            bail!(
+                "no roots given: nothing to enroll; call config_list_pending_shares and pass exactly the roots it shows for this anchor"
+            );
+        }
         let label = label.map(str::trim).filter(|label| !label.is_empty());
         if self.config_changed(expected)? {
             bail!("node configuration changed; inspect before enrolling");
@@ -526,9 +484,9 @@ impl NodeStore {
         let mut write = true;
         let mut delegate = true;
         for collection in share.collections.iter().filter(|row| roots.contains(&row.root)) {
-            let (role, _) = collection.role.with_context(|| {
+            let role = collection.role.with_context(|| {
                 format!(
-                    "granted collection blake3:{} declares no understood faculty role; enroll it with explicit routes",
+                    "granted collection blake3:{} declares no unambiguous understood faculty role; enroll it with explicit routes",
                     hex::encode(collection.root.raw)
                 )
             })?;

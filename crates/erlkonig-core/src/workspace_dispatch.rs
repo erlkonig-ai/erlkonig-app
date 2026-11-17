@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::VerifyingKey;
@@ -20,12 +21,27 @@ use triblespace::core::id::Id;
 
 use crate::config::NodeBinding;
 use crate::node_store::ConfigView;
+use crate::protected_access::ProtectedAccessBridge;
+use crate::secret_entry::{EntryAnswer, EntryInput, EntryKind, EntryRequest, SecretEntry};
+use crate::local_import::{ImportAnswer, ImportRequest, LocalImport};
 use crate::workspace::Workspace;
 
 const LIST: Tool = Tool {
     name: "list_workspaces",
     description: "List explicitly configured Erlkonig workspaces, exact revision IDs, collection roles, alongside unavailable revisions. This reads app configuration only; it does not open the store or key. Pass one returned workspace ID on every faculty tool call. Names are labels, never selectors; each call resolves and freezes the current binding value.",
     input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+};
+
+const ENTER_LOCAL: Tool = Tool {
+    name: "secrets_enter_local",
+    description: "Ask the running app to show one local secure-entry dialog for the exact workspace, service and secret name. Never put credentials or protection passphrases in these arguments. The person enters a login (native structured encrypted username/password fields) or a generic secret (unchanged raw UTF-8 bytes) locally. Set protected=true to create a new locally passphrase-protected version; the person enters and confirms the protection passphrase locally. This does not convert existing secrets. Protected access later prompts for this exact operation; approval may disclose plaintext to the calling integration when the requested tool exports values. Omitted protected=false preserves ordinary entry. Both login fields, or the generic value, must be nonempty; invalid Save publishes nothing and asks for a new local entry. Save returns only an immutable version ID; Cancel saves nothing. Only one prompt may be active. This synchronous call waits for the person; keep the connection open. Disconnect/cancellation does not undo an admitted Save; an unknown outcome must not be retried automatically. Inspect secrets_items metadata for login or secrets_list for generic entry before any new entry. Creates no grants; collection sharing and secret delivery authority are unchanged.",
+    input_schema: r#"{"type":"object","properties":{"service":{"type":"string","minLength":1,"maxLength":160},"name":{"type":"string","minLength":1,"maxLength":160},"kind":{"type":"string","enum":["login","secret"],"default":"login"},"protected":{"type":"boolean","default":false}},"required":["service","name"],"additionalProperties":false}"#,
+};
+
+const IMPORT_LOCAL: Tool = Tool {
+    name: "secrets_import_1password_local",
+    description: "Ask the running app to import a 1Password .1pux export into the exact workspace with user-only passphrase protection. The person chooses the file and enters and confirms an independent app passphrase locally. Never provide a file path, export bytes, credentials or passphrase to this tool. The original archive, imported items, attachments and receipt are protected; ordinary node keys cannot unlock them. Older readable copies are not revoked. No Touch ID or sharing grants are configured. Returns an opaque receipt ID and counts, never export data. Omit previous_import for a NEW import (no automatic deduplication). Supply a returned receipt ID to verify that exact previous import using its passphrase; failure never creates a replacement import. Cancel or expiry before admission saves nothing; an admitted operation runs once. Keep the connection open; disconnect does not undo admitted work. If outcome is unknown, do not retry automatically: inspect metadata first.",
+    input_schema: r#"{"type":"object","properties":{"previous_import":{"type":"string","pattern":"^[0-9A-F]{32}$","description":"Optional receipt ID of the exact previous protected import to verify. Omit for a new import; no global content deduplication."}},"additionalProperties":false}"#,
 };
 
 pub struct WorkspaceDispatch {
@@ -35,11 +51,15 @@ pub struct WorkspaceDispatch {
     schemas: BTreeMap<&'static str, String>,
     // Handles and their adapters, never a materialized dataset or config cache.
     owners: RefCell<BTreeMap<Id, Owner>>,
+    secret_entry: Option<SecretEntry>,
+    protected_access: Option<ProtectedAccessBridge>,
+    local_import: Option<LocalImport>,
 }
 
 struct Owner {
     binding: Workspace,
     catalog: catalog::Catalog,
+    storage: Storage,
 }
 
 impl WorkspaceDispatch {
@@ -61,13 +81,38 @@ impl WorkspaceDispatch {
                 register_tool(&mut tools, &mut schemas, tool, faculty.input_schema(tool))?;
             }
         }
+        register_tool(
+            &mut tools,
+            &mut schemas,
+            &ENTER_LOCAL,
+            ENTER_LOCAL.input_schema,
+        )?;
+        register_tool(&mut tools, &mut schemas, &IMPORT_LOCAL, IMPORT_LOCAL.input_schema)?;
         Ok(Self {
             node,
             config: Box::new(config),
             tools,
             schemas,
             owners: RefCell::new(BTreeMap::new()),
+            secret_entry: None,
+            protected_access: None,
+            local_import: None,
         })
+    }
+
+    pub fn with_secret_entry(mut self, secret_entry: SecretEntry) -> Self {
+        self.secret_entry = Some(secret_entry);
+        self
+    }
+
+    pub fn with_protected_access(mut self, protected_access: ProtectedAccessBridge) -> Self {
+        self.protected_access = Some(protected_access);
+        self
+    }
+
+    pub fn with_local_import(mut self, local_import: LocalImport) -> Self {
+        self.local_import = Some(local_import);
+        self
     }
 
     /// Stop owners whose binding was removed or superseded. HTTP dispatch is
@@ -100,15 +145,35 @@ impl WorkspaceDispatch {
     fn open(&self, workspace: Workspace) -> Result<Owner> {
         let signer = VerifyingKey::from_bytes(&self.node.signer)
             .context("workspace has an invalid configured signing identity")?;
-        // Workspace selection alone does not authorize an acquisition network
-        // owner. Missing payloads are reported; managed sync is independent.
-        let storage = Storage::shared_local(self.node.pile.clone(), Some(self.node.key.clone()))
+        // An explicit Faculty operation may acquire its exact missing bytes.
+        // This lazy, non-serving client contacts the bound node first; it does
+        // not activate background replication or change the selected workspace.
+        let mut storage = Storage::shared_with_daemon(
+            self.node.pile.clone(), Some(self.node.key.clone()), Some(signer),
+        )
             .with_collections(workspace.routes.clone())
             .with_expected_signer(signer);
+        if let Some(bridge) = &self.protected_access {
+            let bridge = bridge.clone();
+            let workspace_id = format!("{:X}", workspace.id);
+            let workspace_label = workspace
+                .label
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(160)
+                .collect::<String>();
+            // Secrets alone invokes this resolver, after releasing its store
+            // lease. It reopens and validates the exact detached operation
+            // before using the returned key; dispatch never retries a call.
+            storage = storage.with_protected_access(Arc::new(move |request| {
+                bridge.request(workspace_id.clone(), workspace_label.clone(), request.clone())
+            }));
+        }
         let mut config = catalog::Config::new(&self.node.pile);
         config.key = Some(self.node.key.clone());
         Ok(Owner {
             binding: workspace,
+            storage: storage.clone(),
             catalog: catalog::Catalog::with_storage(config, storage),
         })
     }
@@ -167,7 +232,11 @@ impl Faculty for WorkspaceDispatch {
             #[serde(deny_unknown_fields)]
             struct Empty {}
             let _: Empty = mcp::decode_arguments(arguments)?;
-            let view = (self.config)().map_err(|_| anyhow::anyhow!("node configuration is unavailable; native data recovery is required"))?;
+            let view = (self.config)().map_err(|_| {
+                anyhow::anyhow!(
+                    "node configuration is unavailable; native data recovery is required"
+                )
+            })?;
             self.retire(&view, None)?;
             let mut workspaces = Vec::new();
             let mut unavailable = Vec::new();
@@ -179,7 +248,7 @@ impl Faculty for WorkspaceDispatch {
                             .iter()
                             .map(|(role, root)| {
                                 json!({
-                                    "role": faculties::collection_names::name_for(*role),
+                                    "role": crate::workspace::role_name(*role),
                                     "role_id": format!("{role:X}"),
                                     "root": format!("blake3:{}", hex::encode(root.raw)),
                                 })
@@ -208,10 +277,18 @@ impl Faculty for WorkspaceDispatch {
         if !self.schemas.contains_key(name) {
             bail!("unknown workspace MCP tool {name:?}");
         }
-        let selected: SelectedArguments = mcp::decode_arguments(arguments)?;
-        let view = (self.config)().map_err(|_| anyhow::anyhow!("node configuration is unavailable; native data recovery is required"))?;
+        let selected: SelectedArguments = mcp::decode_arguments(arguments).map_err(|error| {
+            if name == IMPORT_LOCAL.name {
+                mcp::invalid_arguments("local import requires one exact workspace ID and optional previous_import receipt ID; invalid arguments")
+            } else { error }
+        })?;
+        let view = (self.config)().map_err(|_| {
+            anyhow::anyhow!("node configuration is unavailable; native data recovery is required")
+        })?;
         // Config text handles are bearer capabilities, not diagnostic detail.
-        let resolved = view.workspace(selected.workspace).map_err(|error| anyhow::anyhow!(error.to_string()));
+        let resolved = view
+            .workspace(selected.workspace)
+            .map_err(|error| anyhow::anyhow!(error.to_string()));
         // IDs are opaque: native annotation can change the value under an
         // existing ID. Reuse only an owner for this exact observed value.
         let unchanged = matches!(&resolved, Ok(Some(binding))
@@ -228,6 +305,15 @@ impl Faculty for WorkspaceDispatch {
         let workspace = resolved?.ok_or_else(|| {
             mcp::invalid_arguments("unknown, removed, or superseded workspace binding; call list_workspaces and explicitly choose a current ID")
         })?;
+        if (name == ENTER_LOCAL.name || name == IMPORT_LOCAL.name)
+            && !workspace
+                .routes
+                .contains_key(&faculties::secrets::DEFAULT_SCOPE_ID)
+        {
+            return Err(mcp::invalid_arguments(
+                "workspace collection role secrets is unconfigured; no local entry was requested",
+            ));
+        }
         // Even a tool without a storage entrypoint must not run under a
         // silently replaced binding. Storage repeats this at its own opening
         // boundary, so a replacement between these checks cannot retarget it.
@@ -241,6 +327,180 @@ impl Faculty for WorkspaceDispatch {
             entry.insert(self.open(workspace.clone())?);
         }
         let owner = &owners[&workspace.id];
+        if name == IMPORT_LOCAL.name {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Import {
+                #[serde(default, deserialize_with = "present_receipt")]
+                previous_import: Option<String>,
+            }
+            fn present_receipt<'de, D: Deserializer<'de>>(value: D) -> std::result::Result<Option<String>, D::Error> {
+                String::deserialize(value).map(Some)
+            }
+            // Fixed error: serde's unknown-field diagnostics can echo an
+            // arbitrary caller-provided key. Nothing supplied is repeated.
+            let args: Import = mcp::decode_arguments(selected.arguments).map_err(|_| {
+                mcp::invalid_arguments("local import accepts only workspace and optional previous_import receipt ID; select the export and enter its protection passphrase in the app")
+            })?;
+            let previous_receipt = args.previous_import.as_ref().map(|text| {
+                Id::from_hex(text).filter(|id| format!("{id:X}") == *text)
+                    .ok_or_else(|| mcp::invalid_arguments("previous_import must be an exact uppercase receipt ID"))
+            }).transpose()?;
+            let Some(bridge) = &self.local_import else {
+                return out.text(r#"{"status":"unavailable"}"#);
+            };
+            owner.storage.with_store(|store, signer, runtime| {
+                owner.storage.open_collection_write(store, faculties::secrets::DEFAULT_SCOPE_ID,
+                    signer.verifying_key(), runtime).map(|_| ())
+            })?;
+            // Storage lease is released for the entire file picker/passphrase
+            // interaction. The owner and its workspace route remain frozen.
+            let answer = bridge.request(ImportRequest {
+                workspace: format!("{:X}", owner.binding.id),
+                workspace_label: owner.binding.label.chars().filter(|c| !c.is_control()).take(160).collect(),
+                previous_import: args.previous_import,
+            })?;
+            let response = match answer {
+                ImportAnswer::Cancelled => json!({"status": "cancelled"}),
+                ImportAnswer::Unavailable => json!({"status": "unavailable"}),
+                ImportAnswer::Invalid => json!({"status": "not_saved", "message": "The local selection or passphrase was invalid; nothing was saved."}),
+                ImportAnswer::Submit { source, passphrase } => {
+                    if passphrase.is_empty() || passphrase.len() > 1024 {
+                        return out.text(r#"{"status":"not_saved","message":"Invalid local protection passphrase; nothing was saved."}"#);
+                    }
+                    let limits = faculties::secrets::onepassword::ImportLimits::default();
+                    let bytes = match source.read(limits.archive_bytes) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return out.text(r#"{"status":"not_saved","message":"Selected export changed, is unreadable, or exceeds the import limit; nothing was saved."}"#),
+                    };
+                    let secrets = faculties::secrets::Secrets::with_storage(owner.storage.clone());
+                    let protection = faculties::secrets::protected::Protection { password: passphrase.as_bytes(), device: None };
+                    match secrets.import_1password_protected(&bytes, limits, protection, previous_receipt) {
+                        Ok(report) => json!({
+                            "status": "saved",
+                            "receipt": format!("{:X}", report.receipt), "protected": true,
+                            "reused": report.reused, "view_maintenance_pending": report.view_maintenance_pending,
+                            "counts": {"accounts": report.counts.accounts, "vaults": report.counts.vaults,
+                                "items": report.counts.items, "fields": report.counts.fields,
+                                "attachments": report.counts.attachments, "files": report.counts.files,
+                                "archive_only_files": report.counts.archive_only_files,
+                                "archive_only_values": report.counts.archive_only_values},
+                        }),
+                        Err(error) => local_import_failure(&error),
+                    }
+                }
+            };
+            return out.text(serde_json::to_string(&response)?);
+        }
+        if name == ENTER_LOCAL.name {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Entry {
+                service: String,
+                name: String,
+                #[serde(default)]
+                kind: EntryKind,
+                #[serde(default)]
+                protected: bool,
+            }
+            let args: Entry = mcp::decode_arguments(selected.arguments)?;
+            for text in [&args.service, &args.name] {
+                if text.trim().is_empty()
+                    || text.chars().count() > 160
+                    || text.chars().any(char::is_control)
+                {
+                    return Err(mcp::invalid_arguments(
+                        "service and name must be 1–160 visible characters",
+                    ));
+                }
+            }
+            let Some(bridge) = &self.secret_entry else {
+                return out.text(r#"{"status":"unavailable"}"#);
+            };
+            // A read-only admission preflight on the same owner, before asking
+            // for plaintext. Rechecked by native Secrets authoring at its write
+            // boundary for either raw bytes or a structured item.
+            owner.storage.with_store(|store, signer, runtime| {
+                owner
+                    .storage
+                    .open_collection_write(
+                        store,
+                        faculties::secrets::DEFAULT_SCOPE_ID,
+                        signer.verifying_key(),
+                        runtime,
+                    )
+                    .map(|_| ())
+            })?;
+            let answer = bridge.request(EntryRequest {
+                workspace: format!("{:X}", owner.binding.id),
+                workspace_label: owner
+                    .binding
+                    .label
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(160)
+                    .collect(),
+                service: args.service,
+                name: args.name.clone(),
+                kind: args.kind,
+                protected: args.protected,
+            })?;
+            let response = match answer {
+                EntryAnswer::Cancelled => json!({"status": "cancelled"}),
+                EntryAnswer::Unavailable => json!({"status": "unavailable"}),
+                EntryAnswer::Submit(value) => {
+                    use faculties::secrets::item::{FieldInput, FieldValue, ItemInput};
+                    use faculties::secrets::schema::{ROLE_PASSWORD, ROLE_USERNAME};
+                    let input = value.input(args.kind)?;
+                    let protection = value.protection();
+                    if args.protected != protection.is_some() {
+                        bail!("local entry protection mismatch; no secret was saved");
+                    }
+                    let secrets = faculties::secrets::Secrets::with_storage(owner.storage.clone());
+                    // Only this worker touches the request-bound storage. An
+                    // error may follow commit, so never claim that it rolled back.
+                    let saved = match input {
+                        EntryInput::Login { username, password } => {
+                            let fields = [
+                                FieldInput {
+                                    role: ROLE_USERNAME,
+                                    label: None,
+                                    value: FieldValue::Text(username),
+                                },
+                                FieldInput {
+                                    role: ROLE_PASSWORD,
+                                    label: None,
+                                    value: FieldValue::Text(password),
+                                },
+                            ];
+                            let item = ItemInput {
+                                fields: &fields,
+                                attachments: &[],
+                            };
+                            match protection {
+                                Some(protection) => {
+                                    secrets.add_item_protected(&args.name, item, protection)
+                                }
+                                None => secrets.add_item(&args.name, item),
+                            }
+                        }
+                        EntryInput::Secret(plaintext) => match protection {
+                            Some(protection) => {
+                                secrets.add_protected(&args.name, plaintext, protection)
+                            }
+                            None => secrets.add(&args.name, plaintext),
+                        },
+                    };
+                    match saved {
+                        Ok(id) => json!({"status": "saved", "secret": format!("{id:X}")}),
+                        Err(_) => {
+                            json!({"status": "outcome_unknown", "message": "Saving did not report success; it may have committed. Inspect secret metadata before any new entry; nothing was retried."})
+                        }
+                    }
+                }
+            };
+            return out.text(serde_json::to_string(&response)?);
+        }
         let faculty = owner
             .catalog
             .registrations()
@@ -249,6 +509,25 @@ impl Faculty for WorkspaceDispatch {
             .context("registered workspace tool has no native adapter")?;
         faculty.call(name, selected.arguments, out)
     }
+}
+
+/// Only core-owned static classifications cross this boundary. Never format an
+/// underlying error: archive paths, field labels and values may be in its cause.
+fn local_import_failure(error: &anyhow::Error) -> Value {
+    use faculties::secrets::onepassword::{ProtectedImportPublicationError, ProtectedImportRejection};
+    if let Some(unknown) = error.downcast_ref::<ProtectedImportPublicationError>() {
+        return json!({"status": "outcome_unknown", "receipt": format!("{:X}", unknown.receipt),
+            "code": "publication_uncertain", "message": "Import may have committed. Keep this receipt; inspect metadata before explicitly verifying it. Nothing was retried."});
+    }
+    if let Some(rejection) = error.downcast_ref::<ProtectedImportRejection>() {
+        let mut response = json!({"status": "not_saved", "stage": rejection.stage.as_str(), "code": rejection.code.as_str()});
+        if let Some(code) = rejection.os_error_code.filter(|code| *code > 0) {
+            response["os_error_code"] = json!(code);
+        }
+        return response;
+    }
+    json!({"status": "not_saved", "code": "import_rejected",
+        "message": "The export or previous receipt could not be accepted; no import was published. Nothing was retried."})
 }
 
 fn register_tool(

@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/erlkonig-core", "crates/erlkonig-app", "crates/erlkonig-linux", "crates/erlkonig-mac"]
+members = ["crates/erlkonig-cli", "crates/erlkonig-core", "crates/erlkonig-app", "crates/erlkonig-linux", "crates/erlkonig-mac"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros", "io-
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
-faculties = { path = "../faculties", default-features = false }
+faculties = { path = "../faculties-view-data", default-features = false }
 triblespace = { path = "../triblespace-rs", default-features = false }
 triblespace-net = { path = "../triblespace-rs/triblespace-net" }
 trible = { path = "../triblespace-rs/trible", default-features = false }
@@ -40,6 +40,9 @@ block2 = "0.6.2"
 objc2-foundation = "0.3"
 objc2-app-kit = "0.3"
 objc2-service-management = "0.3"
+objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "LAContext", "LABase", "LABiometryType", "LAError", "block2", "objc2-security"] }
+objc2-security = { version = "0.3", default-features = false, features = ["std", "SecBase", "SecItem", "SecKey", "SecAccessControl", "SecTask"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFData", "CFDictionary", "CFString", "CFNumber", "CFError"] }
 objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CADisplayLink", "objc2-core-foundation"] }
 egui = { version = "0.34", default-features = false, features = ["default_fonts"] }
 egui-winit = { version = "0.34", default-features = false, features = ["clipboard", "wayland", "x11"] }
@@ -47,6 +50,7 @@ egui-wgpu = { version = "0.34", default-features = false, features = ["winit", "
 wgpu = { version = "29", default-features = false, features = ["std", "parking_lot", "vulkan", "gles", "wgsl"] }
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 pollster = "0.4"
+zeroize = "1"
 
 [profile.release]
 strip = "symbols"

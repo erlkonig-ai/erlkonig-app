@@ -5,6 +5,17 @@ use triblespace::core::metadata;
 use triblespace::core::repo::StorageFlush;
 
 #[test]
+fn public_roles_match_the_supported_faculty_table() {
+    let public = faculties::collection_names::table();
+    assert_eq!(roles(), public);
+    assert!(!public.iter().any(|(_, name)| *name == "erp"));
+    for (role, name) in public {
+        assert_eq!(role_name(role), Some(name));
+    }
+    assert_eq!(role_name(genid().id), None);
+}
+
+#[test]
 fn saved_empty_bundle_roots_are_discoverable_in_another_bundle() {
     let dir = tempfile::tempdir().unwrap();
     let bootstrap = crate::config::Bootstrap::new(dir.path());
@@ -153,6 +164,7 @@ fn local_discovery_preserves_bytes_distinguishes_same_names_and_supports_exact_p
     );
     assert!(discovery.select(wiki, denied.handle()).is_err());
     assert!(discovery.select(wiki, descriptor_only.handle()).is_ok());
+    assert!(discovery.select(genid().id, own.handle()).is_err());
     assert!(
         discovery
             .select(wiki, CollectionHandle::new([95; 32]))

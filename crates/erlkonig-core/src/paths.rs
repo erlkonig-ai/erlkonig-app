@@ -92,6 +92,9 @@ impl Layout {
         }
         Ok((self.node.clone(), None))
     }
+    pub(crate) fn uses_locator(&self) -> bool {
+        self.application
+    }
     /// Unresolved construction default, for explicit isolated fixtures.
     /// Application callers use selected_node; running callers use Runtime::binding.
     pub fn bootstrap(&self) -> crate::config::Bootstrap {
@@ -163,6 +166,39 @@ Erlkonig leaves its permissions alone. Use a new or empty folder.",
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
 }
 
+/// Durable program path for generated host commands. AppImage's mounted ELF
+/// disappears after exit; the outer image remains the executable entry point.
+/// Native and app-owned short-lived child paths keep current_exe semantics.
+pub fn launcher_executable() -> io::Result<PathBuf> {
+    let executable = env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    {
+        appimage_launcher(executable, env::var_os("APPIMAGE").as_deref(), env::var_os("APPDIR").as_deref())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(executable)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn appimage_launcher(executable: PathBuf, appimage: Option<&std::ffi::OsStr>, appdir: Option<&std::ffi::OsStr>) -> io::Result<PathBuf> {
+    let Some(appdir) = appdir.map(Path::new).filter(|p| p.is_absolute()) else {
+        return Ok(executable);
+    };
+    // Ignore AppImage variables inherited from an unrelated parent process.
+    if executable.strip_prefix(appdir).ok() != Some(Path::new("usr/bin/erlkonig")) {
+        return Ok(executable);
+    }
+    let outer = appimage.map(PathBuf::from).filter(|p| p.is_absolute())
+        .ok_or_else(|| io::Error::other("AppImage did not supply its absolute outer executable path"))?;
+    let metadata = fs::metadata(&outer)?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(io::Error::other("The outer AppImage is not an executable file"));
+    }
+    Ok(outer)
+}
+
 /// Gatekeeper runs a quarantined app from a random read-only mount
 /// (`/private/var/folders/.../AppTranslocation/...`) until the user moves it.
 pub fn is_translocated(path: &Path) -> bool {
@@ -178,6 +214,28 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn appimage_host_commands_use_outer_file_with_spaces() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mount = scratch.path().join("mount with spaces");
+        let outer = scratch.path().join("Erlkonig candidate.AppImage");
+        fs::write(&outer, b"synthetic executable").unwrap();
+        fs::set_permissions(&outer, fs::Permissions::from_mode(0o700)).unwrap();
+        let inner = mount.join("usr/bin/erlkonig");
+        assert_eq!(appimage_launcher(inner.clone(), Some(outer.as_os_str()), Some(mount.as_os_str())).unwrap(), outer);
+        assert!(appimage_launcher(inner.clone(), Some(std::ffi::OsStr::new("relative.AppImage")), Some(mount.as_os_str())).is_err());
+        assert!(appimage_launcher(inner.clone(), None, Some(mount.as_os_str())).is_err());
+        fs::set_permissions(&outer, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(appimage_launcher(inner, Some(outer.as_os_str()), Some(mount.as_os_str())).is_err());
+    }
+
+    #[test]
+    fn native_launcher_ignores_unrelated_appimage_environment() {
+        let native = PathBuf::from("/usr/bin/erlkonig");
+        assert_eq!(appimage_launcher(native.clone(), None, None).unwrap(), native);
+        assert_eq!(appimage_launcher(native.clone(), Some(std::ffi::OsStr::new("/other.AppImage")), Some(std::ffi::OsStr::new("/tmp/other-app"))).unwrap(), native);
     }
 
     #[test]

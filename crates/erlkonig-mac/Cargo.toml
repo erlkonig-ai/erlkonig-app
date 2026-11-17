@@ -11,6 +11,22 @@ publish.workspace = true
 name = "crown-render"
 path = "../../scripts/crown-render.rs"
 
+[[example]]
+name = "alert-layout"
+path = "../../scripts/alert-layout.rs"
+
+[[example]]
+name = "protected-secrets-trial"
+path = "../../scripts/protected-secrets-trial.rs"
+
+[dev-dependencies]
+serde_json.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
+faculties.workspace = true
+triblespace.workspace = true
+hifitime.workspace = true
+ed25519-dalek.workspace = true
+
 [dependencies]
 erlkonig-app.workspace = true
 
@@ -24,4 +40,10 @@ block2.workspace = true
 objc2-foundation.workspace = true
 objc2-app-kit.workspace = true
 objc2-service-management.workspace = true
+objc2-local-authentication.workspace = true
+objc2-security.workspace = true
+objc2-core-foundation.workspace = true
+anyhow.workspace = true
+hex.workspace = true
 objc2-quartz-core.workspace = true
+zeroize.workspace = true

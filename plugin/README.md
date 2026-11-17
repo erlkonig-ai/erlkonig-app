@@ -13,6 +13,13 @@ The client invokes the app binary's `mcp-stdio` mode; that transport only
 forwards to an already-running app. Quit closes the owning backend, and the
 transport must never relaunch it or acquire a pile itself.
 
+HTTP sessions expire after idle periods. On the native backend's explicit
+missing-session response, the stdio adapter initializes a fresh protocol session
+on its existing connection. It reports the rejected request as not executed;
+it does not replay it. Later requests use the renewed session. Network failures
+and owner shutdown remain terminal because an admitted operation may already
+have completed. Session renewal never reconnects to a replacement app owner.
+
 The Mac's **Integrations** menu detects installed desktop apps through public
 `NSWorkspace` bundle lookup (no app launch), and executable management CLIs
 through the local resolver. Detection runs at startup and on **Refresh plugin
@@ -63,21 +70,25 @@ remain available with zero workspaces. They inspect the public identity and
 typed settings, discover local collection choices, and create/edit/remove
 bundles. `config_share_workspace` grants native access immediately to an exact
 current bundle, invoke-only by default; onward delegation requires explaining
-consequences and the user's opt-in. The normal flow is then recipient-local:
-`config_list_pending_shares` lists the collections resident native grants name
-for this node, grouped by the issuing workspace, with the exact roots, the
-claimed and the admitted access and the role (declared, or from the name
-suffix, as `role_source` says), and `config_enroll_pending_share` publishes a
-local label over exactly the roots shown, refusing a set that changed since
-the listing; a later extension takes only roots the listing shows beside the
-enrolled workspace. The JSON handoff is the fallback for nodes that have not
-connected yet: `config_probe_workspace_share` verifies the bounded signed
-role/root/name metadata without mutation (the signature/recipient binding,
-not collection admission; no proof or definition payload travels in the
-handoff) and `config_enroll_workspace_share` publishes a local label and the
-same roots under the existing key. Either enrollment then separately selects
-newly requested roots for enabled native Full sync; selection failure does
-not roll back publication.
+consequences and the user's opt-in. The recipient inspects
+`config_list_pending_shares` and `config_list_collections`, keeping claimed
+access separate from native admission. Descriptor names and declared
+roles are evidence for the model's mapping, not mandatory routing or authority.
+The model chooses exact existing roots and faculty roles for the requested
+work, including an intentional subset, and uses `config_create_workspace`
+with explicit routes or `config_edit_workspace` for an existing binding.
+Creation without routes creates fresh roots; edit routes replace the complete
+binding, so retain intended existing routes. Exact resident roots and native
+READ or WRITE admission are checked independently of names.
+
+The pending listing's `enrollable` is a status for the automatic helper,
+not a general ability to use admitted collections; when false, inspect the
+reported metadata and reason. `config_enroll_pending_share` is an
+optional convenience when its inferred mappings and complete-root selection
+already match the intended binding. Its exact-all-root checks do not apply
+to explicit create/edit. Reuse an existing local binding rather than making
+a duplicate. Workspace binding publication separately selects newly requested roots for
+enabled native Full sync; selection failure does not roll back publication.
 Native grant exchange discovers authority evidence without an app authorization
 handshake; a grant alone neither enrolls nor selects a collection.
 Peering follows native `Selected` registers, including manual selections outside
@@ -89,7 +100,17 @@ This is not global fetch isolation or a synchronization-completion receipt.
 Typed service settings are port/sync/maintenance only. Old requests containing
 `peers` are unsupported; historical peer facts remain inert. The app refreshes
 installed packages itself; reload the client at the coordinated upgrade.
-The bundled skill describes the handoff and limits. Ordinary faculties still require an exact workspace on
+Sharing returns local native-grant publication metadata. Peer exchange delivers
+proofs and sync/repair acquire descriptors; discovery and local enrollment use
+the recipient's own app. No sharing file is needed.
+
+Binary faculty inputs use host paths or returned file references. The local
+integration is authenticated, but a workspace selects collections rather than
+sandboxing host filesystem access. The calling agent must have the user's
+authority both to read that local source and to write its chosen destination.
+The protected local .1pux chooser/passphrase flow remains separate. The 1 MiB
+MCP request cap is unchanged; original bytes stay outside model arguments.
+The bundled skill describes native sharing and input limits. Ordinary faculties still require an exact workspace on
 each call. Other configuration operations grant no sharing authority; no tool
 exposes a private key, token or arbitrary path editor. The app must be open;
 this is not remote admin.

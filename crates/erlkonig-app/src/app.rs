@@ -7,6 +7,7 @@ use crate::native_menu::NativeMenu;
 use erlkonig_core::{
     install,
     paths::{self, Layout},
+    pile_upgrade::{StartupPrompt, StartupControl},
     runtime::Runtime,
 };
 use std::collections::VecDeque;
@@ -30,10 +31,17 @@ pub enum Login {
 
 /// What only the platform can do. Everything else lives in [`App`].
 pub trait Shell {
+    /// Queue a wake on the existing event loop, without waiting for that thread.
+    /// Called from egui's repaint callback while its context is write-locked.
+    fn faculties_wake(&self) -> Box<dyn Fn() + Send + Sync>;
     /// A native modal answers with the pressed button's index. A shell that
     /// draws its prompts itself returns `None`: [`App`] then queues the prompt
     /// and the shell answers later through [`App::answer`].
     fn alert(&mut self, title: &str, text: &str, buttons: &[&str]) -> Option<usize>;
+    /// Startup's native modal must also observe application termination.
+    fn startup_alert(&mut self, title: &str, text: &str, buttons: &[&str], _terminate: &Arc<AtomicBool>) -> Option<usize> {
+        self.alert(title, text, buttons)
+    }
     fn open_url(&self, url: &str);
     /// Show `path` selected in the file manager.
     fn reveal(&self, path: &Path);
@@ -50,6 +58,31 @@ pub trait Shell {
     fn stop_crown(&mut self);
     /// Ask for the status window to be shown (a no-op where none exists).
     fn show_window(&mut self);
+    /// Called only on the shell's event-loop thread. Unsupported platforms
+    /// return Unavailable, never collect credentials through an ordinary alert.
+    fn enter_secret(
+        &mut self,
+        _prompt: &erlkonig_core::secret_entry::SecretPrompt,
+        _terminate: &Arc<AtomicBool>,
+    ) -> erlkonig_core::secret_entry::EntryAnswer {
+        erlkonig_core::secret_entry::EntryAnswer::Unavailable
+    }
+    /// One exact pending read, never an unlocked session. Unsupported shells
+    /// deny without collecting a passphrase in an ordinary alert.
+    fn unlock_secret(
+        &mut self,
+        _prompt: &erlkonig_core::protected_access::ProtectedPrompt,
+        _terminate: &Arc<AtomicBool>,
+    ) -> erlkonig_core::protected_access::AccessResult {
+        erlkonig_core::protected_access::unavailable()
+    }
+    fn import_1password(
+        &mut self,
+        _prompt: &erlkonig_core::local_import::ImportPrompt,
+        _terminate: &Arc<AtomicBool>,
+    ) -> erlkonig_core::local_import::ImportAnswer {
+        erlkonig_core::local_import::ImportAnswer::Unavailable
+    }
 }
 
 /// The menu as plain data: what every entry shows, which optional entries
@@ -71,7 +104,10 @@ pub(crate) struct Items {
     pub(crate) pause_sync: Control,
     pub(crate) retry_services: Control,
     pub(crate) storage_folder: Control,
+    pub(crate) browse_faculties: Control,
     pub(crate) quit: Control,
+    pub(crate) get_update: Control,
+    pub(crate) update_visible: bool,
     /// The attention item is shown, first in the menu.
     pub(crate) status_visible: bool,
     /// The retry item is shown, after Pause sync.
@@ -136,7 +172,10 @@ impl Items {
             pause_sync: entry("erlkonig.sync", "Pause sync", false, None),
             retry_services: entry("erlkonig.retry", "Retry services", false, None),
             storage_folder: entry("erlkonig.storage", "Show storage folder", false, None),
+            browse_faculties: entry("erlkonig.faculties", "View data", false, None),
             quit: entry("erlkonig.quit", "Quit Erlkonig", true, None),
+            get_update: entry("erlkonig.get-update", "Get update…", true, None),
+            update_visible: false,
             status_visible: false,
             retry_visible: false,
             rows: vec![Row::NoClients, Row::Refresh],
@@ -168,6 +207,8 @@ pub enum Then {
     LoginSettings,
     /// Button 0 installs the plugin for these detected clients.
     Connect(Vec<install::Host>),
+    /// Answer only the migration/branch choice offered by this startup task.
+    StartupChoice,
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -199,6 +240,7 @@ pub struct View {
     pub retry: Option<Control>,
     pub integrations: Vec<Control>,
     pub storage: Control,
+    pub browse_faculties: Control,
     pub login: Control,
     pub quit: Control,
     pub prompt: Option<Prompt>,
@@ -208,6 +250,11 @@ pub struct App<S: Shell> {
     pub shell: S,
     layout: Layout,
     runtime: Option<Runtime>,
+    faculties_browser: Option<crate::faculties_browser::BrowserWindow>,
+    open_faculties: bool,
+    update_notice: Option<crate::update_notice::UpdateNotice>,
+    startup_task: Option<StartupTask>,
+    startup_prompt: Option<StartupPrompt>,
     pub problem: Option<String>,
     items: Items,
     /// The native menu, once a shell has asked for it on its own thread.
@@ -250,6 +297,31 @@ struct PluginTask {
     thread: std::thread::JoinHandle<PluginResult>,
 }
 
+struct StartupTask {
+    control: StartupControl,
+    thread: Option<std::thread::JoinHandle<Result<Runtime, String>>>,
+}
+
+impl StartupTask {
+    fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(|thread| thread.is_finished())
+    }
+
+    fn join(mut self) -> std::thread::Result<Result<Runtime, String>> {
+        self.thread.take().expect("startup worker").join()
+    }
+}
+
+impl Drop for StartupTask {
+    fn drop(&mut self) {
+        // Event-loop failures must not detach a startup owner either.
+        self.control.cancel();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 fn host_index(host: install::Host) -> usize {
     match host {
         install::Host::OpenAi => 0,
@@ -263,6 +335,11 @@ impl<S: Shell> App<S> {
             shell,
             layout,
             runtime: None,
+            faculties_browser: None,
+            open_faculties: false,
+            update_notice: None,
+            startup_task: None,
+            startup_prompt: None,
             problem: None,
             items: Items::new(),
             native: None,
@@ -303,15 +380,66 @@ impl<S: Shell> App<S> {
 
     /// Start native services once the platform's status item exists.
     pub fn start(&mut self) {
+        if self.runtime.is_some() || self.startup_task.is_some() || self.quitting.is_some() {
+            return;
+        }
         if std::env::current_exe().is_ok_and(|p| paths::is_translocated(&p)) {
             self.problem = Some("Move Erlkonig to Applications, then open it again.".into());
         } else {
-            match Runtime::start(&self.layout) {
-                Ok(runtime) => self.runtime = Some(runtime),
-                Err(error) => self.problem = Some(format!("{error:#}")),
+            let layout = self.layout.clone();
+            let control = StartupControl::new(true);
+            let worker = control.clone();
+            match std::thread::Builder::new().name("erlkonig-startup".into())
+                .spawn(move || Runtime::start_controlled(&layout, &worker).map_err(|error| format!("{error:#}")))
+            {
+                Ok(thread) => self.startup_task = Some(StartupTask { control, thread: Some(thread) }),
+                Err(error) => self.problem = Some(format!("Cannot start local services: {error}")),
             }
         }
-        self.check_plugins();
+        self.update_notice.get_or_insert_with(crate::update_notice::UpdateNotice::new);
+        self.next_refresh = Instant::now();
+    }
+
+    fn finish_startup_task(&mut self) {
+        if !self.startup_task.as_ref().is_some_and(StartupTask::is_finished) {
+            return;
+        }
+        let task = self.startup_task.take().expect("finished startup task");
+        if self.quitting.is_some() {
+            self.quitting = Some(Instant::now());
+        }
+        self.startup_prompt = None;
+        self.prompts.retain(|prompt| prompt.then != Then::StartupChoice);
+        match task.join() {
+            Ok(Ok(runtime)) => {
+                if self.quitting.is_some() { runtime.begin_shutdown(); }
+                self.runtime = Some(runtime);
+            }
+            Ok(Err(error)) => self.problem = Some(error),
+            Err(_) => self.problem = Some("Local storage startup did not complete. The original pile was retained; inspect the node locator before retrying.".into()),
+        }
+        if self.quitting.is_none() {
+            self.check_plugins();
+        }
+    }
+
+    fn offer_startup_choice(&mut self) {
+        if self.startup_prompt.is_some() { return; }
+        let Some(prompt) = self.startup_task.as_ref().and_then(|task| task.control.take_prompt()) else { return; };
+        let title = prompt.title.clone();
+        let text = prompt.details.clone();
+        let labels = [prompt.approve_label.clone(), prompt.decline_label.clone()];
+        let buttons = [labels[0].as_str(), labels[1].as_str()];
+        self.startup_prompt = Some(prompt);
+        match self.shell.startup_alert(&title, &text, &buttons, &self.terminate) {
+            Some(answer) => self.follow(Then::StartupChoice, answer),
+            None => {
+                self.prompts.push_back(Prompt {
+                    title, text, buttons: buttons.iter().map(|s| (*s).into()).collect(), then: Then::StartupChoice,
+                });
+                self.shell.show_window();
+            }
+        }
     }
 
     /// The monotonic origin the crown's activity is measured against.
@@ -367,6 +495,11 @@ impl<S: Shell> App<S> {
                     self.change_plugins(install::Change::Install, hosts);
                 }
             }
+            Then::StartupChoice => {
+                if let Some(prompt) = self.startup_prompt.take() {
+                    prompt.answer(answer == 0 && self.quitting.is_none() && !self.terminate.load(Ordering::Relaxed));
+                }
+            }
         }
     }
 
@@ -383,6 +516,7 @@ impl<S: Shell> App<S> {
     /// then the last plugin failure and any client configuration notes.
     fn details(&self) -> String {
         let mut text = self.problem.clone().unwrap_or_else(|| {
+            if let Some(task) = &self.startup_task { return task.control.detail(); }
             self.runtime
                 .as_ref()
                 .map(|r| {
@@ -416,6 +550,15 @@ impl<S: Shell> App<S> {
         self.ask(title, sentence, &["OK"], Then::Nothing);
     }
 
+    /// Worker cleanup must never open a modal: one raised before Quit can
+    /// block a later Quit just as surely as one raised during shutdown.
+    fn viewer_failed(&mut self, error: String) {
+        let diagnostic = format!("Faculties viewer: {error}");
+        eprintln!("Erlkonig: {diagnostic}");
+        self.problem = Some(diagnostic);
+        self.next_refresh = Instant::now();
+    }
+
     /// The menu as it is right now, plus the oldest unanswered prompt.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn view(&self) -> View {
@@ -431,6 +574,7 @@ impl<S: Shell> App<S> {
                 .filter_map(|row| items.row(*row).cloned())
                 .collect(),
             storage: items.storage_folder.clone(),
+            browse_faculties: items.browse_faculties.clone(),
             login: items.login.clone(),
             quit: items.quit.clone(),
             prompt: self.prompts.front().cloned(),
@@ -440,7 +584,32 @@ impl<S: Shell> App<S> {
     pub fn refresh(&mut self, event_loop: &ActiveEventLoop) {
         if self.tick() {
             event_loop.exit();
+            return;
         }
+        if self.open_faculties && self.quitting.is_none() {
+            if let Some(window) = &self.faculties_browser {
+                // A closed window can still be settling its worker. Keep the
+                // request until step() reaps it; never create a second owner.
+                if window.raise() { self.open_faculties = false; }
+            } else if let Some(runtime) = &mut self.runtime {
+                self.open_faculties = false;
+                match crate::faculties_browser::BrowserWindow::open(event_loop, runtime, self.shell.faculties_wake()) {
+                    Ok(window) => self.faculties_browser = Some(window),
+                    // A spawn can also reap a prior failed worker. Keep that
+                    // route passive too, rather than opening a Mac modal.
+                    Err(error) => self.viewer_failed(error),
+                }
+            }
+        }
+    }
+
+    /// Route only the Faculties window; platform status windows remain separate.
+    pub fn faculties_window_event(&mut self, id: winit::window::WindowId, event: &winit::event::WindowEvent) -> bool {
+        self.faculties_browser.as_mut().is_some_and(|window| window.on_event(id, event))
+    }
+
+    pub fn next_wake(&self) -> Instant {
+        self.faculties_browser.as_ref().map_or(self.next_refresh, |window| window.next_wake(self.next_refresh))
     }
 
     /// One refresh step; true once the event loop should exit. The native
@@ -455,15 +624,26 @@ impl<S: Shell> App<S> {
         if self.terminate.load(Ordering::Relaxed) && self.quitting.is_none() {
             self.quit();
         }
+        self.finish_startup_task();
+        if let Some(runtime) = &mut self.runtime {
+            if let Err(error) = runtime.reap_faculties() {
+                self.viewer_failed(format!("{error:#}"));
+            }
+        }
+        if self.faculties_browser.as_mut().is_some_and(|child| child.finished()) {
+            self.faculties_browser = None;
+        }
+        self.items.browse_faculties.enabled = self.runtime.is_some() && self.quitting.is_none();
         if let Some(since) = self.quitting {
             let mut exit = false;
-            if since.elapsed() >= Duration::from_secs(15) {
+            if self.startup_task.is_none() && since.elapsed() >= Duration::from_secs(15) {
                 // The person's Quit is final. A stuck admitted native call
                 // cannot leave the app alive indefinitely. Like Force Quit,
                 // this fallback cannot promise to flush an unfinished write.
                 eprintln!(
                     "Erlkonig: 15-second shutdown grace elapsed; terminating this application process"
                 );
+                // Process termination is not a claim that native work drained.
                 std::process::exit(1);
             }
             self.items.quit.label = if since.elapsed() < Duration::from_secs(5) {
@@ -473,6 +653,9 @@ impl<S: Shell> App<S> {
             }
             .into();
             if self.runtime.as_ref().is_none_or(Runtime::is_finished)
+                && self.startup_task.is_none()
+                && self.faculties_browser.is_none()
+                && self.update_notice.as_ref().is_none_or(crate::update_notice::UpdateNotice::is_finished)
                 && self
                     .plugin_task
                     .as_ref()
@@ -498,10 +681,52 @@ impl<S: Shell> App<S> {
         if Instant::now() < self.next_refresh {
             return false;
         }
+        if let Some(notice) = &mut self.update_notice {
+            notice.poll();
+            self.items.update_visible = notice.offered.is_some();
+        }
+        self.offer_startup_choice();
+        if self.terminate.load(Ordering::Relaxed) {
+            self.quit();
+            return false;
+        }
+        if let Some(prompt) = self.runtime.as_ref().and_then(Runtime::take_protected_prompt) {
+            let answer = self.shell.unlock_secret(&prompt, &self.terminate);
+            if self.terminate.load(Ordering::Relaxed) { self.quit(); }
+            prompt.answer(answer);
+            if self.quitting.is_some() {
+                self.next_refresh = Instant::now();
+                return false;
+            }
+        }
+        if let Some(prompt) = self.runtime.as_ref().and_then(Runtime::take_secret_prompt) {
+            let answer = self.shell.enter_secret(&prompt, &self.terminate);
+            // A signal may have arrived inside a native modal loop. Close the
+            // bridge before sending its answer, so even a stale Save is discarded.
+            if self.terminate.load(Ordering::Relaxed) {
+                self.quit();
+            }
+            prompt.answer(answer);
+            if self.quitting.is_some() {
+                self.next_refresh = Instant::now();
+                return false;
+            }
+        }
+        if let Some(prompt) = self.runtime.as_ref().and_then(Runtime::take_import_prompt) {
+            let answer = self.shell.import_1password(&prompt, &self.terminate);
+            if self.terminate.load(Ordering::Relaxed) { self.quit(); }
+            prompt.answer(answer);
+            if self.quitting.is_some() {
+                self.next_refresh = Instant::now();
+                return false;
+            }
+        }
         self.finish_plugin_task();
         let status = self.runtime.as_ref().map(Runtime::status);
         let attention = if self.problem.is_some() {
             Some("Attention needed")
+        } else if self.startup_task.is_some() {
+            Some("Preparing local storage…")
         } else {
             status
                 .as_ref()
@@ -542,7 +767,7 @@ impl<S: Shell> App<S> {
         let now = self.origin.elapsed();
         crown::observe(
             &mut self.activity,
-            status.as_ref().is_some_and(|s| s.active_work > 0),
+            self.startup_task.is_some() || status.as_ref().is_some_and(|s| s.active_work > 0),
             now,
         );
         self.shell.crown(self.activity, attention.is_some());
@@ -552,9 +777,14 @@ impl<S: Shell> App<S> {
 
     pub fn quit(&mut self) {
         self.quitting.get_or_insert_with(Instant::now);
+        self.open_faculties = false;
+        if let Some(child) = &mut self.faculties_browser { child.stop(); }
+        if let Some(notice) = &self.update_notice { notice.cancel(); }
         self.shell.stop_crown(); // Invalidate display callbacks before service teardown.
         // Quit is final: unanswered prompts no longer lead anywhere.
         self.prompts.clear();
+        self.startup_prompt = None;
+        if let Some(task) = &self.startup_task { task.control.cancel(); }
         if let Some(task) = &self.plugin_task {
             task.cancel.store(true, Ordering::Relaxed);
         }
@@ -566,7 +796,9 @@ impl<S: Shell> App<S> {
             &mut items.cowork,
             &mut items.refresh_plugins,
             &mut items.storage_folder,
+            &mut items.browse_faculties,
             &mut items.quit,
+            &mut items.get_update,
             &mut items.login,
             &mut items.status,
             &mut items.pause_sync,
@@ -583,10 +815,23 @@ impl<S: Shell> App<S> {
 
     /// The platform can terminate without returning from its event loop
     /// (AppKit delivers LoopExiting synchronously from
-    /// applicationWillTerminate), so drain here, with the same final
-    /// process-exit deadline.
+    /// applicationWillTerminate), so drain startup here before applying the
+    /// existing service-shutdown deadline.
     pub fn finish_termination(&mut self) {
+        // AppKit can bypass quit(); cancel and join the advisory request here too.
+        self.update_notice = None;
         self.shell.stop_crown();
+        if let Some(child) = &mut self.faculties_browser { child.stop(); }
+        if let Some(task) = &self.startup_task { task.control.cancel(); }
+        self.startup_prompt = None;
+        // A converter may be finishing one native blob/branch operation.
+        // Keep ownership and node.lock until it reaches its cancellation
+        // checkpoint; never detach it or activate a partially checked output.
+        while self.startup_task.as_ref().is_some_and(|task| !task.is_finished()) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        self.quitting.get_or_insert_with(Instant::now);
+        self.finish_startup_task();
         if let Some(task) = &self.plugin_task {
             task.cancel.store(true, Ordering::Relaxed);
         }
@@ -596,6 +841,15 @@ impl<S: Shell> App<S> {
             runtime.begin_shutdown();
         }
         let since = self.quitting.unwrap_or_else(Instant::now);
+        while self.faculties_browser.as_mut().is_some_and(|child| !child.finished()) {
+            if since.elapsed() >= Duration::from_secs(15) {
+                // Runtime still owns the worker; only process termination can
+                // abandon an uncooperative admitted native operation.
+                std::process::exit(1);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        self.faculties_browser = None;
         while self
             .plugin_task
             .as_ref()
@@ -905,7 +1159,12 @@ impl<S: Shell> App<S> {
             );
             return;
         }
-        let executable = match std::env::current_exe() {
+        // Removal never stages a command and must still work after the image moves.
+        let executable = match if change == install::Change::Remove {
+            Ok(PathBuf::new())
+        } else {
+            paths::launcher_executable()
+        } {
             Ok(path) => path,
             Err(error) => {
                 self.plugin_failed(
@@ -998,7 +1257,7 @@ impl<S: Shell> App<S> {
         if installed.is_empty() {
             return;
         }
-        let (Some(url), Ok(executable)) = (self.mcp_url(), std::env::current_exe()) else {
+        let (Some(url), Ok(executable)) = (self.mcp_url(), paths::launcher_executable()) else {
             return;
         };
         let layout = self.layout.clone();
@@ -1020,7 +1279,7 @@ impl<S: Shell> App<S> {
             );
             return;
         };
-        let executable = match std::env::current_exe() {
+        let executable = match paths::launcher_executable() {
             Ok(path) => path,
             Err(_) => return,
         };
@@ -1090,6 +1349,10 @@ impl<S: Shell> App<S> {
         let id = event.id();
         if id == &self.items.quit.id {
             self.quit();
+        } else if id == &self.items.get_update.id {
+            if self.quitting.is_none() && self.items.update_visible {
+                self.shell.open_url(erlkonig_core::update_catalog::DOWNLOAD_URL);
+            }
         } else if id == &self.items.pause_sync.id {
             self.toggle_sync();
         } else if id == &self.items.retry_services.id {
@@ -1100,6 +1363,10 @@ impl<S: Shell> App<S> {
                     &["OK"],
                     Then::Nothing,
                 );
+            }
+        } else if id == &self.items.browse_faculties.id {
+            if self.quitting.is_none() && self.runtime.is_some() {
+                self.open_faculties = true;
             }
         } else if id == &self.items.storage_folder.id {
             self.show_storage_folder();
@@ -1143,6 +1410,7 @@ mod tests {
     }
 
     impl Shell for Fake {
+        fn faculties_wake(&self) -> Box<dyn Fn() + Send + Sync> { Box::new(|| {}) }
         fn alert(&mut self, title: &str, _: &str, _: &[&str]) -> Option<usize> {
             self.log.borrow_mut().push(format!("alert {title}"));
             self.modal
@@ -1185,6 +1453,99 @@ mod tests {
     fn app(shell: Fake) -> App<Fake> {
         let dir = std::env::temp_dir().join("erlkonig-app-tests-unused");
         App::new(shell, Layout::new(dir), Arc::new(AtomicBool::new(false)))
+    }
+
+    #[test]
+    fn viewer_panic_reporting_is_passive_before_and_during_quit() {
+        for already_quitting in [false, true] {
+            // The fake records both modal alerts and nonmodal window prompts.
+            let mut app = app(Fake::default());
+            let log = app.shell.log.clone();
+            if already_quitting { app.quit(); }
+            app.viewer_failed("Faculties viewer worker panicked".into());
+            assert!(app.details().contains("Faculties viewer worker panicked"));
+            assert!(app.prompts.is_empty());
+            if !already_quitting {
+                assert!(!app.tick());
+                assert!(app.items.status_visible);
+                assert_eq!(app.items.status.label, "Attention needed");
+                app.quit();
+            }
+            assert!(app.tick(), "a worker diagnostic never waits for acknowledgement before Quit");
+            assert!(app.prompts.is_empty());
+            assert!(!log.borrow().iter().any(|line| line.starts_with("alert ") || line == "window"));
+        }
+    }
+
+    #[test]
+    fn update_is_only_a_passive_menu_command_to_the_fixed_download_page() {
+        let mut app = app(Fake::default());
+        let log = app.shell.log.clone();
+        let click = || MenuEvent { id: MenuId::new("erlkonig.get-update") };
+        assert!(!app.items.update_visible);
+        app.on_menu(click());
+        assert!(log.borrow().is_empty());
+        let mut notice = crate::update_notice::UpdateNotice::new();
+        notice.offered = Some("0.2.0".into());
+        app.update_notice = Some(notice);
+        app.tick();
+        assert!(app.items.update_visible);
+        assert_eq!(app.items.get_update.label, "Get update…");
+        assert!(app.prompts.is_empty());
+        assert!(!log.borrow().iter().any(|line| line.starts_with("alert ") || line == "window"));
+        log.borrow_mut().clear();
+        app.on_menu(click());
+        assert_eq!(&*log.borrow(), &["open https://erlkonig.ai/#downloads"]);
+        app.quit();
+        log.borrow_mut().clear();
+        app.on_menu(click());
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn startup_progress_stays_responsive_and_quit_joins_the_worker() {
+        let mut app = app(Fake::default());
+        let control = StartupControl::new(true);
+        let worker_control = control.clone();
+        let (release, wait) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            wait.recv().unwrap(); // One deliberately nonpreemptible operation.
+            assert!(worker_control.is_cancelled());
+            Err("startup cancelled".into())
+        });
+        app.startup_task = Some(StartupTask { control, thread: Some(thread) });
+        assert!(!app.tick());
+        assert!(app.view().details.contains("Inspecting local storage"));
+        assert_eq!(app.view().attention.unwrap().label, "Preparing local storage…");
+        app.quit();
+        app.quitting = Some(Instant::now() - Duration::from_secs(16));
+        assert!(!app.tick(), "Quit retains the in-flight startup owner past the ordinary service deadline");
+        // The normal service deadline begins after this startup task drains.
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.tick() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.startup_task.is_none());
+        assert!(app.runtime.is_none());
+    }
+
+    #[test]
+    fn dropping_the_app_cancels_and_joins_startup() {
+        let mut app = app(Fake::default());
+        let control = StartupControl::new(true);
+        let worker_control = control.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_done = done.clone();
+        let thread = std::thread::spawn(move || {
+            while !worker_control.is_cancelled() { std::thread::sleep(Duration::from_millis(1)); }
+            worker_done.store(true, Ordering::Relaxed);
+            Err("startup cancelled".into())
+        });
+        app.startup_task = Some(StartupTask { control, thread: Some(thread) });
+        drop(app);
+        assert!(done.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -1250,6 +1611,21 @@ mod tests {
                 .map(String::from)
                 .to_vec()
         );
+    }
+
+    #[test]
+    fn faculties_browser_requires_the_existing_runtime() {
+        let mut app = app(Fake::default());
+        assert!(!app.view().browse_faculties.enabled);
+        assert_eq!(app.view().browse_faculties.label, "View data");
+        app.on_menu(MenuEvent { id: app.items.browse_faculties.id.clone() });
+        assert!(!app.open_faculties);
+        assert!(app.faculties_browser.is_none());
+        app.quit();
+        app.on_menu(MenuEvent { id: app.items.browse_faculties.id.clone() });
+        assert!(!app.open_faculties);
+        assert!(!app.view().browse_faculties.enabled);
+        assert_eq!(app.view().browse_faculties.label, "View data");
     }
 
     #[test]
@@ -1405,6 +1781,7 @@ mod tests {
                 row("Pause sync", false, None),
                 sep(),
                 row("Integrations", true, None),
+                row("View data", false, None),
                 row("Show storage folder", false, None),
                 sep(),
                 row("Open at login", true, Some(false)),
@@ -1426,7 +1803,7 @@ mod tests {
         let top = native_rows(&menu.items());
         assert_eq!(top[0], row("Attention needed", true, None));
         assert_eq!(top[1], row("Resume sync", false, None));
-        assert_eq!(top[6], row("Open at login", true, Some(true)));
+        assert_eq!(top[7], row("Open at login", true, Some(true)));
         assert_eq!(
             native_rows(&integrations_submenu(&menu).items())[1],
             row("Refresh plugin status…", true, None)

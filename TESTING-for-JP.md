@@ -7,6 +7,97 @@ the app deliberately refuses to share its data-owner lock with it.
 
 These are pending interactive checks, not an already-passed checklist:
 
+Supported framing upgrade (synthetic-only, isolated candidate): run the same
+`scripts/accept/isolated_app.py` candidate/helper command documented in README
+with `--old-framing` and a new absolute fixture root. The helper preserves real
+app settings and workspace routes, appends a public released-format fixture
+record, and writes the public `node.json` locator with the same existing key.
+The acceptance runner checks a fresh sibling is selected, source bytes and key
+are retained, settings/routes remain usable, and restart keeps that selection.
+On the first launch choose **Migrate** in the candidate's **Update local data?**
+prompt; the runner allows two minutes for that explicit response. Separately
+choose **Not now**: the source and locator must remain unchanged and local
+services must remain stopped. Reopening asks again; a completed update's next
+launch must not ask again. Noninteractive startup must never silently consent.
+This exercises framing conversion, not the separately authored `/32` canonical
+cutover. It must not be reported as acceptance of an actual old DMG until that
+artifact's writer format has also been exercised.
+
+For signed `/32` app acceptance, use `--legacy32-writer /absolute/legacy32_writer`
+instead of `--old-framing`. Build `scripts/accept/legacy32_writer.rs` as an example
+inside an isolated historical core checkout at
+`3ca5c1cb5504d8ff60730edfe5bf641b01f44913`, without editing that library. The
+candidate's fixture helper exports synthetic Config/workspace blobs and unsigned
+commit coordinates; that historical library independently stores and signs them.
+The runner records writer/source hashes, then checks native migration consent,
+the real node locator, preserved identity/settings/workspace, and silent restart.
+This is synthetic app-state acceptance under the historical writer, not a copy
+of anyone's installed data. The two ignored `pile_upgrade::tests::historical*`
+tests use `ERLKONIG_LEGACY32_WRITER` for the same boundary, including an unmet
+foreign-author case that must never activate a replacement.
+
+For an old branch fixture, check that the native prompt displays its readable
+label, exact ID and this node's public identity. Cancel leaves the source and
+locator unchanged. Import explicitly adopts that collection only. Quit while
+waiting must close the prompt and join startup; Quit during conversion waits
+for a native-operation checkpoint. Current piles with retained branch pins
+must start without repeating the import prompt.
+
+Protected local 1Password importer (synthetic-only, isolated candidate):
+
+The source-only helper extension is `protected-secrets-trial --interactive-import
+NEW_ABSOLUTE_ROOT`. Launch only after explicit coordination: set
+`HOME=NEW_ABSOLUTE_ROOT/home` and `TMPDIR=NEW_ABSOLUTE_ROOT/tmp` in a clean
+environment; the root must not exist yet. The helper creates public synthetic
+export/key/store files there, starts no normal runtime/services, and only returns
+its pre-opened synthetic source when that exact fixture is selected. Other paths
+are never opened. Five deliberate UI phases test picker Cancel, passphrase Cancel,
+new Save, wrong-passphrase verification and correct receipt reuse. The entire
+helper is bounded to 15 minutes; prompt admission remains 120 seconds. This is
+not an automatically passed check, and it does not replace production deployment
+acceptance. Existing `--interactive` password-trial mode is unchanged.
+
+- Call `secrets_import_1password_local` with an exact workspace. Only the
+  local picker may select the invented `.1pux`; no file path or data goes in
+  the tool call. Cancel the picker, then separately Cancel the passphrase
+  confirmation; neither publishes an import.
+- Verify the bounded confirmation names the workspace, explicitly says NEW
+  import (or prior receipt verification), no ordinary node-key access, older
+  readable copies NOT revoked, no Touch ID/recovery, and once-only work after
+  Save. Confirm it fits the screen without the long-details modal path.
+- Wrong extension/non-regular file, changed source, empty/mismatched passphrase,
+  shutdown and expiry before admission must save nothing. After admission a
+  long import can drain beyond the UI deadline; never infer rollback from a
+  closed connection. Check metadata only, not secret exports, for completion.
+- Successful synthetic import returns an opaque receipt and counts only.
+  Explicitly verify that receipt with the same local export/passphrase, then
+  test wrong passphrase and wrong export: neither may create a replacement.
+  Omitting the receipt intentionally requests another new import.
+- Ordinary node-key reads of original/items/attachments/receipt must fail;
+  titles, export path, values and passphrase must not appear in results/logs.
+  Do not perform these checks with the real company export.
+
+Protected Secrets candidate checks (only with invented data in an isolated
+store/HOME; do not run against an existing credential):
+
+- Create a protected generic item and a protected login. Confirm the separate
+  app passphrase twice; mismatch, empty input, over 1024 UTF-8 bytes, Cancel,
+  shutdown and the 120-second deadline must publish nothing.
+- Request raw plaintext, private facts, structural inspection, one exact
+  text/binary field and a TOTP code separately. Confirm each prompt describes
+  its different disclosure and remains screen-bounded with long labels. A
+  second request must ask again, not reuse the previous passphrase/unlock.
+- Cancel a pending request, including after its native window is visible;
+  verify no plaintext output. Disconnect is not currently a cancellation
+  guarantee: allow only synthetic calls to reach the deadline.
+- The current ad-hoc candidate must say Touch ID is not configured. No device
+  key may be created merely by startup, metadata listing or drawing a prompt.
+  Real Secure Enclave enrollment remains a separate, explicitly interactive
+  acceptance after provisioned signing is available: verify fresh Touch ID per
+  access, cancellation, lockout, enrollment changes, missing hardware/key,
+  hardware loss recovery and key access across a signed app upgrade. Never
+  report source/mock tests as having passed these hardware checks.
+
 1. Launch the candidate. Expect one crown, no Dock window, and a clickable
    status line. A fresh app store enables sync of permitted collections and
    maintenance of supported attached collections. No background-node approval
@@ -141,3 +232,39 @@ Native menu compilation and GUI interactions require a reserved Mac build/run;
 Rust parser checks and Linux tests do not establish AppKit correctness. Local
 MCP runs on the host through Desktop; Cowork's shell VM is a separate execution
 environment. No remote Connector or public tunnel is configured by this app.
+
+## Faculties viewer candidate
+
+Use an isolated candidate and synthetic pile/key/profile, never the installed
+app or production pile for the following acceptance. The original app41 lock is
+retained separately; the candidate adds the named Lissajous/widget dependency
+closure. Source tests alone do not establish GUI acceptance.
+
+- Crown → Browse Faculties opens one window without another backend/listener. The
+  menu disables while open; close/reopen and app Quit leave no child process.
+- An empty configuration shows an honest empty state. Two identically named
+  workspaces remain distinguishable and route to different synthetic pages.
+  Nothing is selected implicitly, and no pile/key/hex-input form appears.
+- Expand Wiki, Compass, Messages, Files and Memory in the same window. Verify
+  the original card interactions and whole-graph dots. A missing or denied
+  optional route leaves other readable cards usable; missing roles never
+  select default roots. Return A → B → A and verify card navigation resets.
+- Search/open a design/BOM page, follow an exact old revision and an entry link,
+  and show both tips of a concurrent fork. Files open only from that workspace's
+  configured Files route. Missing text/file bytes have visible unavailable
+  messages; a missing optional Files descriptor/frontier leaves Wiki usable.
+  Every file action has its own preview root. Replay directory R(X, privateY) in workspace A then R(X) in B and verify B cannot retain A’s privateY. Cancel after a write and verify no launch or partial export remains.
+  There is no peer acquisition from the viewer.
+- While the window holds an old observation, edit/remove its workspace. Refresh
+  clears stale content, and a file click rejects the changed binding before
+  exporting anything. Reselect during a slow load: its completion cannot replace
+  the new choice, including same-selection Refresh and A → B → A. File clicks
+  run off-thread against their pinned observation and are never replayed after
+  reselection. Changing the signing key at the same path is rejected.
+- Initial load and Refresh keep the crown and window controls responsive; local
+  Typst rendering is still synchronous. Parent EOF and Quit close the window;
+  an unresponsive child is killed/reaped within the parent grace.
+- Existing routed viewer_capture is now enabled by widgets. Use a bounded
+  synthetic Files target to verify PNG output, and invalid options to verify
+  rejection before rendering. Test workspace rejection/route isolation too.
+  Do not infer disconnect cancellation or a total memory bound from this test.

@@ -78,7 +78,7 @@ impl ConfigView {
         Ok(text.to_string())
     }
 
-    fn is_current(&self, snapshot: &PileSnapshot) -> bool {
+    pub(crate) fn is_current(&self, snapshot: &PileSnapshot) -> bool {
         self.observed.is_current(snapshot)
             && snapshot.changes_for(
                 self.observed.snapshot(),

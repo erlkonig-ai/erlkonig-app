@@ -128,9 +128,13 @@ impl Fixture {
         self.call("config_share_workspace", args)
     }
 
-    fn enroll(&self, invitation: &Value) -> Result<Value> {
-        self.call("config_enroll_workspace_share", json!({"observation":self.inspect()["observation"],
-            "bootstrap":invitation["bootstrap"],"label":"Local shared workspace"}))
+    /// Deterministic native evidence acquisition, followed by the same local
+    /// pending-share operation exposed to clients; no file or network claim.
+    fn enroll_native(&self, owner: &Fixture, workspace: &Workspace) -> Result<Value> {
+        owner.repair_authority_to(self, workspace);
+        owner.publish_descriptors_to(self, workspace);
+        self.enroll_pending(&workspace.anchor, &self.shown_roots(&workspace.anchor),
+            Some("Local shared workspace"))
     }
 
     fn list_pending(&self) -> Value {
@@ -274,7 +278,7 @@ impl Fixture {
         for root in workspace.routes.values().copied().collect::<std::collections::BTreeSet<_>>() {
             let overlay = triblespace_net::collection_activation::collection_repair_overlay(&snapshot, root).unwrap();
             let evidence = overlay.authorization_evidence();
-            match evidence.authorized_readers() {
+            match evidence.authorized_readers(&snapshot) {
                 CollectionReadAudience::Open => {}
                 CollectionReadAudience::Restricted(subjects) => assert!(subjects.contains(&target.signer.verifying_key()), "server resident authority admits this endpoint"),
             }
@@ -355,19 +359,21 @@ fn sharing_read_only_enrolls_same_roots_and_reads_without_write_or_delegation() 
     let third = Fixture::new();
     let id = owner.create("Shared research");
     let original = owner.workspace(&id);
+    assert_eq!(original.routes.len(), workspace::roles().len());
     call(&owner.dispatch, "compass_add", json!({"workspace":id,"title":"Shared evidence"})).unwrap();
     let before = owner.inspect();
-    let invitation = owner.share(&id, &recipient, "read_only", None).unwrap();
+    let shared = owner.share(&id, &recipient, "read_only", None).unwrap();
     let key = triblespace::core::signing_key_file::load_existing(&owner.config.binding.key).unwrap();
-    let encoded = invitation.to_string();
+    let encoded = shared.to_string();
     assert!(!encoded.contains(&hex::encode(key.to_bytes())));
     assert!(!encoded.contains(owner.config.binding.key.to_str().unwrap()));
     assert!(!encoded.contains(owner.config.binding.pile.to_str().unwrap()));
-    assert_eq!(invitation["delegate"], false);
-    assert_eq!(invitation["sync_complete"], false);
-    assert_eq!(before["observation"], owner.inspect()["observation"], "inviting does not edit Config");
+    assert_eq!(shared["delegate"], false);
+    assert_eq!(shared["sync_complete"], false);
+    assert_eq!(before["observation"], owner.inspect()["observation"], "sharing does not edit Config");
     let owner_proofs = owner.proofs();
-    assert_eq!(owner.share(&id, &recipient, "read_only", None).unwrap(), invitation);
+    let repeated = owner.share(&id, &recipient, "read_only", None).unwrap();
+    assert_eq!(repeated, shared);
     assert_eq!(owner.proofs(), owner_proofs, "repeat issue is a native set no-op");
     {
         let mut guard = owner.config.node.lock().unwrap();
@@ -379,35 +385,10 @@ fn sharing_read_only_enrolls_same_roots_and_reads_without_write_or_delegation() 
             assert!(collection.reader_is_admitted(&snapshot, key).unwrap(), "grant is valid before recipient enrollment");
         }
     }
-    let before_probe = recipient.inspect();
-    let pile_before = std::fs::read(&recipient.config.binding.pile).unwrap();
-    let probe = recipient.call("config_probe_workspace_share", json!({"bootstrap":invitation["bootstrap"]})).unwrap();
-    assert_eq!(probe["source_label"], "Shared research");
-    assert_eq!(probe["source_workspace"], id);
-    assert_eq!(probe["access"], "read_only");
-    assert_eq!(probe["metadata_verified"], true);
-    assert_eq!(probe["native_admission"], "not_confirmed_by_probe");
-    assert_eq!(probe["collections"].as_array().unwrap().len(), original.routes.len());
-    assert!(probe["collections"].as_array().unwrap().iter().any(|row|
-        row["role"] == "compass" && row["names"] == json!(["Shared research · compass"])));
-    assert_eq!(before_probe, recipient.inspect(), "probe has no Config mutation");
-    assert_eq!(pile_before, std::fs::read(&recipient.config.binding.pile).unwrap(), "probe imports nothing");
-    let wire: Value = serde_json::from_str(invitation["bootstrap"].as_str().unwrap()).unwrap();
-    assert!(wire.get("proofs").is_none(), "handoff never carries proof bytes");
-    for value in wire["blobs"].as_array().unwrap() {
-        use triblespace::core::blob::{Blob, Bytes, TryFromBlob};
-        let blob = Blob::<blobencodings::SimpleArchive>::new(Bytes::from_source(hex::decode(value["bytes"].as_str().unwrap()).unwrap()));
-        if let Ok(facts) = TribleSet::try_from_blob(blob) {
-            assert!(!exists!(pattern!(&facts, [{ triblespace::core::capability::capability_action: _?action }])), "handoff never carries capability definition bodies");
-        }
-    }
     assert_eq!(recipient.inspect()["workspaces"], json!([]));
-    let unselected = recipient.selection();
-    for root in original.routes.values() {
-        assert!(!unselected.sync.contains(root), "off-store probe cannot select Full hydration");
-        assert!(!unselected.maintenance.contains(root), "off-store probe cannot select Driver upkeep");
-    }
-    let accepted = recipient.enroll(&invitation).unwrap();
+    assert!(original.routes.values().all(|root| !recipient.selection().sync.contains(root)),
+        "a sender grant does not select recipient roots");
+    let accepted = recipient.enroll_native(&owner, &original).unwrap();
     assert_eq!(accepted["access"], "read_only");
     assert_eq!(accepted["delegate"], false);
     assert_eq!(accepted["sync_complete"], false);
@@ -421,13 +402,9 @@ fn sharing_read_only_enrolls_same_roots_and_reads_without_write_or_delegation() 
         assert!(local.routes.values().all(|root| sync_selection(&facts, *root) == Selection::Selected), "enrollment bridges to the native selection register");
     }
     let selected = recipient.selection();
-    assert!(local.routes.values().all(|root| selected.sync.contains(root) && !selected.maintenance.contains(root)), "local consent selects pending known-C bootstrap, not maintenance authority");
-    assert!(recipient.admission(&local).iter().all(|value| *value == (false, false)), "metadata/enrollment cannot manufacture admission");
-    assert_eq!(recipient.proofs(), 0);
-    owner.repair_authority_to(&recipient, &original);
-    assert!(recipient.selection().maintenance.iter().any(|root| local.routes.values().any(|selected| selected == root)));
+    assert!(local.routes.values().all(|root| selected.sync.contains(root)));
     assert!(recipient.admission(&local).iter().all(|value| *value == (true, false)));
-    // Enrollment imports descriptors/names, not authority or member data.
+    // Native evidence acquisition and local enrollment did not copy member data.
     assert!(!call(&recipient.dispatch, "compass_list", json!({"workspace":local_id})).unwrap().contains("Shared evidence"));
     owner.replicate_to(&recipient, &original);
     assert!(call(&recipient.dispatch, "compass_list", json!({"workspace":local_id})).unwrap().contains("Shared evidence"));
@@ -435,12 +412,12 @@ fn sharing_read_only_enrolls_same_roots_and_reads_without_write_or_delegation() 
     let proof_count = recipient.proofs();
     assert!(recipient.share(local_id, &third, "read_only", None).is_err());
     assert_eq!(recipient.proofs(), proof_count, "failed delegation publishes no proof");
-    let repeated = recipient.enroll(&invitation).unwrap();
+    let repeated = recipient.enroll_pending(&original.anchor, &root_handles(&original), Some("Local shared workspace")).unwrap();
     assert_eq!(repeated["already_enrolled"], true);
     assert_eq!(repeated["workspace"]["workspace"], *local_id);
     assert_eq!(recipient.proofs(), proof_count);
-    assert!(recipient.call("config_enroll_workspace_share", json!({"observation":recipient.inspect()["observation"],
-        "bootstrap":invitation["bootstrap"],"label":"Different alias"})).is_err(), "repeat cannot silently change a chosen alias");
+    assert!(recipient.enroll_pending(&original.anchor, &root_handles(&original),
+        Some("Different alias")).is_err(), "repeat cannot silently change a chosen alias");
 }
 
 #[test]
@@ -460,12 +437,14 @@ fn sharing_read_write_admits_authored_commit_and_opt_in_delegation_is_bounded() 
     let key_bytes = std::fs::read(&recipient.config.binding.key).unwrap();
     let id = owner.create("Collaboration");
     let original = owner.workspace(&id);
-    let invoke_accept = recipient.enroll(&owner.share(&invoke_only, &recipient, "read_write", None).unwrap()).unwrap();
+    owner.share(&invoke_only, &recipient, "read_write", None).unwrap();
+    let invoke_accept = recipient.enroll_native(&owner, &owner.workspace(&invoke_only)).unwrap();
     let invoke_id = &invoke_accept["workspace"]["workspace"];
     owner.repair_authority_to(&recipient, &owner.workspace(&invoke_only));
     assert!(recipient.admission(&recipient.workspace(invoke_id)).iter().all(|value| *value == (true, true)));
     assert!(recipient.share(invoke_id, &third, "read_only", None).is_err(), "WRITE invocation is not delegation");
-    let accepted = recipient.enroll(&owner.share(&id, &recipient, "read_write", Some(true)).unwrap()).unwrap();
+    owner.share(&id, &recipient, "read_write", Some(true)).unwrap();
+    let accepted = recipient.enroll_native(&owner, &original).unwrap();
     let local_id = &accepted["workspace"]["workspace"];
     let local = recipient.workspace(local_id);
     owner.repair_authority_to(&recipient, &original);
@@ -482,14 +461,14 @@ fn sharing_read_write_admits_authored_commit_and_opt_in_delegation_is_bounded() 
     // foundation is admitted without re-signing or copying a key.
     recipient.replicate_to(&owner, &local);
     assert!(call(&owner.dispatch, "compass_list", json!({"workspace":id})).unwrap().contains("Recipient authored"));
-    let onward = recipient.share(local_id, &third, "read_only", Some(true)).unwrap();
-    let accepted_third = third.enroll(&onward).unwrap();
+    recipient.share(local_id, &third, "read_only", Some(true)).unwrap();
+    let accepted_third = third.enroll_native(&recipient, &local).unwrap();
     let third_id = &accepted_third["workspace"]["workspace"];
     recipient.repair_authority_to(&third, &local);
     assert!(third.admission(&third.workspace(third_id)).iter().all(|value| *value == (true, false)));
     assert!(third.share(third_id, &fourth, "read_write", Some(true)).is_err(), "cannot broaden actions");
-    let final_invite = third.share(third_id, &fourth, "read_only", None).unwrap();
-    let final_accept = fourth.enroll(&final_invite).unwrap();
+    third.share(third_id, &fourth, "read_only", None).unwrap();
+    let final_accept = fourth.enroll_native(&third, &third.workspace(third_id)).unwrap();
     third.repair_authority_to(&fourth, &third.workspace(third_id));
     assert!(fourth.share(&final_accept["workspace"]["workspace"], &fifth, "read_only", None).is_err(), "invoke-only attenuation denies a new participant, not a directly authorized existing owner");
     let private_roots = owner.workspace(&unrelated).routes;
@@ -506,44 +485,36 @@ fn sharing_read_write_admits_authored_commit_and_opt_in_delegation_is_bounded() 
 }
 
 #[test]
-fn sharing_rejects_wrong_recipient_malformed_and_tampered_without_mutation() {
+fn sharing_native_evidence_does_not_admit_a_different_recipient() {
     let owner = Fixture::new();
     let recipient = Fixture::new();
     let wrong = Fixture::new();
-    let id = owner.create("Integrity");
-    let invitation = owner.share(&id, &recipient, "read_only", None).unwrap();
-    let wrong_before = wrong.inspect();
-    let wrong_proofs = wrong.proofs();
-    assert!(wrong.enroll(&invitation).is_err());
-    assert_eq!(wrong_before, wrong.inspect());
-    assert_eq!(wrong.proofs(), wrong_proofs);
-    let before = recipient.inspect();
-    let proofs = recipient.proofs();
-    let mut malformed = invitation.clone();
-    malformed["bootstrap"] = json!("{not JSON");
-    assert!(recipient.enroll(&malformed).is_err());
-    let original: Value = serde_json::from_str(invitation["bootstrap"].as_str().unwrap()).unwrap();
-    for part in ["commit", "blob"] {
-        let mut transport = original.clone();
-        let value = match part {
-            "commit" => &mut transport["commit"],
-            _ => &mut transport["blobs"][0]["bytes"],
-        };
-        let mut bytes = hex::decode(value.as_str().unwrap()).unwrap();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 1;
-        *value = json!(hex::encode(bytes));
-        let mut tampered = invitation.clone();
-        tampered["bootstrap"] = json!(serde_json::to_string(&transport).unwrap());
-        assert!(recipient.enroll(&tampered).is_err(), "reject tampered {part}");
-        assert_eq!(before, recipient.inspect());
-        assert_eq!(recipient.proofs(), proofs);
+    let id = owner.create("Recipient bound grants");
+    let original = owner.workspace(&id);
+    owner.share(&id, &recipient, "read_only", None).unwrap();
+    owner.repair_authority_to(&recipient, &original);
+    owner.publish_descriptors_to(&wrong, &original);
+    // Even resident valid proofs and definitions for another endpoint cannot
+    // grant this node native admission or make its pending enrollment valid.
+    {
+        use triblespace::core::repo::{CapabilityProofStore, transfer};
+        let mut source = recipient.config.node.lock().unwrap();
+        let snapshot = source.as_mut().unwrap().pile.snapshot().unwrap();
+        let proofs = snapshot.proofs().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        let mut target = wrong.config.node.lock().unwrap();
+        let target = target.as_mut().unwrap();
+        for proof in &proofs { target.pile.insert_proof(proof.clone()).unwrap(); }
+        for copied in transfer(&snapshot, &mut target.pile,
+            proofs.iter().flat_map(|proof| proof.blob_references())) { copied.unwrap(); }
+        target.pile.flush().unwrap();
     }
-    let mut forbidden = original;
-    forbidden["proofs"] = json!([]);
-    let mut malformed = invitation.clone();
-    malformed["bootstrap"] = json!(serde_json::to_string(&forbidden).unwrap());
-    assert!(recipient.enroll(&malformed).is_err(), "proof-carrier transport is not a supported metadata handoff");
+    assert!(wrong.admission(&original).iter().all(|value| *value == (false, false)));
+    assert_eq!(wrong.list_pending()["shares"], json!([]));
+    let before = wrong.inspect();
+    let proofs = wrong.proofs();
+    assert!(wrong.enroll_pending(&original.anchor, &root_handles(&original), Some("Wrong recipient")).is_err());
+    assert_eq!(wrong.inspect(), before);
+    assert_eq!(wrong.proofs(), proofs);
     let mut invalid_subject = json!({"observation":owner.inspect()["observation"],"workspace":id,
         "recipient":"00".repeat(32),"access":"read_only"});
     assert!(owner.call("config_share_workspace", invalid_subject.clone()).is_err());
@@ -558,7 +529,7 @@ fn sharing_freezes_current_bundle_and_never_resurrects_or_overwrites_enrollment(
     let id = owner.create("First revision");
     let extra = owner.create("Future roots");
     let original = owner.workspace(&id);
-    let invitation = owner.share(&id, &recipient, "read_only", None).unwrap();
+    owner.share(&id, &recipient, "read_only", None).unwrap();
     let mut replacement = owner.workspace(&extra);
     replacement.anchor = original.anchor;
     let mut guard = owner.config.node.lock().unwrap();
@@ -566,15 +537,15 @@ fn sharing_freezes_current_bundle_and_never_resurrects_or_overwrites_enrollment(
     let view = node.config().unwrap();
     node.put_workspace(&view, &replacement).unwrap();
     drop(guard);
-    assert!(owner.share(&id, &recipient, "read_only", None).is_err(), "old revision cannot issue fresh invitation");
-    let accepted = recipient.enroll(&invitation).unwrap();
+    assert!(owner.share(&id, &recipient, "read_only", None).is_err(), "old revision cannot issue fresh grants");
+    let accepted = recipient.enroll_native(&owner, &original).unwrap();
     let local_id = &accepted["workspace"]["workspace"];
-    assert_eq!(recipient.workspace(local_id).routes, original.routes, "previously issued invitation is frozen, never future-following");
+    assert_eq!(recipient.workspace(local_id).routes, original.routes, "issued grants cover the original roots, never future roots");
     let before = recipient.inspect();
     let key_before = std::fs::read(&recipient.config.binding.key).unwrap();
     recipient.call("config_remove_workspace", json!({"observation":before["observation"],"workspace":local_id})).unwrap();
     let after = recipient.inspect();
-    assert!(recipient.enroll(&invitation).is_err(), "repeat cannot resurrect withdrawn workspace");
+    assert!(recipient.enroll_pending(&original.anchor, &root_handles(&original), Some("Local shared workspace")).is_err(), "repeat cannot resurrect withdrawn workspace");
     assert_eq!(after, recipient.inspect());
     assert_eq!(after["node_id"], before["node_id"]);
     assert_eq!(after["settings"], before["settings"]);
@@ -622,10 +593,13 @@ fn sharing_uses_independent_quorum_paths_and_ignores_unavailable_future_policy()
     let id = node.put_workspace(&view, &value).unwrap();
     drop(guard);
     let id = json!(format!("{id:X}"));
-    let invitation = owner.share(&id, &recipient, "read_only", None).unwrap();
-    let accepted = recipient.enroll(&invitation).unwrap();
-    let local = recipient.workspace(&accepted["workspace"]["workspace"]);
+    owner.share(&id, &recipient, "read_only", None).unwrap();
     owner.repair_authority_to(&recipient, &value);
+    owner.publish_descriptors_to(&recipient, &value);
+    let accepted = recipient.call("config_create_workspace", json!({
+        "observation":recipient.inspect()["observation"], "label":"Local quorum",
+        "routes":[{"role":"compass","root":format!("blake3:{}", hex::encode(collection.handle().raw))}]})).unwrap();
+    let local = recipient.workspace(&accepted["workspace"]);
     assert_eq!(local.routes, value.routes);
     assert_eq!(recipient.admission(&local), [(true, false)]);
     let mut guard = recipient.config.node.lock().unwrap();
@@ -1033,6 +1007,8 @@ fn native_grants_list_by_workspace_anchor_and_enroll_without_bootstrap() {
     let share_of = |workspace: &Workspace| shares.iter()
         .find(|share| share["anchor"] == format!("{:X}", workspace.anchor)).unwrap().clone();
     let share_a = share_of(&original_a);
+    assert!(share_a["collections"].as_array().unwrap().iter().any(|row|
+        row["role"] == "compass" && row["role_source"] == "declared"));
     assert_eq!(share_a["label"], "Shared research");
     assert_eq!(share_a["claimed_access"], "read_only");
     assert_eq!(share_a["claimed_delegate"], false);
@@ -1100,7 +1076,7 @@ fn native_grants_list_by_workspace_anchor_and_enroll_without_bootstrap() {
 }
 
 #[test]
-fn native_grants_refuse_withdrawn_anchors_and_report_name_derived_or_missing_roles() {
+fn native_grants_refuse_withdrawn_anchors_and_require_explicit_routes_without_declarations() {
     use triblespace::core::capability::policy;
     use triblespace::core::collection::{Collection, records};
     use triblespace::core::metadata::MetaDescribe;
@@ -1123,8 +1099,8 @@ fn native_grants_refuse_withdrawn_anchors_and_report_name_derived_or_missing_rol
     assert!(recipient.enroll_pending(&original.anchor, &root_handles(&original), Some("Local")).is_err(), "repeat cannot resurrect a withdrawn workspace");
     assert_eq!(after, recipient.inspect());
     // Descriptors created before roles were declared, and descriptors that
-    // name no role at all, are shared the same way; the role derivation is
-    // reported rather than hidden.
+    // name no role at all, are shared the same way. A recognizable suffix
+    // is display text, so both need explicit routes.
     let legacy_anchor = genid().id;
     let bare_anchor = genid().id;
     let compass = workspace::roles().into_iter().find(|(_, name)| *name == "compass").unwrap().0;
@@ -1140,7 +1116,7 @@ fn native_grants_refuse_withdrawn_anchors_and_report_name_derived_or_missing_rol
         }).unwrap();
         collection.handle()
     };
-    let legacy_root = register(legacy_anchor, "Legacy · compass");
+    let legacy_root = register(legacy_anchor, "X · archive");
     let bare_root = register(bare_anchor, "Two independent roots");
     let mut legacy = Workspace::new("Legacy");
     legacy.anchor = legacy_anchor;
@@ -1165,20 +1141,101 @@ fn native_grants_refuse_withdrawn_anchors_and_report_name_derived_or_missing_rol
     assert_eq!(shares.len(), 3);
     let share_of = |anchor: Id| shares.iter().find(|share| share["anchor"] == format!("{anchor:X}")).unwrap().clone();
     let legacy_share = share_of(legacy_anchor);
-    assert_eq!(legacy_share["label"], "Legacy");
-    assert_eq!(legacy_share["enrollable"], true);
-    assert_eq!(legacy_share["collections"][0]["role"], "compass");
-    assert_eq!(legacy_share["collections"][0]["role_source"], "name");
+    assert_eq!(legacy_share["label"], "X · archive", "no declared role to shorten the label");
+    assert_eq!(legacy_share["enrollable"], false);
+    assert!(legacy_share["collections"][0]["role"].is_null());
+    assert!(legacy_share["collections"][0]["role_source"].is_null());
     let bare_share = share_of(bare_anchor);
     assert_eq!(bare_share["label"], "Two independent roots");
     assert_eq!(bare_share["enrollable"], false);
     assert!(bare_share["collections"][0]["role"].is_null());
     assert!(bare_share["collections"][0]["role_source"].is_null());
     assert!(recipient.enroll_pending(&bare_anchor, &recipient.shown_roots(&bare_anchor), Some("Bare")).is_err(), "a root without an understood role needs explicit routes");
-    let accepted = recipient.enroll_pending(&legacy_anchor, &recipient.shown_roots(&legacy_anchor), Some("Legacy local")).unwrap();
-    let local = recipient.workspace(&accepted["workspace"]["workspace"]);
-    assert_eq!(local.routes, legacy.routes);
-    assert_eq!(recipient.list_pending()["shares"].as_array().unwrap().len(), 2);
+    let before = recipient.inspect();
+    let proofs = recipient.proofs();
+    assert!(recipient.enroll_pending(&legacy_anchor, &recipient.shown_roots(&legacy_anchor), Some("Legacy local")).is_err(), "a current display-name suffix establishes no role");
+    assert_eq!(recipient.inspect(), before);
+    let local_id = recipient.call("config_create_workspace", json!({
+        "observation":before["observation"], "label":"Chosen locally",
+        "routes":[{"role":"compass", "root":format!("blake3:{}", hex::encode(legacy_root.raw))}],
+    })).unwrap()["workspace"].clone();
+    let local = recipient.workspace(&local_id);
+    assert_eq!(local.routes, legacy.routes, "explicit routes may disagree with a display name");
+    assert_eq!(recipient.admission(&local), [(true, false)]);
+    let edited = recipient.call("config_edit_workspace", json!({
+        "observation":recipient.inspect()["observation"], "workspace":local_id,
+        "routes":[
+            {"role":"compass", "root":format!("blake3:{}", hex::encode(legacy_root.raw))},
+            {"role":"wiki", "root":format!("blake3:{}", hex::encode(bare_root.raw))},
+        ],
+    })).unwrap()["workspace"].clone();
+    let wiki = workspace::roles().into_iter().find(|(_, name)| *name == "wiki").unwrap().0;
+    let local = recipient.workspace(&edited);
+    assert_eq!(local.routes, BTreeMap::from([(compass, legacy_root), (wiki, bare_root)]));
+    assert_eq!(recipient.admission(&local), [(true, false), (true, false)]);
+    assert_eq!(recipient.proofs(), proofs, "routing never grants permissions");
+}
+
+#[test]
+fn native_grants_use_only_understood_declared_roles_independently_of_names() {
+    use triblespace::core::capability::policy;
+    use triblespace::core::collection::{Collection, records};
+    use triblespace::core::metadata::MetaDescribe;
+    let owner = Fixture::new();
+    let recipient = Fixture::new();
+    let compass = workspace::roles().into_iter().find(|(_, name)| *name == "compass").unwrap().0;
+    let wiki = workspace::roles().into_iter().find(|(_, name)| *name == "wiki").unwrap().0;
+    let unknown = genid().id;
+    for (name, declared, expected) in [
+        ("An arbitrary title", vec![compass], Some("compass")),
+        ("X · archive", vec![compass, unknown], Some("compass")),
+        ("X · compass", vec![compass, wiki], None),
+        ("X · archive", vec![unknown], None),
+    ] {
+        let anchor = genid().id;
+        let mut guard = owner.config.node.lock().unwrap();
+        let node = guard.as_mut().unwrap();
+        let signer = node.signer.verifying_key();
+        let collection: Collection<blobencodings::SimpleArchive> = node.pile.register_collection(entity! {
+            metadata::tag*: [records::KIND_COLLECTION_DESCRIPTOR, anchor],
+            metadata::name: "unrelated metadata",
+            records::collection_name: name,
+            records::collection_representation*: <blobencodings::SimpleArchive as MetaDescribe>::describe(),
+            policy::resource_policy*: faculties::collection_names::private_policy(signer).fragment(),
+            attrs::collection_role*: declared,
+        }).unwrap();
+        let mut original = Workspace::new(name);
+        original.anchor = anchor;
+        original.id = anchor;
+        original.routes.insert(compass, collection.handle());
+        let view = node.config().unwrap();
+        let revision = node.put_workspace(&view, &original).unwrap();
+        drop(guard);
+        owner.share(&json!(format!("{revision:X}")), &recipient, "read_only", None).unwrap();
+        owner.repair_authority_to(&recipient, &original);
+        owner.publish_descriptors_to(&recipient, &original);
+        let before = recipient.inspect();
+        let pending = recipient.list_pending();
+        let share = pending["shares"].as_array().unwrap().iter()
+            .find(|share| share["anchor"] == format!("{anchor:X}")).unwrap();
+        let row = &share["collections"][0];
+        assert_eq!(row["name"], name);
+        assert_eq!(row["role"], json!(expected), "{row}");
+        assert_eq!(row["role_source"], json!(expected.map(|_| "declared")));
+        assert_eq!(row["admitted"], json!({"read":true,"write":false}));
+        assert_eq!(share["enrollable"], expected.is_some());
+        assert_eq!(share["label"], name, "a suffix alone cannot change the role or label");
+        assert_eq!(recipient.inspect(), before, "listing changes no binding");
+        let accepted = recipient.enroll_pending(&anchor, &recipient.shown_roots(&anchor), Some("Local"));
+        if expected.is_some() {
+            let local = recipient.workspace(&accepted.unwrap()["workspace"]["workspace"]);
+            assert_eq!(local.routes, original.routes);
+            assert_eq!(recipient.admission(&local), [(true, false)]);
+        } else {
+            assert!(accepted.is_err(), "unknown or conflicting roles require explicit routes");
+            assert_eq!(recipient.inspect(), before);
+        }
+    }
 }
 
 #[test]
@@ -1301,6 +1358,7 @@ fn native_grants_list_descriptors_with_ambiguous_or_missing_anchor_tags_ungroupe
     let mut register = |tags: Vec<Id>, name: &str| -> triblespace::core::collection::CollectionHandle {
         let collection: Collection<blobencodings::SimpleArchive> = node.pile.register_collection(entity! {
             metadata::tag*: tags,
+            attrs::collection_role: compass,
             records::collection_name: name,
             records::collection_representation*: <blobencodings::SimpleArchive as MetaDescribe>::describe(),
             policy::resource_policy*: faculties::collection_names::private_policy(signer).fragment(),
@@ -1340,11 +1398,13 @@ fn native_grants_list_descriptors_with_ambiguous_or_missing_anchor_tags_ungroupe
     assert_eq!(ambiguous_row["descriptor"], "resident");
     assert_eq!(ambiguous_row["name"], "Ambiguous · compass");
     assert_eq!(ambiguous_row["role"], "compass");
+    assert_eq!(ambiguous_row["role_source"], "declared");
     assert_eq!(ambiguous_row["reason"], "descriptor carries 2 candidate anchors");
     let unanchored_row = row_of(unanchored_root);
     assert_eq!(unanchored_row["descriptor"], "resident");
     assert_eq!(unanchored_row["name"], "Unanchored · compass");
     assert_eq!(unanchored_row["role"], "compass");
+    assert_eq!(unanchored_row["role_source"], "declared");
     assert_eq!(unanchored_row["reason"], "descriptor carries no candidate anchor");
     assert!(recipient.enroll_pending(&ambiguous_anchor, &[format!("blake3:{}", hex::encode(ambiguous_root.raw))], Some("Ambiguous")).is_err(), "an ungrouped root needs explicit routes");
     let accepted = recipient.enroll_pending(&grouped.anchor, &recipient.shown_roots(&grouped.anchor), Some("Local")).unwrap();
@@ -1614,4 +1674,77 @@ fn native_grants_treat_an_undecodable_definition_as_unavailable_for_that_edge() 
     assert_eq!(pending["skipped"], 0);
     let accepted = recipient.enroll_pending(&original.anchor, &recipient.shown_roots(&original.anchor), Some("Local")).unwrap();
     assert_eq!(recipient.workspace(&accepted["workspace"]["workspace"]).routes, original.routes);
+}
+
+#[test]
+fn native_grants_refuse_an_empty_roots_list_instead_of_publishing_an_empty_workspace() {
+    let owner = Fixture::new();
+    let recipient = Fixture::new();
+    let mut shared = Workspace::new("Shared");
+    shared.anchor = genid().id;
+    shared.id = shared.anchor;
+    let revision = owner.grow_workspace(&mut shared, "compass");
+    owner.deliver(revision, &shared, &recipient);
+    let compass = workspace::roles().into_iter().find(|(_, role)| *role == "compass").unwrap().0;
+    let c1 = shared.routes[&compass];
+    let hex_of = |root: CollectionHandle| format!("blake3:{}", hex::encode(root.raw));
+    // The recipient's own workspace B routes every root of the group, so the
+    // listing shows C1 only as routed elsewhere and nothing is required.
+    let b = recipient.put_local_workspace("B", BTreeMap::from([(compass, c1)]));
+    let pending = recipient.list_pending();
+    let share = pending["shares"].as_array().unwrap().iter()
+        .find(|share| share["anchor"] == format!("{:X}", shared.anchor)).unwrap().clone();
+    let rows = share["collections"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["routed_in"], json!([format!("{b:X}")]));
+    let proofs = recipient.proofs();
+    // An empty consent is no consent: refused, naming the listing, before
+    // anything is published.
+    let outcome = recipient.enroll_pending(&shared.anchor, &[], Some("Local"));
+    assert!(outcome.is_err(), "an empty roots list published a workspace: {outcome:?}");
+    let refused = format!("{:#}", outcome.unwrap_err());
+    assert!(refused.contains("nothing to enroll"), "{refused}");
+    assert!(refused.contains("config_list_pending_shares"), "{refused}");
+    let workspaces = recipient.inspect()["workspaces"].as_array().unwrap().clone();
+    assert_eq!(workspaces.len(), 1, "no empty-route workspace was published: {workspaces:?}");
+    assert_eq!(workspaces[0]["workspace"], format!("{b:X}"));
+    assert_eq!(recipient.proofs(), proofs);
+    // Giving the routed root explicitly still enrolls it, as before.
+    let accepted = recipient.enroll_pending(&shared.anchor, &[hex_of(c1)], Some("Local")).unwrap();
+    assert_eq!(accepted["already_enrolled"], false);
+    let local = recipient.workspace(&accepted["workspace"]["workspace"]);
+    assert_eq!(local.routes, BTreeMap::from([(compass, c1)]));
+    assert_eq!(recipient.inspect()["workspaces"].as_array().unwrap().len(), 2);
+    // An empty list is refused for an enrolled workspace too: it is not the
+    // idempotent repeat, which names the routed set.
+    let refused = format!("{:#}", recipient.enroll_pending(&shared.anchor, &[], None).unwrap_err());
+    assert!(refused.contains("nothing to enroll"), "{refused}");
+    assert_eq!(recipient.inspect()["workspaces"].as_array().unwrap().len(), 2);
+    let repeated = recipient.enroll_pending(&shared.anchor, &[hex_of(c1)], None).unwrap();
+    assert_eq!(repeated["already_enrolled"], true);
+    assert_eq!(repeated["workspace"]["workspace"], accepted["workspace"]["workspace"]);
+}
+
+
+#[test]
+fn sharing_catalog_and_result_use_only_native_grants() {
+    let owner = Fixture::new();
+    let recipient = Fixture::new();
+    let workspace = owner.create("Native sharing");
+    let names = owner.config.tools().iter().map(|tool| tool.name).collect::<Vec<_>>();
+    assert!(names.contains(&"config_share_workspace"));
+    assert!(names.contains(&"config_list_pending_shares"));
+    assert!(names.contains(&"config_enroll_pending_share"));
+    assert!(!names.contains(&"config_probe_workspace_share"));
+    assert!(!names.contains(&"config_enroll_workspace_share"));
+    let tool = owner.config.tools().iter().find(|tool| tool.name == "config_share_workspace").unwrap();
+    let schema: Value = serde_json::from_str(tool.input_schema).unwrap();
+    let properties = schema["properties"].as_object().unwrap().keys().map(String::as_str).collect::<BTreeSet<_>>();
+    assert_eq!(properties, BTreeSet::from(["observation", "workspace", "recipient", "access", "delegate"]));
+    let result = owner.share(&workspace, &recipient, "read_only", None).unwrap();
+    let fields = result.as_object().unwrap().keys().map(String::as_str).collect::<BTreeSet<_>>();
+    assert_eq!(fields, BTreeSet::from(["workspace", "recipient", "delegate", "issuer_routing_hint", "publication", "sync_complete"]));
+    assert_eq!(result["publication"], "local_native_grants");
+    assert_eq!(result["sync_complete"], false);
+    assert_eq!(recipient.inspect()["workspaces"], json!([]), "grant publishing never enrolls another node");
 }

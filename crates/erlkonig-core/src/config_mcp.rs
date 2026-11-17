@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use triblespace::core::collection::CollectionHandle;
 use triblespace::core::metadata;
 use triblespace::core::query::register::{ObservationOrder, maximal};
-use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
 use crate::config::{NodeBinding, parse_handle};
@@ -55,27 +55,17 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "config_share_workspace",
-        description: "Share an exact current workspace revision's resolved collection bundle with an exact recipient public node identity. access is read_only or read_write; delegate defaults false (invoke-only). Native grants are valid immediately, without recipient approval or acknowledgement. Returns bounded signed role/root/descriptor-name metadata, never proof or definition payload. Native grant exchange delivers capability evidence independently of this metadata handoff; grants alone neither enroll nor select collections locally. Only these roots/actions are granted: no old or future membership, settings, keys or global workspace selection. Before choosing delegate=true, explain and obtain the user's choice: the recipient may invite additional participants within these roots/actions without the original user choosing each one. Disclosed or copied data cannot be made unread. Native per-collection authority must support every requested grant; reader/writer access alone does not confer onward delegation. Requires the latest config_inspect observation.",
+        description: "Returns grant publication metadata. Native peer exchange delivers authority evidence and descriptors; the recipient discovers them with config_list_pending_shares and chooses its local workspace routes. Share an exact current workspace revision's resolved collection bundle with an exact recipient public node identity. access is read_only or read_write; delegate defaults false (invoke-only). Native grants are valid immediately, without recipient approval or acknowledgement. Grants alone neither enroll nor select collections locally. Only these roots/actions are granted: no old or future membership, settings, keys or global workspace selection. Before choosing delegate=true, explain and obtain the user's choice: the recipient may invite additional participants within these roots/actions without the original user choosing each one. Disclosed or copied data cannot be made unread. Native per-collection authority must support every requested grant; reader/writer access alone does not confer onward delegation. Requires the latest config_inspect observation.",
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"workspace":{"type":"string"},"recipient":{"type":"string"},"access":{"type":"string","enum":["read_only","read_write"]},"delegate":{"type":"boolean","default":false}},"required":["observation","workspace","recipient","access"],"additionalProperties":false}"#,
     },
     Tool {
-        name: "config_probe_workspace_share",
-        description: "Read-only verification of bounded signed workspace metadata on its intended recipient node. Checks the native signature and recipient binding; reports source label, exact descriptor names/roles/roots and the issuer's declared access/delegation choice. Actual native collection admission is NOT confirmed by this probe; enrolled known roots acquire evidence through native repair. Does not import evidence, enroll a workspace, activate repair, download payloads or start maintenance. Explain contents and resource consequences, then let the recipient user/agent choose whether to enroll and a local label. Rights already exist; probing/enrollment is not an authorization handshake and sends no reply to the source.",
-        input_schema: r#"{"type":"object","properties":{"bootstrap":{"type":"string","maxLength":4194304}},"required":["bootstrap"],"additionalProperties":false}"#,
-    },
-    Tool {
-        name: "config_enroll_workspace_share",
-        description: "After recipient-local consent, enroll a verified one-way bootstrap under a chosen nonempty local label. Imports descriptor/name metadata and configures the SAME exact roots/role routes under the existing node key; never imports proofs, copies signing keys or creates replacement data roots. Workspace publication completes first; newly requested roots are then separately selected for enabled native Full sync, even while local READ evidence is pending. Selection failure does not roll back publication: reinspect before retrying. Native grant exchange and participant discovery deliver authority evidence; native admission governs local reads/writes and upkeep. Sync follows the native Selected relation, not arbitrary grants; maintenance remains independently all-accessible and may acquire exact missing bodies while sync is enabled. No global workspace default or authorization handshake is created. Explain additive non-expiring rights, possible onward invitations when delegate=true, and that disclosed/copied data cannot be made unread. Repeat enrollment never overwrites a later edit/withdrawal. Removing local enrollment neither revokes grants nor unselects native roots. Returns local publication only, not synchronization completion. Requires the latest config_inspect observation.",
-        input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"bootstrap":{"type":"string","maxLength":4194304},"label":{"type":"string","minLength":1}},"required":["observation","bootstrap","label"],"additionalProperties":false}"#,
-    },
-    Tool {
         name: "config_list_pending_shares",
-        description: "List collections that resident native grants name for this node and that no current local workspace routes, grouped by the issuing workspace anchor found in their descriptor tags, with the descriptor name, faculty role (declared on the descriptor, or read from the name's role suffix: role_source says which), issuer identities, the READ/WRITE/delegate actions the proof edges claim (claimed, claimed_access, claimed_delegate) and, separately, what native admission under the resident descriptor actually grants this node (admitted per root; admitted_access and admitted_any per group, which never restate a claim: a chain no policy admits reads claimed read_write with admitted_access none). local_workspace is none, enrolled (roots shown beside an enrolled workspace extend it) or changed_or_withdrawn. A granted root that another local workspace already routes stays listed with that workspace in routed_in and is routed here only when given to config_enroll_pending_share. A proof edge whose definition is not resident or does not decode contributes no claim and counts in definitions_pending. A collection whose descriptor is not yet resident is listed by handle as descriptor pending, with nothing inferred. A resident descriptor whose name blob has not arrived, or whose tags offer no single anchor, keeps its entry and says why in reason; skipped counts resident granted resources that are no collection descriptor. sync_memory_pending lists handles the running sync daemon holds grants for in memory only. Read-only: fetches, grants, imports and selects nothing. No workspace required. Enroll a group with config_enroll_pending_share; use config_create_workspace with explicit routes for anything ungrouped.",
+        description: "List collections that resident native grants name for this node and that no current local workspace routes, grouped by the issuing workspace anchor found in their descriptor tags, with the descriptor name, faculty role (only an unambiguous understood declaration on the descriptor; role_source is declared, or null when unresolved; display names never establish a role), issuer identities, the READ/WRITE/delegate actions the proof edges claim (claimed, claimed_access, claimed_delegate) and, separately, what native admission under the resident descriptor actually grants this node (admitted per root; admitted_access and admitted_any per group, which never restate a claim: a chain no policy admits reads claimed read_write with admitted_access none). local_workspace is none, enrolled (roots shown beside an enrolled workspace extend it) or changed_or_withdrawn. A granted root that another local workspace already routes stays listed with that workspace in routed_in and is routed here only when given to config_enroll_pending_share. A proof edge whose definition is not resident or does not decode contributes no claim and counts in definitions_pending. A collection whose descriptor is not yet resident is listed by handle as descriptor pending, with nothing inferred. A resident descriptor whose name blob has not arrived, or whose tags offer no single anchor, keeps its entry and says why in reason; skipped counts resident granted resources that are no collection descriptor. sync_memory_pending lists handles the running sync daemon holds grants for in memory only. Read-only: fetches, grants, imports and selects nothing. No workspace required. Choose explicit routes over admitted existing roots with config_create_workspace, or config_edit_workspace for an existing binding, whether grouped or ungrouped; an intentional subset is valid. The optional config_enroll_pending_share helper uses declared roles when that mapping fits the requested binding.",
         input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
     },
     Tool {
         name: "config_enroll_pending_share",
-        description: "After recipient-local consent, publish a local workspace over exactly the collections config_list_pending_shares showed for one workspace anchor and select those roots for native sync. roots is the consent unit: pass the collection handles the listing printed for that anchor; a root the listing disclosed as routed by another local workspace may be left out. If a root arrived since the listing or a given root is not granted under the anchor, the call refuses, names the difference and asks for a fresh listing; the published routes are exactly the roots given (or their union with the enrolled workspace's routes), never the whole granted group. A first enrollment needs a nonempty local label. When a workspace with that anchor is already enrolled and the listing shows new roots beside it, passing those roots extends it with a new revision (union of routes, label preserved unless given); the identical already-routed set returns the same revision; a different label for an unchanged enrolled set is refused; a changed or withdrawn local workspace is never overwritten. No bootstrap is needed: native grant exchange delivered the proofs and sync the descriptors. Imports no proofs, copies no keys, creates no replacement roots and sends no reply to the issuer. Publication completes first; selection follows and its failure does not roll back publication: reinspect before retrying. An anchor with no resident grant, or a collection without an understood role, is refused. Explain additive non-expiring rights and that disclosed data cannot be made unread. Returns local publication only, with the claimed access, not admission. Requires the latest config_inspect observation.",
+        description: "After recipient-local consent, publish a local workspace over exactly the collections config_list_pending_shares showed for one workspace anchor and select those roots for native sync. roots is the consent unit: pass the collection handles the listing printed for that anchor; a root the listing disclosed as routed by another local workspace may be left out, but an empty roots list is refused: nothing to enroll. If a root arrived since the listing or a given root is not granted under the anchor, the call refuses, names the difference and asks for a fresh listing; the published routes are exactly the roots given (or their union with the enrolled workspace's routes), never the whole granted group. A first enrollment needs a nonempty local label. When a workspace with that anchor is already enrolled and the listing shows new roots beside it, passing those roots extends it with a new revision (union of routes, label preserved unless given); the identical already-routed set returns the same revision; a different label for an unchanged enrolled set is refused; a changed or withdrawn local workspace is never overwritten. Native grant exchange delivered the proofs and sync the descriptors. Imports no proofs, copies no keys, creates no replacement roots and sends no reply to the issuer. Publication completes first; selection follows and its failure does not roll back publication: reinspect before retrying. An anchor with no resident grant, or a collection without an unambiguous understood declared role, is refused. Explain additive non-expiring rights and that disclosed data cannot be made unread. Returns local publication only, with the claimed access, not admission. Requires the latest config_inspect observation.",
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"anchor":{"type":"string","minLength":32,"maxLength":32},"roots":{"type":"array","items":{"type":"string"},"minItems":1},"label":{"type":"string","minLength":1}},"required":["observation","anchor","roots"],"additionalProperties":false}"#,
     },
     Tool {
@@ -168,20 +158,6 @@ struct Share {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProbeShare {
-    bootstrap: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EnrollShare {
-    observation: String,
-    bootstrap: String,
-    label: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct EnrollPending {
     observation: String,
     anchor: String,
@@ -220,9 +196,9 @@ fn granted_json(value: &crate::workspace_grants::GrantedCollection) -> Value {
         "descriptor": if value.descriptor_resident { "resident" } else { "pending" },
         "name": value.name,
         "reason": value.reason,
-        "role": value.role.and_then(|(role, _)| faculties::collection_names::name_for(role)),
-        "role_id": value.role.map(|(role, _)| format!("{role:X}")),
-        "role_source": value.role.map(|(_, source)| source.as_str()),
+        "role": value.role.and_then(workspace::role_name),
+        "role_id": value.role.map(|role| format!("{role:X}")),
+        "role_source": value.role.map(|_| "declared"),
         "issuers": value.issuers.iter().map(hex::encode).collect::<Vec<_>>(),
         "routed_in": value.routed_in.iter().map(|route| format!("{:X}", route.workspace)).collect::<Vec<_>>(),
         "claimed": {"read": value.claimed_read, "write": value.claimed_write, "delegate": value.claimed_delegate,
@@ -265,7 +241,7 @@ pub(crate) fn workspace_json(workspace: &Workspace) -> Value {
     json!({
         "workspace": format!("{:X}", workspace.id), "label": workspace.label,
         "roles": workspace.routes.iter().map(|(role, root)| json!({
-            "role": faculties::collection_names::name_for(*role),
+            "role": workspace::role_name(*role),
             "role_id": format!("{role:X}"), "root": format!("blake3:{}", hex::encode(root.raw)),
         })).collect::<Vec<_>>(),
     })
@@ -422,48 +398,15 @@ impl ConfigMcp {
             "config_share_workspace" => {
                 let args: Share = mcp::decode_arguments(arguments)?;
                 current(&view, &args.observation)?;
-                let bootstrap = node.share_workspace(
-                    &view, revision(&args.workspace)?,
-                    crate::workspace_sharing::public_identity(&args.recipient)?,
-                    args.access, args.delegate,
+                let workspace = revision(&args.workspace)?;
+                let recipient = crate::workspace_sharing::public_identity(&args.recipient)?;
+                node.share_workspace(
+                    &view, workspace, recipient, args.access, args.delegate,
                 )?;
-                json!({"bootstrap":bootstrap, "workspace":args.workspace,
-                    "recipient":args.recipient, "delegate":args.delegate,
+                json!({"workspace":args.workspace, "recipient":args.recipient,
+                    "delegate":args.delegate,
                     "issuer_routing_hint":hex::encode(node.signer.verifying_key().to_bytes()),
-                    "handoff":"signed_workspace_metadata_only", "publication":"local_native_grants", "sync_complete":false})
-            }
-            "config_probe_workspace_share" => {
-                let args: ProbeShare = mcp::decode_arguments(arguments)?;
-                let mut prepared = node.probe_workspace_share(&args.bootstrap)?;
-                let snapshot = prepared.store.snapshot()?;
-                let mut collections = Vec::new();
-                for (role, root) in &prepared.workspace.routes {
-                    let facts: TribleSet = snapshot.get(*root)?;
-                    let mut names = Vec::new();
-                    for name in find!(name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>, pattern!(&facts, [{
-                        metadata::tag: triblespace::core::collection::records::KIND_COLLECTION_DESCRIPTOR,
-                        triblespace::core::collection::records::collection_name: ?name,
-                    }])) {
-                        let name: View<str> = snapshot.get(name)?;
-                        names.push(name.to_string());
-                    }
-                    names.sort(); names.dedup();
-                    collections.push(json!({"role":faculties::collection_names::name_for(*role),
-                        "role_id":format!("{role:X}"),"root":format!("blake3:{}",hex::encode(root.raw)),"names":names}));
-                }
-                json!({"source_workspace":format!("{:X}",prepared.source),
-                    "source_label":prepared.workspace.label, "issuer":hex::encode(prepared.issuer.to_bytes()),
-                    "recipient":hex::encode(self.binding.signer), "collections":collections,
-                    "access":if prepared.write { "read_write" } else { "read_only" },
-                    "delegate":prepared.delegate, "metadata_verified":true, "recipient_bound":true,
-                    "native_admission":"not_confirmed_by_probe", "issuer_is_routing_hint_not_authority":true,
-                    "enrollment":"not_changed_by_probe", "read_only_probe":true})
-            }
-            "config_enroll_workspace_share" => {
-                let args: EnrollShare = mcp::decode_arguments(arguments)?;
-                current(&view, &args.observation)?;
-                let accepted = node.enroll_workspace_share(&view, &args.bootstrap, &args.label)?;
-                enrolled_json(&accepted)
+                    "publication":"local_native_grants", "sync_complete":false})
             }
             "config_list_pending_shares" => {
                 let _: Empty = mcp::decode_arguments(arguments)?;

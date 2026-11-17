@@ -4,8 +4,8 @@
 #   ./install-user.sh --uninstall  remove the program, menu entry, icons and
 #                                  autostart entry (never the data directory)
 # No root, no system files: ~/.local/bin, ~/.local/share/applications and
-# ~/.local/share/icons/hicolor only. Desktops pick up new entries and icons
-# from these folders by themselves; no cache is written.
+# ~/.local/share/icons/hicolor and the Erlkonig notice directory. Desktops pick
+# up new entries and icons from these folders; no cache is written.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -21,13 +21,22 @@ if [ "${1:-}" = "--uninstall" ]; then
     for icon in "$data"/icons/hicolor/*/apps/"$app_id".png; do
         [ -e "$icon" ] && rm -f "$icon"
     done
+    rm -rf "$data/erlkonig-notices"
     echo "Removed Erlkonig. Its data directory ($data/erlkonig) was left in place."
     exit 0
 fi
 
 [ -x "$here/erlkonig" ] || { echo "erlkonig binary not found next to $0" >&2; exit 1; }
 
+[ -f "$here/notices/manifest.json" ] && [ -f "$here/notices/README.txt" ] || { echo "install: missing prepared notices" >&2; exit 1; }
+
 mkdir -p "$bin_dir" "$data/applications"
+notice_stage="$data/.erlkonig-notices.partial-$$"
+trap 'rm -rf "$notice_stage"' EXIT
+cp -R "$here/notices" "$notice_stage"
+rm -rf "$data/erlkonig-notices"
+mv "$notice_stage" "$data/erlkonig-notices"
+trap - EXIT
 # Replace atomically, so a running copy keeps its executable.
 cp "$here/erlkonig" "$bin.partial"
 chmod 0755 "$bin.partial"

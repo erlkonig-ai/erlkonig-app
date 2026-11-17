@@ -58,52 +58,52 @@ Invocation alone never permits onward delegation. Also explain that disclosed
 or copied data cannot be made unread, whether or not delegation is enabled.
 Ask about the consequence in ordinary language, not capability jargon.
 
-The normal flow needs no handoff. The owner runs `config_share_workspace`;
-native grant exchange delivers the proofs to the recipient's node when the
-two nodes connect, and sync delivers the descriptors. On the recipient's node,
-call `config_list_pending_shares` (read-only, no workspace needed). It groups
-the collections resident grants name for this node by the issuing workspace,
-and per collection shows the exact root, the descriptor name and role, the
-access the proof edges claim (`claimed`, `claimed_access`) and, separately,
-what native admission grants right now (`admitted`, `admitted_access`); a
-claim is never effective access, so say both in ordinary language. The role
-is the one declared on the descriptor, or, for older descriptors, read from
-the name's role suffix, and `role_source` (declared or name) says which. A
-root whose descriptor has not arrived is listed as pending with nothing
-inferred; a root another local workspace already routes says so in
-`routed_in`. Explain exactly the roots shown and the disk/network/maintenance
-consequences, and choose a friendly **local alias** with the person. Then
-`config_inspect` and `config_enroll_pending_share` with the latest
-observation, the anchor, that alias and exactly the roots shown: it publishes
-a local workspace over those roots under the existing node key and selects
-them for native sync. If a root arrived or disappeared since the listing, it
-refuses and names the difference; list again rather than guessing. Later,
-when the listing shows new roots beside an enrolled workspace, enrolling
-exactly those roots extends it with a new revision; never pass roots the
-listing did not show. Rights already existed: nothing is acknowledged or
-approved toward the source, no key is copied, no menu is involved, and a
-grant alone neither enrolls nor selects anything.
+The owner runs `config_share_workspace`;
+native grant exchange delivers proofs to the recipient's node when the nodes
+connect, and sync delivers descriptors. On the recipient's node, inspect
+`config_list_pending_shares` and `config_list_collections` (both read-only,
+no workspace needed). Keep proof claims (`claimed`, `claimed_access`)
+separate from effective native access (`admitted`, `admitted_access`, and
+the collection's independent `read`/`write` values).
 
-The JSON handoff is the fallback for when the nodes have not connected yet.
-Hand the opaque returned `bootstrap` unchanged to the intended recipient only
-through the user-requested channel. It contains signed role/root metadata and
-exact descriptor/name blobs, not capability proofs, definition bodies, keys or
-member payloads. Native grant exchange discovers capability evidence separately;
-this metadata handoff is not authority delivery, automatic enrollment, or a
-request/approve/acknowledge protocol. Do not print its internal handles
-unnecessarily or reconstruct it. On the recipient's node, call
-`config_probe_workspace_share` first. This is read-only: it verifies the
-native signature and recipient binding, NOT actual collection admission. It
-reports the issuer's declared access choice and the current exact collection
-names/roles/roots without importing, activating repair, downloading bodies or
-starting upkeep. Explain what is available and the consequences, and let the
-user choose whether to enroll it and a local label. Do not expand membership
-from common descriptor tags. For that chosen enrollment, inspect and call
-`config_enroll_workspace_share` with the bootstrap, local label and latest
-observation. It imports descriptor/name metadata and configures the **same
-roots and role routes under the existing node key**.
+The model chooses collection-to-faculty mappings for the requested work.
+Descriptor names, declared roles and `role_source` are evidence for that
+choice, not authority or a mandatory mapping. An unknown role or
+`enrollable:false` does not mean the recipient cannot use an admitted root.
+That field is a status for the automatic `config_enroll_pending_share`
+helper, not the general ability to bind a collection. Inspect the reported
+metadata and explain the actual reason. A missing
+descriptor or missing native admission is a different condition; explicit
+routing does not fetch the descriptor or grant permission.
 
-Either way, use the returned local workspace ID on subsequent faculty calls;
+Choose the exact roots and faculty roles needed within the user's scope;
+an intentional subset of the shared bundle is valid. Explain those selected
+roots and their disk/network/maintenance consequences, and choose a friendly
+**local alias** with the person when creating a binding. With a fresh
+`config_inspect` observation, use `config_create_workspace` with explicit
+`routes: [{role, root}, ...]`, or `config_edit_workspace` for an existing
+local binding. Supply `routes` when joining existing data: omitting it on
+creation creates fresh private roots. On edit, supplied routes replace the
+complete bundle, so include the existing routes the user wants to retain.
+The tools check the known faculty role, exact resident named root and native
+READ or WRITE admission; the model supplies the semantic mapping. Explicit
+routing does not require every granted root or matching descriptor names.
+
+The automatic `config_enroll_pending_share` helper remains available when
+its inferred mappings and complete-root selection already match the intended
+binding. Its exact-root checks apply to that helper, not to explicit
+create/edit. `routed_in` identifies roots already used by another local
+workspace; reuse or edit an intended existing binding rather than creating a
+duplicate. Successful binding publication separately selects newly added
+roots for native sync. Rights already existed: no acknowledgement, key copy
+or new grant is involved, and a grant alone neither creates a binding nor
+selects its collections.
+
+Sharing returns local native-grant publication metadata. Peer exchange delivers
+proofs and sync/repair acquire descriptors on the recipient's node. Use its
+local pending-share and collection tools to choose the workspace binding.
+
+Use the returned local workspace ID on subsequent faculty calls;
 there is no global default. Repeat unchanged enrollment returns the same
 workspace, never overwriting a later edit or resurrecting a withdrawal.
 
@@ -151,10 +151,13 @@ can change the value resolved under an existing ID on later calls.
 
 Omitted roles are unavailable, including auxiliary roles a tool needs. Report
 the missing configuration; do not synthesize a private root or switch
-workspaces silently. Workspace reads are local-only and may report missing
-payloads. Workspace selection does not change the node's sync or maintenance
-settings or start a second service. Node synchronization follows native-selected
-collections independently of the current request's workspace.
+workspaces silently. An explicit Faculty operation may acquire exact missing
+payloads through a lazy, non-serving client, even with background sync paused.
+The bound node is its first contact; authenticated discovery can lead to other
+providers. It creates no collection selection or replication interest. Workspace
+selection does not change sync or maintenance settings or start a second sync
+service. Node synchronization follows native-selected collections independently
+of the current request's workspace.
 
 If access is missing, explain that a node with the appropriate native grant
 authority must invite the existing node identity with the required access.
@@ -166,6 +169,20 @@ Reading workspace A and writing workspace B require separate explicit calls
 and the user's authority for that destination. Selection does not automatically
 copy or union data, and there is no cross-workspace transaction. Workspace routing
 is not an execution sandbox for tools that accept host paths or commands.
+
+File input paths refer to the computer running Erlkonig, not the agent's
+container or another person's computer. Use original local paths or returned
+Files references in binary-input tools; never generate base64 or hexadecimal
+file payloads. A workspace chooses the destination collections, not filesystem
+authority. Read only the host files authorized by the user's task, and keep
+that authorization separate from permission to publish into the destination.
+`files_add` imports a local file or folder through the native tree importer;
+retain its returned file/import reference for later operations. A consumer that
+needs one file cannot use a directory reference as if it were bytes. A file
+reference resolves in the explicitly selected workspace, not across all roots.
+For secret path input, use the Secrets operation directly so plaintext never
+passes through an ordinary Files import. Protected local .1pux import retains
+its app chooser and local passphrase flow.
 
 ## Where things go
 
@@ -189,8 +206,29 @@ goal, not a wiki page.
 - **Never ask for a secret in chat.** Some tools need an API key, a token or
   a model (web search, mail, discord, linkedin, voice, hear, triage and
   others). When one answers that it is not set up, tell the user in one
-  sentence that it needs to be set up in the Erlkonig app or by their admin,
-  and continue without it. Do not ask them to paste a key here.
+  sentence that it needs to be set up in the Erlkonig app or by their admin.
+  For requested local credential entry, use `secrets_enter_local` with the exact
+  selected workspace, service, storage name and `kind` (`login` or `secret`).
+  Those arguments are metadata only: the person types the value in the app,
+  never here. Login creates a native structured encrypted item with separate
+  username/password semantic roles, not JSON; generic entry keeps its exact raw
+  UTF-8 bytes. The storage name is a public label. Keep the call/connection open
+  for Save or Cancel. Report only status/version ID; never export private facts
+  or values to verify Save.
+  Cancel saves nothing; a lost response or `outcome_unknown` requires metadata
+  inspection (`secrets_items` for login, `secrets_list` for generic entry) before
+  any new entry, never an automatic retry. No sharing grant is created;
+  keep the Secrets route separate from an invoice-only shared bundle. If local
+  entry is unavailable, continue without it. Do not ask them to paste a key here.
+  For metadata-only inspection, use `secrets_item_inspect` with the exact version
+  and body; `secrets_item_open` without a body lists body alternatives only.
+  Supplying an exact body to `secrets_item_open` exports PRIVATE FACTS, including
+  plaintext inline integer/flag values: this is not a metadata-only operation and
+  requires explicitly authorized disclosure. Out-of-line text and attachment
+  children remain ciphertext handles. `secrets_item_export` additionally requires
+  the exact child handle and encoding and discloses that child's plaintext to the
+  caller. Do not silently choose a body alternative or collapse repeated or
+  unknown roles. Old raw versions retain the `secrets_get` byte contract.
 - **Read before you write.** Search the wiki and list goals before creating
   an entry, so you add to existing work instead of duplicating it.
 - **First use.** Empty results describe the selected roots, not the entire

@@ -19,13 +19,14 @@ use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use window::{Action, StatusWindow};
 use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::WindowId;
 use zbus::blocking::Connection;
 
 /// Everything that reaches the main loop from other threads.
 pub(crate) enum UserEvent {
     Menu(MenuEvent),
+    FacultiesWake,
     Tray(TrayIconEvent),
     /// Another launch, over the session bus, asked for the window.
     Show,
@@ -73,6 +74,7 @@ fn xdg_open(target: &OsStr) -> bool {
 }
 
 struct LinuxShell {
+    wake_proxy: EventLoopProxy<UserEvent>,
     tray: Option<TrayIcon>,
     colour: [u8; 4],
     /// The attention state of the installed icon; `None` forces a redraw.
@@ -83,6 +85,10 @@ struct LinuxShell {
 }
 
 impl Shell for LinuxShell {
+    fn faculties_wake(&self) -> Box<dyn Fn() + Send + Sync> {
+        let proxy = self.wake_proxy.clone();
+        Box::new(move || { let _ = proxy.send_event(UserEvent::FacultiesWake); })
+    }
     fn alert(&mut self, _: &str, _: &str, _: &[&str]) -> Option<usize> {
         self.want_window = true;
         None
@@ -134,7 +140,12 @@ impl Shell for LinuxShell {
             .autostart
             .as_ref()
             .ok_or("There is no autostart folder because HOME is not set.")?;
-        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        // Disabling only removes the desktop entry; the image may have moved.
+        let executable = if on {
+            paths::launcher_executable().map_err(|error| error.to_string())?
+        } else {
+            PathBuf::new()
+        };
         autostart::set(dir, on, &executable).map_err(|error| {
             format!(
                 "Cannot change {}: {error}",
@@ -224,6 +235,7 @@ impl ApplicationHandler<UserEvent> for Linux {
     fn resumed(&mut self, _: &ActiveEventLoop) {}
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if self.app.faculties_window_event(id, &event) { return; }
         let Some(window) = &mut self.window else {
             return;
         };
@@ -249,6 +261,7 @@ impl ApplicationHandler<UserEvent> for Linux {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
+            UserEvent::FacultiesWake => {} // next_wake reads the pending deadline on this thread.
             UserEvent::Menu(event) => {
                 self.app.on_menu(event);
                 self.app.refresh(event_loop);
@@ -276,7 +289,7 @@ impl ApplicationHandler<UserEvent> for Linux {
         if let Some(window) = &mut self.window {
             window.set_view(self.app.view());
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.app.next_refresh));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.app.next_wake()));
     }
 
     fn exiting(&mut self, _: &ActiveEventLoop) {
@@ -329,6 +342,7 @@ pub fn main() {
         signal_hook::flag::register(signal, terminate.clone()).expect("shutdown signal");
     }
     let shell = LinuxShell {
+        wake_proxy: proxy,
         tray: None,
         colour: crown_colour(scheme),
         shown: None,

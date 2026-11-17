@@ -197,7 +197,7 @@ impl MigrationPlan {
         }
         let mut selections = Fragment::empty();
         for (role, root) in routes {
-            if faculties::collection_names::name_for(*role).is_none() {
+            if crate::workspace::role_name(*role).is_none() {
                 bail!("unknown faculty role {role:X}");
             }
             let collection = faculties::collection_names::open_workspace_in(target, *root)?;

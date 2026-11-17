@@ -22,6 +22,11 @@ pub fn roles() -> Vec<(Id, &'static str)> {
     faculties::collection_names::table()
 }
 
+/// Resolve only roles supported by the public Faculty catalog.
+pub(crate) fn role_name(role: Id) -> Option<&'static str> {
+    faculties::collection_names::name_for(role)
+}
+
 /// One edit request / native-fact projection, not a catalog of the store.
 /// `id` is the only request-facing ID. `anchor` exists for explicit UI edits.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,7 +167,7 @@ impl Discovery {
     /// A picker selection must name a root compatible with the selected role
     /// and usable by this signer. This does not confer missing permissions.
     pub fn select(&self, role: Id, handle: CollectionHandle) -> Result<RootChoice> {
-        faculties::collection_names::name_for(role).context("unknown faculty role")?;
+        role_name(role).context("unknown faculty role")?;
         let root = self.probe(handle)?;
         if !root.read && !root.write {
             bail!("selected signer has neither READ nor WRITE admission to this exact root");

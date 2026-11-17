@@ -132,6 +132,10 @@ fn install_refresh_and_uninstall_touch_nothing_but_their_own_data() {
         std::env::set_var("CODEX_HOME", home.join(".codex"));
         std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
     }
+    // Establish shell-runtime state before measuring installer mutations.
+    // Rosetta creates HOME/.cache/rosetta even for this neutral command.
+    assert!(std::process::Command::new("/bin/sh")
+        .args(["-c", ":"]).status().unwrap().success());
     let before = snapshot(&root);
 
     let layout = Layout::new(data.clone());
@@ -334,6 +338,25 @@ fn install_refresh_and_uninstall_touch_nothing_but_their_own_data() {
     // Every sentinel survived byte for byte, and every change is inside the
     // app's own data directory (its plugin staging, nothing else).
     let after = snapshot(&root);
+    // Diagnostic only: retain every delta before the first guard assertion.
+    let describe = |entry: Option<&Entry>| match entry {
+        None => "missing".to_owned(),
+        Some(Entry::Dir(mode, time)) => format!("directory mode={mode:o} mtime={time:?}"),
+        Some(Entry::File(mode, time, bytes)) =>
+            format!("file mode={mode:o} mtime={time:?} length={}", bytes.len()),
+        Some(Entry::Link(target)) => format!("symlink target={target:?}"),
+    };
+    for path in before.keys().chain(after.keys()).collect::<std::collections::BTreeSet<_>>() {
+        let (old, new) = (before.get(path), after.get(path));
+        if old != new {
+            let bytes_equal = match (old, new) {
+                (Some(Entry::File(_, _, a)), Some(Entry::File(_, _, b))) => Some(a == b),
+                _ => None,
+            };
+            eprintln!("guard_delta path={path:?} before={} after={} file_bytes_equal={bytes_equal:?}",
+                describe(old), describe(new));
+        }
+    }
     let staging = data.join("plugins");
     for (path, entry) in &before {
         if path.starts_with(&staging) || *path == data {

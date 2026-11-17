@@ -1,5 +1,12 @@
 # Erlkonig
 
+This isolated public-source candidate uses the public Faculty catalog. It does
+not include the private ERP adapter or its collection role. Its source and CI
+recipe are not yet publication-ready: dependency source availability, license
+notices and native validation remain outstanding. The retained lock has an ERP-only
+reconciliation verified with locked offline metadata; this is not a build validation.
+See `ci/source-inputs.json` and the inactive `ci/native.yml.draft` recipe.
+
 One macOS menu-bar application, one executable, one resident backend. The
 main thread owns the menu; native Rust workers own replication, maintenance
 and the authenticated local Faculty MCP endpoint. No node executable,
@@ -7,7 +14,170 @@ LaunchAgent or KeepAlive restarter is bundled. A client may start the same
 executable in `mcp-stdio` mode: this connection-scoped transport only forwards
 to the running app, and never owns a pile or starts a backend.
 
+## Local secret entry (private prototype)
+
+`secrets_enter_local` takes the exact `workspace` ID from `list_workspaces`,
+`service` and `name` (each 1–160 visible characters), and optional `kind`
+(`login`, the default, or `secret`). These are presentation metadata, not
+credentials. Do not put a username, password, token or seed in tool arguments
+or chat. On macOS the running app shows the selected workspace label and exact
+ID, service and storage name, with local Save/Cancel fields. The selected
+Secrets route and native WRITE admission are checked before collecting input.
+
+Login uses a username field and a native secure password field. Save creates a
+native structured encrypted item with separate username/password semantic roles,
+not a JSON body. The storage name is its explicit public label; field values
+stay encrypted. Existing raw secret versions are not rewritten or reinterpreted.
+Generic secret entry uses one native secure field and encrypts its UTF-8 bytes
+without JSON framing. Both login fields, or the generic value, must contain at
+least one character. An empty-field Save returns a fixed error asking for a new
+local entry and publishes nothing; values are not trimmed or echoed in errors.
+No TOTP generation, password change, credential registry
+or grant operation is added. Existing collection and Secrets delivery semantics
+are unchanged; keep credentials out of an invoice-only shared workspace bundle.
+
+The call waits on the existing app connection. Keep it open until the person
+answers. A successful response is only `{"status":"saved","secret":"<ID>"}`;
+Cancel returns `{"status":"cancelled"}` and publishes nothing. An unsupported
+shell or stopped bridge returns `{"status":"unavailable"}`. The in-process
+bridge accepts one prompt at a time; another simultaneous entry fails busy.
+The HTTP worker remains sequential and can queue calls behind that prompt.
+No prompt job or receipt is persisted, and nothing is retried automatically.
+
+Shutdown closes queued and visible entry before HTTP drain. A Save already
+admitted before shutdown may complete. Disconnecting or sending MCP cancellation
+does not undo an admitted call; if the response is lost, its outcome is unknown.
+`outcome_unknown` likewise means storage did not report success, possibly after
+commit. Inspect `secrets_items` metadata for login or `secrets_list` for generic
+entry before deciding whether to enter again; never decrypt values to verify Save.
+Owned Rust input buffers are zeroized where feasible and controls are cleared;
+AppKit/editor/intermediate copies are not guaranteed to be erased.
+
+For metadata-only inspection, use `secrets_item_inspect` with an exact version
+and ciphertext body; `secrets_item_open` without a body lists body alternatives
+only. With an exact body, `secrets_item_open` exports a PRIVATE FACTS archive,
+including plaintext inline integer/flag values. That is an explicitly authorized
+body disclosure, not metadata-only inspection. Out-of-line text and attachment
+children remain ciphertext handles. Explicit `secrets_item_export` additionally
+selects an exact ciphertext child handle and encoding and reveals that child's
+plaintext to the caller. Never export private facts or values to verify Save.
+Unknown/repeated roles and body alternatives remain native relations, not a
+single chosen login or JSON export.
+Legacy consumers of raw `secrets_get` continue to receive the original bytes,
+but must explicitly adopt native item APIs to consume new local login entries.
+
+## Protected local Secrets candidate (not deployed)
+
+`secrets_enter_local` additionally accepts `protected: true`. The native form
+collects and confirms an independent app passphrase (1–1024 UTF-8 bytes), never
+the Mac login password. A new protected version has its own random DEK, wrapped
+by an Argon2id-derived passphrase key; there is no node/agent-key recipient wrap.
+Existing versions are not converted, deleted, or made retrospectively private.
+Keep the passphrase separately: this candidate has no recovery reset, and losing
+it loses access. Omit the flag for unchanged ordinary agent-accessible entry.
+
+Protected explicit Secrets get/open/inspect/export/TOTP operations detach their
+exact encrypted request, release the store lease, and ask locally. The prompt
+names the operation and its disclosure. Approval returns a request-bound key,
+not an unlocked vault; the operation reopens and rechecks its immutable binding.
+Plaintext output is available to the calling integration after approval. The
+shared MCP bearer token does not authenticate an individual named agent. Direct
+Mail/Discord/other low-level consumers have not been adapted: protected reads
+there fail closed, without silently using ordinary agent-key access.
+
+Both entry and unlock prompts expire after 120 seconds. Shutdown aborts pending
+and visible modals. The deadline gates admission, not already-admitted work.
+Transport disconnect/MCP cancellation is not yet propagated to these synchronous
+requests; it must not be described as revoking a pending approval. No automatic
+retry occurs. Rust-owned passphrases/keys are zeroized; AppKit and immutable
+Apple framework buffer copies cannot promise complete erasure.
+
+Touch ID remains **not configured and not UI-enabled** in this candidate. The
+concrete source backend creates P-256 Secure Enclave keys with private-key-use
+and current-biometry access control, wraps an independent DEK binding with ECIES,
+and uses a new LAContext per read. It cancels/invalidate-drops that context and
+never caches authentication between requests. It provides no OS-password,
+software-key, or agent-key fallback. Hardware loss, missing hardware/enrollment,
+biometry changes/lockout, headless use, signing failure and missing key deny the
+device path; an independently configured passphrase wrap remains the recovery
+path. Source compilation/mock tests do not constitute hardware acceptance.
+
+The existing app is ad-hoc signed with no team identity/entitlements. Activating
+the device path requires a provisioned app identity, appropriate data-protection
+keychain access, explicit enrollment UI, and synthetic hardware tests across
+cancel, repeated access, app upgrade and missing-key scenarios. No keychain item,
+profile or signing account was created during implementation. Apple references:
+[Secure Enclave keys](https://developer.apple.com/documentation/security/protecting-keys-with-the-secure-enclave),
+[macOS keychains](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains),
+[authentication context reuse](https://developer.apple.com/documentation/security/ksecuseauthenticationcontext).
+
+## Protected local 1Password import (candidate, not deployed)
+
+`secrets_import_1password_local` requires an exact `workspace` ID. The only
+other argument is optional `previous_import`, an opaque receipt ID returned by
+a previous protected import. No path, export bytes, credentials, passphrase or
+ordinary-protection option is accepted. The native file picker selects one
+regular `.1pux` file; the app opens it once and locally collects and confirms an
+independent app passphrase. Export contents never go through chat/tool arguments,
+logs, clipboard or temporary plaintext files. Existing importer limits apply.
+
+Omitting `previous_import` explicitly creates a **new** import, without global
+content deduplication. Supplying it verifies only that exact previous protected
+import against the locally selected export and passphrase; failure never falls
+back to creating a replacement. Keep the returned receipt ID for this purpose.
+The whole original archive, imported items/attachments and receipt have user-only
+protection, not node-key recipient wraps. Public labels are neutral, not imported
+titles: model metadata listing cannot discover account/vendor titles before
+approval. This is not yet a named account search/catalog or local selection UX.
+Older ordinary node-readable copies are **not revoked or converted**.
+Touch ID, recovery and signing/keychain enrollment remain disabled.
+
+The workspace route is frozen for the call. No store lease is held during file
+selection or passphrase entry; expensive parsing/encryption also runs outside
+the publication lease. Cancel/shutdown/120-second expiry before Save admission
+publishes nothing. An admitted batch runs once and may take longer than the
+prompt deadline; disconnection or shutdown does not promise rollback. Results
+contain only status, receipt ID, counts and maintenance/reuse flags. A typed
+uncertain publication returns `outcome_unknown` plus its planned receipt ID;
+keep it and inspect metadata before any explicit verification. No operation is
+automatically retried. The source-read buffer and passphrase are zeroizing;
+complete erasure of parser, AppKit and OS copies is not promised, and the original
+local export is untouched.
+
+Prepublication rejection reports `not_saved` with a static `stage` and `code`
+(format/limit validation, destination observation, encryption, receipt
+verification or other preparation), and optional positive numeric `os_error_code`.
+These are classifications, not raw parser/IO messages: no archive names, paths,
+field labels, values or passphrases are returned. An unclassified prepublication
+error retains the generic `import_rejected` code. Publication uncertainty still
+returns `outcome_unknown` and its receipt, never a no-publication claim.
+
 ## One node, named workspaces
+
+Startup inspects the selected pile before opening services. When an update is
+needed, the native app asks **Update local data?** with **Migrate** and **Not now**.
+Not now leaves the original and locator unchanged, with local services stopped.
+Noninteractive startup cannot answer on the person's behalf. After approval,
+supported older framing is converted on one background startup task into a fresh sibling file;
+the original pile and existing signing key are retained. Erlkonig checks the
+candidate through its settings and workspace readers, then atomically updates
+the existing `node.json` locator. A restart uses that locator and does not
+repeat conversion merely because retained legacy branch pins remain.
+
+Legacy branches require an explicit native choice naming the collection and
+this node's read/write authority. Importing a collection does not infer its
+Faculty role or enroll it in a workspace. The separate settings migration
+handles old application identities and configuration. Unsupported formats and
+canonical signed-record migrations that need original authors' refreshes leave
+the original and locator untouched and explain the required next step.
+After migration approval, records signed by this node use its existing key for
+the canonical update. Foreign signatures are never replaced with this node's.
+Quit cancels startup at the converter's checkpoints and waits for its current
+native operation to finish before releasing the owner lock.
+Cancellation is checked again after the locator's temp file is durable and
+immediately before selection. Once selected, the updated copy stays selected
+even if the remaining startup is cancelled. Existing unavailable Config data
+and unresolved choices retain their native read outcomes for normal repair.
 
 One node identity, one logical pile and one local MCP endpoint serve every
 workspace. A workspace is a named bundle of collections, not a separate
@@ -42,64 +212,45 @@ membership. Grants are additive and non-expiring; editing/removing a workspace
 does not revoke another node's authority. A narrower share does not remove
 permissions the recipient already holds.
 
-Grants are valid immediately. The returned bounded, opaque `bootstrap` is a
-one-way signed workspace-metadata handoff, not a request/approve/acknowledge protocol.
-Native grant exchange delivers capability evidence independently of the
-workspace-metadata handoff. A grant alone neither enrolls nor selects its roots.
-On the recipient's own node, `config_probe_workspace_share` verifies the signed native manifest,
-recipient binding in memory, and reports exact descriptor names and typed
-role/root routes plus the issuer's declared access choice. It does not confirm
-native collection admission. It imports nothing and starts no repair,
-hydration or upkeep. Names are presentation, never parsed to infer roles or
-future bundle members.
+Grants are valid immediately. Native peer exchange delivers proofs; sync and
+repair acquire descriptors and their names. A grant alone neither enrolls a
+workspace nor selects its roots for Full synchronization. On the recipient's
+own node, inspect native evidence with `config_list_pending_shares` and local
+roots with `config_list_collections`.
+The pending listing groups resident evidence by issuer workspace and reports
+exact roots, descriptor names, role hints, proof claims and native admission
+separately. Names and declared roles inform the model's choice of faculty
+routes; they do not dictate that choice or grant access. Automatic enrollment
+uses only an unambiguous understood role declared on the descriptor, never a
+display-name suffix. Unknown declarations coexist with understood roles;
+conflicting understood declarations require explicit routes.
 
-After choosing whether to enroll and a local alias, the recipient calls
-`config_enroll_workspace_share` with that bootstrap, label and current Config
-observation. It imports descriptor/name metadata and publishes a local
-workspace with the same roots/role routes and existing key. It copies no keys,
-creates no replacement data roots, sends no reply to the issuer and sets no
-global default. Repeat unchanged enrollment returns the same local revision;
-a later local edit or withdrawal is never overwritten. The bootstrap contains
-descriptor/name blobs and a native signed COMMIT, never capability proofs,
-definition bodies, keys or member data. It is metadata discovery, not authority
-delivery: native grant exchange and collection repair supply proofs, and
-ordinary exact-handle acquisition supplies their definitions.
+For the requested work, the model chooses explicit `{role, root}` routes over
+the existing admitted collections. A deliberate subset is valid. Use
+`config_create_workspace` with those routes for a new local binding, or
+`config_edit_workspace` for an existing binding. Creation without routes
+creates fresh private collections instead; editing with routes replaces the
+complete binding, so retain the routes the user still wants. These operations
+check the known faculty role, resident named descriptor and independent native
+READ or WRITE admission. They require neither matching descriptor names nor
+the entire issuer bundle, and do not change roots or grant permissions.
 
-Without a bootstrap, the same enrollment follows the native grant exchange.
-When the issuer's node connects, the grant's proofs reach the recipient's
-node and land once their descriptors are resident. `config_list_pending_shares`
-lists, read-only, the collections resident proofs grant to this node that no
-current local workspace routes, grouped by the issuing workspace anchor found
-among each descriptor's tags, with the descriptor name, faculty role (declared
-on descriptors created since 2026-10-13, otherwise read from the name's role
-suffix, and `role_source` says which), issuer identities, the actions the
-proof edges claim (`claimed`, `claimed_access`, `claimed_delegate`) and,
-separately, what native admission under the resident descriptor grants this
-node (`admitted` per root, `admitted_access` and `admitted_any` per group);
-a claim is never presented as effective, so a chain no policy admits reads
-claimed read_write with admitted_access none. A root whose descriptor is not
-yet resident is listed by handle as descriptor pending, with nothing
-inferred; a resident descriptor whose name blob has not arrived, or whose
-tags offer no single anchor, keeps its entry and says why in `reason`;
-granted resources that are resident but no collection descriptor are counted
-under `skipped`; and roots the sync daemon holds grants for in memory only
-appear under `sync_memory_pending`. `config_enroll_pending_share` then
-publishes a local workspace over exactly the roots given as `roots`, the
-consent unit, which are the roots the listing showed: if a root arrived under
-the anchor since the listing, or a given root is not granted under it, the
-call refuses and names the difference instead of widening or narrowing
-silently; the published routes are exactly the roots given, never the whole
-granted group. A granted root that another local workspace already routes
-stays listed, with that workspace in `routed_in`, may be left out of
-`roots`, and is routed here only when given. A first enrollment needs a
-label; roots that arrive later under an enrolled anchor are listed beside it
-(`local_workspace` enrolled) and enrolling them extends the workspace with a
-new revision over the union of routes, label preserved unless given; the
-identical already-routed set is idempotent, and a changed or withdrawn local
-workspace is never overwritten. A proof edge whose definition is not
-resident or does not decode contributes no claim and is counted under
-`definitions_pending`. The bootstrap tools remain the fallback when the
-nodes have not connected yet.
+`config_list_pending_shares` reports `enrollable` for its automatic helper,
+not the recipient's general ability to use a root. When it is false, inspect
+the reported metadata and reason. Unknown role hints can be handled by
+explicit model-selected routes. Missing descriptor
+bytes and missing native admission are separate conditions that explicit
+routing does not fix. A root already used by a local workspace is disclosed
+in `routed_in`; inspect that binding before creating another one.
+
+`config_enroll_pending_share` remains an optional convenience for a complete
+group whose inferred mappings already match the intended binding. Only that
+helper requires every currently unrouted granted root and rejects a set that
+changed since listing; explicit create/edit supports the chosen subset.
+Its later extensions union the given roots with its existing binding, while
+a changed or withdrawn binding is never overwritten. Listing alone fetches,
+grants and selects nothing. Discovery reads the evidence native exchange and
+repair have already made resident.
 
 Sync peering and Full hydration follow the pile's native collection-selection
 registers, not all admitted record/proof roots. Creating a workspace, adding
@@ -184,8 +335,14 @@ both are installed as the `erlkonig` command. `faculties`, `trible` and
 `triblespace-net` are linked libraries, not launched commands. The node's
 single sync owner provides its durable Peer and enabled maintenance. With
 sync paused, maintenance is local-only and starts no acquisition networking.
-Workspace Faculty reads are local-only: missing payloads fail instead of
-starting acquisition peers. Native owners and safe pile handles end with the app.
+An explicit workspace Faculty operation may acquire exact missing payloads,
+independently of background sync and maintenance settings. Each used workspace
+retains one lazy, non-serving client: resident operations start no endpoint;
+a cold read contacts the bound node first and may follow authenticated provider
+and discovery hints. It neither selects collections nor activates replication.
+Its frozen collection observation remains unchanged while exact bytes arrive.
+Workspace replacement/withdrawal and app shutdown close those clients and their
+safe pile handles.
 
 Maintenance uses a dedicated four-worker CPU pool, dependency-first ordering,
 and value-change gating at a one-second cadence. Native held sets are maintained
@@ -211,6 +368,12 @@ stopped services, and Quit rejects retries while draining owned work.
 Healthy operation has no status row in the crown menu. An error adds a short
 **Sync paused**, **Services paused** or **Attention needed** action; click it
 for the full local diagnostics. Diagnostic text never becomes the menu title.
+On macOS, long reports use a bounded, selectable scrolling text area; the
+native dismissal button stays outside it and Return keeps its default action.
+Short alerts retain their usual native layout. The hidden AppKit layout probe
+(`cargo run --release -p erlkonig-mac --example alert-layout`) checks full-text
+retention, selection, scrolling, button bounds, and small-screen sizing without
+opening a dialog or starting services; it is not a visible interaction test.
 The same attention condition gives the crown a mildly sharper static outline;
 it remains distinct with Reduce Motion, without inventing activity.
 
@@ -240,6 +403,73 @@ rename-similarity and clock-skewed history ordering can differ from Git CLI.
 User-invoked Habit shell predicates remain an explicit subprocess exception.
 They are not resident app sidecars, but arbitrary descendants are outside the
 native shutdown guarantee.
+
+### Bounded FD failure evidence (macOS)
+
+Maintenance failures matching the fixed EMFILE/ENFILE messages now capture
+diagnostics before the app handler formats status or sends ordinary metrics.
+This is **handler-time evidence**, not the failed allocation's syscall snapshot:
+the upstream error is already a string and temporary descriptors may already
+have closed. Matching examines at most 8 KiB of its prefix/causal suffix, accepts
+wrapped `tempfile` errors without relying on the outer `raw_os_error`, and stores
+neither error text nor paths, descriptor numbers, contents, or handles.
+
+Capture reads this process's actual `getrlimit(RLIMIT_NOFILE)`, realtime and
+monotonic clocks, and `proc_pidinfo(PROC_PIDLISTFDS)` into a fixed 8192-entry
+stack buffer. Returned descriptors are counted by allowlisted native type,
+including an unknown-type bucket. A full buffer is incomplete and its count a
+lower bound. A failed/malformed census is absent, never zero; clocks and limits
+also remain absent when unavailable. The list, limit and clock calls are not
+one atomic observation. Other platforms currently retain limits/clocks but
+report the FD census as unavailable.
+
+Every new occurrence separately records `error_site = maintenance`: this names
+the handler observing failure, **not** the subsystem causing descriptor pressure.
+Snapshots also carry `mcp_http_accepted_streams` from this app's exact MCP HTTP
+endpoint. This allocation-free atomic gauge follows accepted I/O lifetimes:
+it increments only after accept succeeds and decrements after I/O closes, before
+releasing admission. It does not count reserved pre-accept permits, requests,
+sessions, the listener, kernel backlog, outbound sockets or other subsystems.
+A cloned observer does not keep the endpoint alive. Missing instrumentation is
+absent, not zero. The gauge and OS census are separate observations; do not
+subtract them to manufacture an "unattributed socket count". They can disagree
+under concurrent activity, and a recent sampled high-water selects by total FD
+count, not by the HTTP gauge's maximum.
+
+The explicit read-only `inspect-fd-events` report exposes `error_site_subsystems`,
+`pressure_owner: "unknown"`, and each snapshot's `mcp_http_accepted_streams`.
+Older/unknown error-site facts report `unknown`; arbitrary labels are never
+echoed. OS socket ownership and the cause of exhaustion remain unknown: the
+separate MCP gauge is corroborating lifetime evidence, not syscall attribution.
+
+The controller keeps at most 60 in-memory samples at a nominal one-second
+cadence; store work can delay that cadence. A failure carries the maximum
+**complete** sample no older than 60 monotonic seconds and its timestamp, plus
+the number of eligible samples. Stale, partial, future and unknown-clock samples
+do not qualify. This is a recent sampled high-water mark, never an exact peak;
+sampling alone creates no durable writes.
+
+Sixteen preallocated occurrence slots use a nonblocking capture lock. Full or
+contended capture increments a saturating loss count; a cumulative loss fact is
+published even without a subsequent successful capture. Capture opens no file,
+allocates no dynamic buffer, takes no node lock and never calls the writer.
+The existing controller publishes bounded batches to the private
+`erlkonig-metrics` collection at most once per ten seconds (plus shutdown).
+Commit/flush failure retains the same occurrence identities and clocks for
+retry, including commit-success/flush-failure ambiguity. Writer failure does
+not recursively trigger capture. Pending memory is not crash-durable; final
+shutdown failure or process exit can lose it. The ordinary UI `metrics_problem`
+is not a durable failure latch and may be replaced by other metrics outcomes.
+Ordinary metric cadence and detailed error reporting are unchanged.
+
+The facts use the public typed attributes in `erlkonig_core::node_metrics::fd`,
+joining occurrence -> handler/recent-sample snapshot -> type/count aggregates
+inside the existing metrics collection. There is no new JSON body, secondary
+store, dedicated UI or MCP reader. `node_metrics` tests demonstrate direct
+`find!` queries, sparse/unknown values, reopening and idempotent retry.
+Attribute anchors and event-kind IDs were minted with `trible genid` on
+2026-10-21 (original census) and 2026-10-26 (subsystem evidence), and are recorded
+verbatim beside their declarations.
 
 ## Workspace requests
 
@@ -299,8 +529,15 @@ profile. Quit disconnects the transports, which never relaunch the app.
 A stored MCP-port change takes effect on the next launch. Metrics contain cumulative
 observed bytes/publications/failures by node, worker and session;
 absent counters remain unknown. Measurements are coalesced at a ten-second
-cadence, with observed failures and shutdown flushed sooner. Local-only
-maintenance does not claim a live network listener. Failed metrics
+cadence, with observed failures and shutdown flushed sooner. Successful maintenance hops with no publications emit no sample; observations
+are work evidence, not an idle heartbeat. Upkeep of this node's metrics root,
+its native derived collections and their attached indexes still runs and counts
+in live status. Targets classified from the current discovery snapshot emit no
+ordinary sample into their own sink, including when that upkeep fails. Newly
+resident descriptors are classified on the next changed snapshot. These failures remain visible in status and existing bounded
+FD diagnostics; failures for other targets retain ordinary error samples. A
+later reportable observation carries the cumulative counters for all upkeep.
+Local-only maintenance does not claim a live network listener. Failed metrics
 appends are visible in the menu and are never reported as persisted success.
 Service failures append and flush separate typed events in that existing
 `erlkonig-metrics` collection: initiating cause, startup/session failure and each
@@ -324,8 +561,9 @@ current 3.6-second ripple cycle, landing exactly on the resting outline; new wor
 before that landing continues the same phase without a restart. Overlapping
 work shares one activity count; enabling services, idle waits, status sampling
 and rendering do not count. It is an activity indicator, not a bytes-per-second
-meter. Payload counters still report measured bytes, and local-only workspace
-reads add no network traffic. There is no animation-preview mode.
+meter. Payload counters report the background service's measured bytes; exact
+workspace-client acquisition is not included in that counter. There is no
+animation-preview mode.
 
 ## Integrations
 
@@ -441,6 +679,20 @@ credential is required. See the probe's own output for the precise evidence;
 mock transport results are not native binary acceptance. No validation step
 requires changing real client profiles or opening the GUI.
 
+For an explicitly approved candidate-only GUI lifecycle check, build
+`cargo build -p erlkonig-core --example accept-fixture` from the same frozen
+source/dependency closure, then run `python3 scripts/accept/isolated_app.py
+/absolute/candidate/Erlkonig.app --fixture-binary /absolute/target/debug/examples/accept-fixture
+--root /absolute/new-fixture-directory`. This directly executes the candidate,
+never `open -n` or an installed app. The new fixture has its own HOME, client
+profiles, temporary directory and inventory-only fake CLIs; native settings are
+port 0, sync off and maintenance off before launch. It checks authenticated MCP,
+explicit workspace routing, forwarding without another owner, Quit/drain and
+relaunch with the same fixture identity, then stops all fixture processes.
+It does not open credential-entry UI: invented native Save/Cancel and plaintext
+output guards belong to the core local-entry/dispatch tests. Do not reuse a
+previous app executable or fixture directory as evidence for a new candidate.
+
 To package an already signed candidate without rebuilding or changing it:
 
 ```sh
@@ -480,3 +732,122 @@ tests. Signing credentials and external submission are separate release work.
 The adjacent native dependency repositories must be the frozen source cohort
 recorded by the validation run. See `TESTING-for-JP.md` for the remaining
 interactive checks; automated success is not a claim those checks occurred.
+
+## Faculties viewer candidate
+
+Choose **View data** from the crown menu, then select a workspace from the dropdown.
+Choosing it again brings the same window forward; after closing it, the command
+opens a new viewer on the existing app owner.
+Duplicate names have distinct revision suffixes; selection binds the exact
+current workspace value. The window reuses the existing Faculties notebook and
+its ordered cards, including Wiki, Compass, Messages, Files and Memory. The
+Wiki graph, search and Typst pages retain their existing layout and exact
+revision links. Expand the sections you want to inspect.
+
+The viewer shows **local data** and updates as relevant content arrives. The
+app owner's existing refresh cycle checks the observation's native dependencies,
+including payload reads performed later by widgets. It queues one replacement
+observation on the reader worker; completion wakes the window. Unrelated appends
+do not reset the view. **Refresh** requests an explicit observation and resets
+card navigation. Existing widget queries over frozen data and Typst rendering
+still run on the window thread. Activity, Gauge, Compass and Headspace defer their
+queries while collapsed; opening a large section can still be expensive. Each view uses its explicitly configured workspace collection.
+Missing roles are omitted, and unavailable views do not hide independent readable
+views. Ordinary collections retain their READ admission; Secrets retains its
+local delivered-envelope possession semantics. No role falls back to a default
+collection. The resident app's existing sync/maintenance supplies local content;
+the viewer does not acquire data from peers or start another service.
+
+The window lives inside the app's existing main-thread event loop. It embeds the
+same GORBIE paint renderer and `compose_hosted(Target::Dashboard)` composition;
+there is no viewer child or second event loop. Its Runtime-registered worker
+borrows the already-loaded `SharedNode`/`NodeStore.pile` for Config, frozen widget
+observations and actions. It never opens a pile path or creates a Faculty Storage,
+peer, key or independent storage owner. The borrowed pile's durable signer is
+the app's signer. Selection and refresh recheck the complete workspace value.
+A transient request generation rejects old completions and resets card navigation
+after Refresh or choosing A → B → A. Automatic presentation updates keep that
+generation and navigation while invalidating workspace presentation caches once
+per relevant update. Native snapshots remain frozen; a missing resident payload
+that arrives through sync triggers a fresh observation without a viewer fetch.
+
+Wiki links and Files preview actions run on the worker against the exact clicked
+Files observation. Every export gets a fresh owned preview folder. Actions check
+selection and cancellation before filesystem effects and again immediately before
+launching the system viewer. Failed or cancelled exports remove their own partial
+folder; successful previews remain available to the external viewer. Requests are
+never replayed automatically. Config changes refresh the same dropdown choices.
+A changed binding clears the old view and invalidates its queued actions. A
+removed or unreadable selected workspace stays selected and unavailable; it
+never silently falls back to another workspace.
+
+Priority answers use the same factored Compass preparation, cycle checks,
+authoring and publication operation through the app's owner. READ/WRITE admission
+and a final cancellation/generation check precede publication; successful writes
+refresh the observation. Skip publishes nothing.
+
+Only one viewer is open per app process; its menu row is disabled while open.
+Close the window to cancel its worker and release the UI observations. Once the
+worker settles, **Browse Faculties…** is enabled again; the app-owned pile stays
+open. Runtime owns every worker join and joins them before closing NodeStore.
+Quit also cancels the viewer. The existing 15-second final process-termination
+fallback does not claim that an unfinished native operation drained cleanly.
+
+Enabling widgets also makes the already-registered **viewer_capture** operation
+available. This is a named capability change: explicit calls still select an exact
+workspace and target through the existing dispatcher, validate bounded image
+output before rendering, and return PNGs. No GUI/GPU is opened during discovery or
+startup. Capture remains synchronous; disconnect does not cancel an admitted
+call, and the app's existing shutdown grace applies. Its image-byte bounds do not
+bound all GPU allocations or total render time. The viewer window adds no MCP tool. The pinned Faculty upgrade also brings upstream catalog changes, including Alarm; release acceptance compares tool names and schemas against the preceding app.
+
+Mac and Linux route the new window through their existing application loops.
+Linux's status window remains independent. No desktop adapter is added to iOS.
+This in-process source candidate has not been compiled or exercised on either
+desktop platform; native dashboard, GPU callback, input/repaint and close/reopen
+acceptance remain required. There is no Windows executable in this workspace.
+
+## Native command line candidate
+
+`erlkonig-cli` is a separate core-dependent crate whose installed binary is
+`erlkonig`. It does not depend on the GUI crate or require AppImage/FUSE. The
+existing core dependency closure still includes WGPU through TribleSpace/Jerky;
+this candidate does not claim a GPU-free binary. Running
+without arguments shows help; only `erlkonig serve` starts an owner, in the
+foreground. It uses the desktop application's data directory, node locator,
+identity, workspaces and existing exclusivity locks. Ctrl-C and SIGTERM cancel
+controlled startup or drain the running owner through its normal shutdown.
+Storage upgrades needing interactive approval are refused. Local secret entry,
+protected access and import dialogs return unavailable promptly in this shell.
+
+Clients connect to an existing owner and need its exact URL; `serve` reports the
+actual bound URL. Supply `--data-dir` when the owner uses a nondefault app
+directory. Clients do not open the pile or signing key, create a token, scan
+ports, launch an owner, reconnect, retry a call or persist workspace selection.
+
+```sh
+erlkonig serve
+erlkonig workspaces list --url http://127.0.0.1:PORT/
+erlkonig tools list --url http://127.0.0.1:PORT/ --output json
+erlkonig call wiki_list --url http://127.0.0.1:PORT/ --workspace 'My workspace' --json '{}'
+```
+
+`call` accepts the owner's advertised tools and schemas, with no local Faculty
+command registry. `--json -` reads one JSON object from stdin. `--workspace`
+resolves an exact current label or revision through `list_workspaces`; ambiguous
+labels fail. This convenience applies only when the tool advertises a string
+`workspace` argument, including applicable Config tools. A conflicting JSON
+workspace fails rather than being overwritten. An explicit JSON workspace can
+also be supplied unchanged. Tool errors exit unsuccessfully; `--output json`
+preserves the complete MCP tool result. An unknown mutation outcome is never
+retried, and connection loss does not cancel admitted work.
+
+Native CLI distribution contract: `erlkonig-cli-${VERSION}-${TARGET}.tar.gz`,
+with exactly two flat regular members: executable `erlkonig` and
+`THIRD_PARTY_NOTICES.txt`. Initial targets are `aarch64-apple-darwin`,
+`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`. Each release records
+archive and both member sizes and SHA-256 hashes, selected source identities and
+retained lock hash. This source candidate adds only a local CLI package entry
+to the prior lock, without changing external dependency versions. Native build,
+runtime acceptance, complete license notices and publishing are separate release
+steps; source/fixture tests do not establish them.

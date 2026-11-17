@@ -1,0 +1,61 @@
+# INACTIVE. Install only after source gates and native execution are accepted.
+# Common build script is also used by standard-release.yml.draft; development
+# artifacts are never promoted to releases and never use signing credentials.
+name: native-app-candidate
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-26
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    env:
+      RETAINED_RUST_ROOT: ${{ vars.ERLKONIG_LINUX_RUST_ROOT }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: erlkonig-app
+          persist-credentials: false
+      - name: Build and package exact native candidate
+        run: bash erlkonig-app/scripts/ci/native-build.sh '${{ matrix.target }}' "$RUNNER_TEMP/development"
+      - name: Native runtime on packaged development bytes
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = macOS ]; then
+            packages=("$RUNNER_TEMP/development/"*.dmg)
+          else
+            packages=("$RUNNER_TEMP/development/"*.AppImage)
+          fi
+          test "${#packages[@]}" -eq 1
+          python3 erlkonig-app/scripts/ci/probe_package.py --artifact "${packages[0]}" \
+            --target '${{ matrix.target }}' --app "$PWD/erlkonig-app" \
+            --fixture "$RUNNER_TEMP/app-target/release/examples/accept-fixture" \
+            --root "$RUNNER_TEMP/development-runtime"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: development-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/development/*.AppImage
+            ${{ runner.temp }}/development/*.dmg
+            ${{ runner.temp }}/development/*.sha256
+            ${{ runner.temp }}/development/*.txt
+            ${{ runner.temp }}/development/source-inputs.json
+# Probe failure prevents the development-artifact success path.

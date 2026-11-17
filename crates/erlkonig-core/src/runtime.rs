@@ -5,6 +5,7 @@ use crate::{
     config::NodeBinding,
     config_mcp::ConfigMcp,
     credentials, init,
+    fd_diagnostics::Diagnostics,
     node_metrics::{Sample, ServiceCode, ServiceEvent, ServicePhase},
     node_store::{ConfigView, NodeSettings, NodeStore},
     paths::{Layout, ensure_private_dir},
@@ -25,7 +26,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use trible::maintenance::{Driver, Event, SuccinctBackend, Target};
 use triblespace::core::{
+    collection::CollectionHandle,
     id::{Id, genid},
+    patch::{Entry, IdentitySchema, PATCH},
     repo::{SnapshotSource, StorageClose, StoreChanges, StoreSnapshot},
     signing_key_file,
 };
@@ -42,8 +45,14 @@ pub struct Runtime {
     node: SharedNode,
     stop: watch::Sender<bool>,
     services: ServiceControl,
+    secret_entry: crate::secret_entry::SecretEntry,
+    protected_access: crate::protected_access::ProtectedAccessBridge,
+    local_import: crate::local_import::LocalImport,
     workers: Vec<JoinHandle<Result<()>>>,
+    viewer_workers: Vec<JoinHandle<Result<()>>>,
+    viewer_interests: crate::faculties_browser::ViewerInterests,
     lock: Option<File>,
+    startup_notice: Option<String>,
 }
 
 fn update(status: &Arc<Mutex<Status>>, f: impl FnOnce(&mut Status)) {
@@ -108,6 +117,21 @@ impl Runtime {
     }
 
     fn start_with_guard(layout: &Layout, guard: ResourceCheck) -> Result<Self> {
+        Self::start_controlled_with_guard(layout, &crate::pile_upgrade::StartupControl::new(false), guard)
+    }
+
+    /// The native app calls this on its one owned startup worker. The same
+    /// lock covers inspection, conversion, locator publication and services.
+    pub fn start_controlled(layout: &Layout, control: &crate::pile_upgrade::StartupControl) -> Result<Self> {
+        Self::start_controlled_with_guard(layout, control, Arc::new(crate::resource_guard::sample))
+    }
+
+    fn start_controlled_with_guard(
+        layout: &Layout,
+        control: &crate::pile_upgrade::StartupControl,
+        guard: ResourceCheck,
+    ) -> Result<Self> {
+        control.check()?;
         ensure_private_dir(&layout.dir)?;
         let lock = lease(&layout.lock()).context(
             "another Erlkonig owner is using this data directory; stop it before starting this app",
@@ -129,6 +153,8 @@ impl Runtime {
             key: bootstrap.key,
             signer: signer.verifying_key().to_bytes(),
         };
+        let binding = crate::pile_upgrade::prepare(layout, binding, &signer, control)?;
+        control.progress("Opening local services…")?;
         let mut node = NodeStore::open(&binding.pile, signer.clone())?;
         let port = node.config().and_then(|view| view.mcp_port())
             .unwrap_or_else(|_| NodeSettings::default().mcp_port);
@@ -141,6 +167,7 @@ impl Runtime {
         config.body_timeout = Duration::from_secs(5);
         let endpoint = http::Endpoint::bind(config)
             .context("cannot open the local authenticated MCP service")?;
+        let fd_diagnostics = Arc::new(Diagnostics::new().with_http(endpoint.connection_metrics()));
         let status = Arc::new(Mutex::new(Status {
             running: true,
             node_id: Some(hex::encode(signer.verifying_key().as_bytes())),
@@ -163,8 +190,14 @@ impl Runtime {
             node,
             stop,
             services,
+            secret_entry: crate::secret_entry::SecretEntry::default(),
+            protected_access: crate::protected_access::ProtectedAccessBridge::default(),
+            local_import: crate::local_import::LocalImport::default(),
             workers: Vec::new(),
+            viewer_workers: Vec::new(),
+            viewer_interests: Default::default(),
             lock: Some(lock),
+            startup_notice: control.notice(),
         };
         let http_stop = app.stop.subscribe();
         let state = app.status.clone();
@@ -172,6 +205,9 @@ impl Runtime {
         let node = app.node.clone();
         let binding = app.binding.clone();
         let services = app.services.clone();
+        let secret_entry = app.secret_entry.clone();
+        let protected_access = app.protected_access.clone();
+        let local_import = app.local_import.clone();
         let mcp_url = app.status().mcp_url.context("local MCP address")?;
         app.workers.push(
             thread::Builder::new()
@@ -181,7 +217,7 @@ impl Runtime {
                         let config = ConfigMcp::new(binding.clone(), node.clone(), mcp_url, port, services);
                         let dispatch = WorkspaceDispatch::new(binding, move || {
                             with_node(&node, NodeStore::config)
-                        })?;
+                        })?.with_secret_entry(secret_entry).with_protected_access(protected_access).with_local_import(local_import);
                         dispatch.finish(endpoint.serve_until(
                             &[&activity.faculty(&dispatch), &activity.faculty(&config)],
                             stopping(http_stop),
@@ -199,6 +235,7 @@ impl Runtime {
         let activity = app.activity.clone();
         let node = app.node.clone();
         let control_stop = app.stop.subscribe();
+        let viewer_interests = app.viewer_interests.clone();
         let binding = app.binding.clone();
         let identity_lock = std::env::temp_dir().join(format!(
             "erlkonig-endpoint-{}.lock",
@@ -219,6 +256,8 @@ impl Runtime {
                         port,
                         retries,
                         guard,
+                        fd_diagnostics,
+                        viewer_interests,
                     );
                     if let Err(error) = &result {
                         update(&state, |s| {
@@ -228,6 +267,10 @@ impl Runtime {
                     result
                 })?,
         );
+        if control.is_cancelled() {
+            app.finish()?;
+            control.check()?;
+        }
         Ok(app)
     }
 
@@ -237,6 +280,53 @@ impl Runtime {
 
     pub fn binding(&self) -> &NodeBinding {
         &self.binding
+    }
+
+    /// Register a viewer worker in the existing service lifetime. Even when
+    /// its window closes, finish joins it before taking/closing NodeStore.
+    pub fn spawn_faculties(
+        &mut self,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        work: impl FnOnce(crate::faculties_browser::ViewerNode) + Send + 'static,
+    ) -> Result<crate::faculties_browser::ViewerWorker> {
+        if *self.stop.borrow() { bail!("application is shutting down"); }
+        self.reap_faculties()?;
+        let node = crate::faculties_browser::ViewerNode {
+            node: self.node.clone(), shutdown: self.stop.subscribe(),
+            interests: self.viewer_interests.clone(),
+        };
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completion = done.clone();
+        let worker = std::thread::Builder::new().name("faculties-observation".into()).spawn(move || {
+            struct Completed(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Completed {
+                fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Release); }
+            }
+            let _completed = Completed(completion);
+            work(node);
+            Ok(())
+        })?;
+        self.viewer_workers.push(worker);
+        Ok(crate::faculties_browser::ViewerWorker { stop, done })
+    }
+
+    /// Called by the normal app tick, including after a window closes. Only
+    /// finished handles are joined here; running workers remain Runtime-owned.
+    pub fn reap_faculties(&mut self) -> Result<()> {
+        let mut failures = Vec::new();
+        let mut index = 0;
+        while index < self.viewer_workers.len() {
+            if !self.viewer_workers[index].is_finished() {
+                index += 1;
+                continue;
+            }
+            match self.viewer_workers.swap_remove(index).join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(format!("{error:#}")),
+                Err(_) => failures.push("Faculties viewer worker panicked".into()),
+            }
+        }
+        if failures.is_empty() { Ok(()) } else { bail!(failures.join("; ")) }
     }
 
     pub fn put_settings(&self, expected: &ConfigView, value: &NodeSettings) -> Result<()> {
@@ -285,6 +375,9 @@ impl Runtime {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         status.active_work = self.activity.count();
+        if let Some(notice) = &self.startup_notice {
+            status.warnings.push(notice.clone());
+        }
         status
     }
     /// Request one guarded retry without editing persistent settings.
@@ -292,16 +385,30 @@ impl Runtime {
         self.services.retry()
     }
     pub fn begin_shutdown(&self) {
+        // Release a queued/visible local-entry waiter before the HTTP drain.
+        self.secret_entry.close();
+        self.protected_access.close();
+        self.local_import.close();
         self.stop.send_replace(true);
     }
+
+    pub fn take_secret_prompt(&self) -> Option<crate::secret_entry::SecretPrompt> {
+        self.secret_entry.take_prompt()
+    }
+    pub fn take_import_prompt(&self) -> Option<crate::local_import::ImportPrompt> {
+        self.local_import.take_prompt()
+    }
+    pub fn take_protected_prompt(&self) -> Option<crate::protected_access::ProtectedPrompt> {
+        self.protected_access.take_prompt()
+    }
     pub fn is_finished(&self) -> bool {
-        self.workers.iter().all(JoinHandle::is_finished)
+        self.workers.iter().chain(&self.viewer_workers).all(JoinHandle::is_finished)
     }
 
     pub fn finish(&mut self) -> Result<()> {
         self.begin_shutdown();
         let mut failures = Vec::new();
-        for worker in self.workers.drain(..) {
+        for worker in self.workers.drain(..).chain(self.viewer_workers.drain(..)) {
             match worker.join() {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => failures.push(format!("{e:#}")),
@@ -462,8 +569,12 @@ fn controller(
     initial_port: u16,
     retries: mpsc::Receiver<()>,
     guard: ResourceCheck,
+    fd_diagnostics: Arc<Diagnostics>,
+    viewer_interests: crate::faculties_browser::ViewerInterests,
 ) -> Result<()> {
     let (reports, receiver) = mpsc::channel();
+    let mut last_fd_sample = Instant::now() - Duration::from_secs(1);
+    let mut last_fd_publish = Instant::now();
     let mut task: Option<Task> = None;
     // The last interpreted service settings are independent of task liveness.
     // Reaping a finished handle must not turn unrelated Config edits into retries.
@@ -473,6 +584,12 @@ fn controller(
     let mut last_metrics = Instant::now();
     let mut last_guard = Instant::now() - Duration::from_secs(1);
     while !*stop.borrow() {
+        // Best-effort sampling, outside every node lock. A delayed controller
+        // leaves gaps; this is sampled high-water evidence, not an exact peak.
+        if last_fd_sample.elapsed() >= Duration::from_secs(1) {
+            fd_diagnostics.sample();
+            last_fd_sample = Instant::now();
+        }
         if task.as_ref().is_some_and(|task| task.worker.is_finished()) {
             join_task(task.take().unwrap(), &status, &node);
         }
@@ -486,7 +603,16 @@ fn controller(
         }
         let mut start = false;
         match with_node(&node, |node| {
-            node.poll_config()?.map(|view| {
+            let config = node.poll_config();
+            let interest = viewer_interests.lock().unwrap_or_else(|e| e.into_inner())
+                .as_ref().and_then(std::sync::Weak::upgrade);
+            if let Some(interest) = interest {
+                // Reuse the existing owner refresh cycle. Native snapshots
+                // compare indexed roots; no second store or history rescan.
+                let snapshot = node.pile.snapshot();
+                interest.check(snapshot.as_ref().ok(), config.is_err() || snapshot.is_err());
+            }
+            config?.map(|view| {
                 let settings = view.settings()?;
                 node.initialize_workspace_sync()?;
                 Ok(settings)
@@ -566,6 +692,7 @@ fn controller(
                     let state = status.clone();
                     let work = activity.clone();
                     let metrics = reports.clone();
+                    let diagnostics = fd_diagnostics.clone();
                     let shared = node.clone();
                     let worker =
                         thread::Builder::new()
@@ -600,6 +727,7 @@ fn controller(
                                             &state,
                                             &work,
                                             &metrics,
+                                            Some(&diagnostics),
                                             attempt,
                                             &mut entered,
                                         )
@@ -655,6 +783,16 @@ fn controller(
             });
             last_metrics = Instant::now();
         }
+        if last_fd_publish.elapsed() >= Duration::from_secs(10) {
+            if let Err(error) = fd_diagnostics.publish_pending(|batch| {
+                with_node(&node, |node| node.append_fd_events(batch))
+            }) {
+                // No failure is fed back into capture. The immutable pending
+                // occurrences remain queued even if commit succeeded but flush failed.
+                update(&status, |s| s.metrics_problem = Some(format!("{error:#}")));
+            }
+            last_fd_publish = Instant::now();
+        }
         thread::sleep(Duration::from_millis(200));
     }
     if let Some(old) = task.take() {
@@ -667,8 +805,13 @@ fn controller(
     }
     let mut batch: Vec<_> = pending.into_values().collect();
     batch.append(&mut failures);
-    with_node(&node, |node| node.append_metrics(&batch))?;
-    Ok(())
+    let fd_result = fd_diagnostics.publish_pending(|batch| with_node(&node, |node| node.append_fd_events(batch)));
+    let metrics_result = with_node(&node, |node| node.append_metrics(&batch));
+    match (fd_result, metrics_result) {
+        (Err(fd), Err(metrics)) => Err(anyhow::anyhow!("{fd:#}; ordinary metrics: {metrics:#}")),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 fn sample(
@@ -685,20 +828,60 @@ fn sample(
         })
 }
 
+// Both service modes use the same executable Faculty mappings. Discovery
+// still chooses the full admitted app target set, including ordinary roots.
+fn maintenance_driver<R: StoreSnapshot>(
+    targets: impl IntoIterator<Item = Target>,
+) -> Result<Driver<R, ((), faculties::maintenance::Mappings)>> {
+    Ok(Driver::new(targets, true, SuccinctBackend::Cpu)?
+        .with_registered(faculties::maintenance::mappings()))
+}
+
+// A key-only projection of native descriptor relationships, retained between
+// snapshots in PATCH. It controls reporting only, never maintenance selection.
+fn metrics_maintenance_targets<S: triblespace::core::repo::StoreRead>(
+    snapshot: &S,
+    metrics: CollectionHandle,
+) -> Result<PATCH<32, IdentitySchema>> {
+    use triblespace::core::collection::{attached_to, derived_from};
+    let mut roots = vec![metrics];
+    roots.extend(derived_from(snapshot, metrics)?.into_iter().map(|derived| derived.handle));
+    let mut targets = PATCH::new();
+    for root in roots {
+        targets.insert(&Entry::new(&root.raw));
+        for attached in attached_to(snapshot, root)? {
+            targets.insert(&Entry::new(&attached.handle.raw));
+        }
+    }
+    Ok(targets)
+}
+
 fn maintenance_observer<'a>(
     endpoint: ed25519_dalek::VerifyingKey,
     session: Id,
     status: &'a Arc<Mutex<Status>>,
     activity: &'a ActiveWork,
     metrics: &'a mpsc::Sender<Sample>,
-) -> impl FnMut(Event) + Send + 'a {
+    diagnostics: Option<&'a Diagnostics>,
+) -> impl FnMut(Event, &PATCH<32, IdentitySchema>) + Send + 'a {
     let started = Instant::now();
     let mut published = 0u128;
     let mut failed = 0u128;
     // Driver hops are sequential, and its RAII observer emits HopCancelled
     // when an in-flight tick is dropped. No-op ticks emit no HopStarted.
     let mut work = None;
-    move |event| {
+    move |event, metrics_targets| {
+        // Upstream has already converted its error into a String and may have
+        // released temporary FDs. Capture before this handler's own formatting,
+        // activity/status locks, or unbounded ordinary sample channel.
+        if let Some(diagnostics) = diagnostics {
+            match &event {
+                Event::HopFinished { error: Some(error), .. } | Event::Failure { error, .. } => {
+                    diagnostics.maintenance_failure(session, error);
+                }
+                _ => {}
+            }
+        }
         match &event {
             Event::HopStarted { .. } => work = Some(activity.enter()),
             Event::HopFinished { .. } | Event::HopCancelled { .. } => {
@@ -706,19 +889,26 @@ fn maintenance_observer<'a>(
             }
             _ => {}
         }
-        let (count, error) = match event {
+        let (collection, count, error) = match event {
             Event::HopFinished {
+                collection,
                 publications,
                 error,
                 ..
             } => (
+                Some(collection),
                 publications
                     .merges
                     .saturating_add(publications.derives)
                     .saturating_add(publications.maps),
                 error,
             ),
-            Event::Failure { error, .. } => (0, Some(error)),
+            Event::Failure { reference, error } => {
+                // Driver formats handle targets as exact collection references.
+                // Use the existing typed parser, never match labels/error text.
+                // Unresolved names or global failures remain reportable errors.
+                (crate::config::parse_handle(&reference).ok(), 0, Some(error))
+            },
             _ => return,
         };
         published = published.saturating_add(count);
@@ -732,6 +922,16 @@ fn maintenance_observer<'a>(
                 s.node.problem = Some(format!("Maintenance: {error}"));
             }
         });
+        // Observing upkeep of the observation sink must not append another
+        // observation to that same sink once classified by the snapshot. Status,
+        // activity, counters and bounded
+        // FD capture above still see all work and errors. Empty successful hops
+        // carry no new counter evidence and are not a heartbeat.
+        if collection.is_some_and(|collection| metrics_targets.get(&collection.raw).is_some())
+            || (count == 0 && error.is_none())
+        {
+            return;
+        }
         if let Some(mut value) = sample(endpoint, session, "maintenance", started.elapsed()) {
             value.publications = Some(published);
             value.failed = Some(failed);
@@ -751,6 +951,7 @@ fn node_session(
     status: &Arc<Mutex<Status>>,
     activity: &ActiveWork,
     metrics: &mpsc::Sender<Sample>,
+    diagnostics: Option<&Diagnostics>,
     attempt: Attempt,
     entered: &mut bool,
 ) -> Result<()> {
@@ -771,13 +972,15 @@ fn node_session(
         .enable_all()
         .build()?;
     let store = faculties::storage::open_pile_strict_as(&binding.pile, signer.verifying_key())?;
-    let mut observer = maintenance_observer(signer.verifying_key(), session, status, activity, metrics);
+    let metrics_root = with_node(&node, |node| Ok(node.metrics.handle()))?;
+    let mut metrics_targets = PATCH::new();
+    metrics_targets.insert(&Entry::new(&metrics_root.raw));
+    let mut observer = maintenance_observer(signer.verifying_key(), session, status, activity, metrics, diagnostics);
     let result = if settings.sync_enabled {
         let mut peer = Peer::new(
             store,
             signer.clone(),
             PeerConfig {
-                walk_algorithm: triblespace_net::walk_stream::Algorithm::default(),
                 // This app owns the daemon, rather than dialing another one.
                 daemon: None,
                 provider_publication_budget: None,
@@ -786,7 +989,7 @@ fn node_session(
         )
         .context("cannot start native node endpoint")?;
         *entered = true;
-        let mut driver = None;
+        let mut driver = maintenance_driver([])?;
         let mut selection = AllAccessible::default();
         let mut previous_snapshot = None;
         let mut previous_sent = 0u64;
@@ -827,6 +1030,7 @@ fn node_session(
                         peer.try_refresh()?;
                         let snapshot = peer.snapshot()?;
                         if previous_snapshot.as_ref().is_none_or(|previous| snapshot.changes_since(previous) != StoreChanges::NONE) {
+                            metrics_targets = metrics_maintenance_targets(&snapshot, metrics_root)?;
                             let roots = with_node(&node, NodeStore::workspace_roots)?;
                             let mut next = AllAccessible::discover(&snapshot, signer.verifying_key(), roots)?;
                             // Maintenance remains independently all-accessible.
@@ -837,8 +1041,8 @@ fn node_session(
                                 peer.set_replication(ReplicationMode::Full, next.sync.iter().copied());
                                 peer.activate_collections(next.sync.iter().copied());
                             }
-                            if settings.maintenance_enabled && (driver.is_none() || selection.maintenance != next.maintenance) {
-                                driver = Some(Driver::new(next.maintenance.iter().copied().map(Target::Handle), true, SuccinctBackend::Cpu)?);
+                            if settings.maintenance_enabled {
+                                driver.retarget(next.maintenance.iter().copied().map(Target::Handle));
                             }
                             update(status, |s| {
                                 s.sync_collections = next.sync.len(); s.maintenance_targets = next.maintenance.len();
@@ -851,7 +1055,7 @@ fn node_session(
                         received += progress.received_bytes as u128;
                         let health = peer.health();
                         let sent = health.blob_serving.sent_bytes;
-                        let waiting = health.available.iter().map(|root| format!("blake3:{}", hex::encode(root.raw))).collect::<Vec<_>>();
+                        let waiting = health.named_unselected.iter().map(|root| format!("blake3:{}", hex::encode(root.raw))).collect::<Vec<_>>();
                         update(status, |s| if s.node.grants_waiting != waiting { s.node.grants_waiting = waiting; });
                         let delta = progress.received_bytes.saturating_add(sent.saturating_sub(previous_sent));
                         previous_sent = sent;
@@ -861,7 +1065,7 @@ fn node_session(
                                 value.received_bytes = Some(received); value.sent_bytes = Some(sent as u128); let _ = metrics.send(value);
                             }
                         }
-                        if let Some(driver) = &mut driver { driver.tick(&mut peer, signer, &mut observer).await?; }
+                        if settings.maintenance_enabled { driver.tick(&mut peer, signer, &mut |event| observer(event, &metrics_targets)).await?; }
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         Ok::<(), anyhow::Error>(())
                     } => result?,
@@ -881,8 +1085,7 @@ fn node_session(
         ], status, &node, attempt, stop.borrow().as_ref())
     } else {
         let mut store = store;
-        let mut driver = None;
-        let mut selection = AllAccessible::default();
+        let mut driver = maintenance_driver([])?;
         let mut previous_snapshot = None;
         *entered = true;
         update(status, |s| {
@@ -908,16 +1111,14 @@ fn node_session(
                         store.refresh()?;
                         let snapshot = store.snapshot()?;
                         if previous_snapshot.as_ref().is_none_or(|previous| snapshot.changes_since(previous) != StoreChanges::NONE) {
+                            metrics_targets = metrics_maintenance_targets(&snapshot, metrics_root)?;
                             let next = AllAccessible::discover(&snapshot, signer.verifying_key(),
                                 with_node(&node, NodeStore::workspace_roots)?)?;
-                            if driver.is_none() || selection.maintenance != next.maintenance {
-                                driver = Some(Driver::new(next.maintenance.iter().copied().map(Target::Handle), true, SuccinctBackend::Cpu)?);
-                            }
+                            driver.retarget(next.maintenance.iter().copied().map(Target::Handle));
                             update(status, |s| { s.maintenance_targets = next.maintenance.len(); s.warnings = next.pending.clone(); });
-                            selection = next;
                         }
                         previous_snapshot = Some(snapshot);
-                        if let Some(driver) = &mut driver { driver.tick(&mut store, signer, &mut observer).await?; }
+                        driver.tick(&mut store, signer, &mut |event| observer(event, &metrics_targets)).await?;
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         Ok::<(), anyhow::Error>(())
                     } => result?,
@@ -1356,32 +1557,167 @@ mod tests {
     }
 
     #[test]
+    fn repeated_viewer_close_reaps_handles_without_closing_the_shared_owner() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let bootstrap = crate::config::Bootstrap::new(directory.path());
+        let signer = init::prepare(&bootstrap).unwrap();
+        let binding = NodeBinding {
+            pile: bootstrap.pile.clone(), key: bootstrap.key.clone(),
+            signer: signer.verifying_key().to_bytes(),
+        };
+        let node = Arc::new(Mutex::new(Some(NodeStore::open(&bootstrap.pile, signer).unwrap())));
+        let status = Arc::new(Mutex::new(Status::default()));
+        let (stop, _) = watch::channel(false);
+        let (services, _retries) = ServiceControl::new(status.clone(), stop.clone());
+        // No endpoint/controller, credentials or device: one synthetic owner.
+        let mut runtime = Runtime {
+            binding, status, activity: ActiveWork::default(), node: node.clone(), stop, services,
+            secret_entry: crate::secret_entry::SecretEntry::default(),
+            protected_access: crate::protected_access::ProtectedAccessBridge::default(),
+            local_import: crate::local_import::LocalImport::default(),
+            workers: Vec::new(), viewer_workers: Vec::new(), viewer_interests: Default::default(),
+            lock: None, startup_notice: None,
+        };
+        for _ in 0..32 {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let worker_cancelled = cancelled.clone();
+            let owner = node.clone();
+            let (started, ready) = mpsc::channel();
+            let (release, wait) = mpsc::channel();
+            let worker = runtime.spawn_faculties(cancelled.clone(), move |viewer| {
+                assert!(Arc::ptr_eq(&owner, &viewer.node));
+                started.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(worker_cancelled.load(Ordering::Acquire));
+                assert!(viewer.node.lock().unwrap().is_some());
+            }).unwrap();
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            runtime.reap_faculties().unwrap();
+            assert_eq!(runtime.viewer_workers.len(), 1, "running handle stays owned");
+            assert!(!runtime.is_finished());
+            worker.stop();
+            release.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !runtime.viewer_workers[0].is_finished() {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            runtime.reap_faculties().unwrap();
+            assert!(runtime.viewer_workers.is_empty(), "no handle accumulation across close/reopen");
+            assert!(worker.is_finished());
+            assert!(runtime.is_finished());
+            assert!(node.lock().unwrap().as_mut().unwrap().config().is_ok());
+        }
+        for shutting_down in [false, true] {
+            let worker = runtime.spawn_faculties(Arc::new(AtomicBool::new(false)), |_| {
+                panic!("synthetic viewer failure");
+            }).unwrap();
+            if shutting_down { runtime.begin_shutdown(); }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !runtime.viewer_workers[0].is_finished() {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            let error = runtime.reap_faculties().unwrap_err();
+            assert!(error.to_string().contains("Faculties viewer worker panicked"));
+            assert!(runtime.viewer_workers.is_empty());
+            assert!(worker.is_finished());
+            assert!(node.lock().unwrap().is_some(), "panic reaping does not close the owner");
+        }
+        runtime.finish().unwrap();
+        assert!(node.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn viewer_worker_is_joined_before_the_shared_node_closes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let layout = Layout::new(directory.path().join("data"));
+        std::fs::create_dir(&layout.dir).unwrap();
+        let signer = init::prepare(&layout.bootstrap()).unwrap();
+        let mut node = NodeStore::open(&layout.default_pile(), signer).unwrap();
+        let view = node.config().unwrap();
+        node.put_settings(&view, &NodeSettings {
+            mcp_port: 0, sync_enabled: false, maintenance_enabled: false,
+        }).unwrap();
+        node.close().unwrap();
+        let mut runtime = Runtime::start_with_guard(&layout, Arc::new(|| Ok(()))).unwrap();
+        let owner = runtime.node.clone();
+        let settled = Arc::new(AtomicBool::new(false));
+        let marker = settled.clone();
+        let (started, ready) = mpsc::channel();
+        let worker = runtime.spawn_faculties(Arc::new(AtomicBool::new(false)), move |viewer| {
+            assert!(Arc::ptr_eq(&owner, &viewer.node));
+            started.send(()).unwrap();
+            while !viewer.is_stopping() { std::thread::park_timeout(Duration::from_millis(5)); }
+            assert!(viewer.node.lock().unwrap().is_some(), "the worker settles before node close");
+            marker.store(true, Ordering::Release);
+        }).unwrap();
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        runtime.finish().unwrap();
+        assert!(settled.load(Ordering::Acquire));
+        assert!(worker.is_finished());
+        assert!(runtime.node.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn fd_observer_captures_stringified_failure_before_ordinary_metrics() {
+        use triblespace::core::collection::CollectionHandle;
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let status = Arc::new(Mutex::new(Status::default()));
+        let work = ActiveWork::default();
+        let (metrics, reports) = mpsc::channel();
+        let diagnostics = Diagnostics::new();
+        let session = genid().id;
+        let mut observer = maintenance_observer(signer.verifying_key(), session,
+            &status, &work, &metrics, Some(&diagnostics));
+        let collection = CollectionHandle::new([5; 32]);
+        observer(Event::HopFinished { collection, elapsed: Duration::ZERO, census: None,
+            publications: Default::default(),
+            error: Some("failed to create a buffer: wrapped tempfile: Too many open files (os error 24)".into()) }, &PATCH::new());
+        observer(Event::Failure { reference: "fixture".into(), error: "permission denied".into() }, &PATCH::new());
+        observer(Event::Failure { reference: "fixture".into(), error: "Too many open files in system (os error 23)".into() }, &PATCH::new());
+        assert_eq!(reports.try_iter().count(), 3, "ordinary metrics are unchanged");
+        diagnostics.publish_pending(|batch| {
+            let events: Vec<_> = batch.events.iter().flatten().collect();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].session, session);
+            assert_eq!(events[0].code, crate::fd_diagnostics::Exhaustion::Process);
+            assert_eq!(events[1].code, crate::fd_diagnostics::Exhaustion::System);
+            assert!(events.iter().all(|event| event.error_site == crate::fd_diagnostics::ErrorSite::Maintenance));
+            assert!(events.iter().all(|event| event.handler.monotonic_ns.is_some()));
+            Ok::<_, ()>(())
+        }).unwrap();
+    }
+
+    #[test]
     fn maintenance_boundaries_release_only_their_own_work() {
         use triblespace::core::collection::CollectionHandle;
         let signer = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
         let status = Arc::new(Mutex::new(Status::default()));
         let work = ActiveWork::default();
         let (metrics, _reports) = mpsc::channel();
-        let mut observer = maintenance_observer(signer.verifying_key(), genid().id, &status, &work, &metrics);
+        let mut observer = maintenance_observer(signer.verifying_key(), genid().id, &status, &work, &metrics, None);
         let collection = CollectionHandle::new([5; 32]);
-        observer(Event::Failure { reference: "fixture".into(), error: "before hop".into() });
+        observer(Event::Failure { reference: "fixture".into(), error: "before hop".into() }, &PATCH::new());
         assert_eq!(work.count(), 0, "no actual maintenance was entered");
         let reconciliation = work.enter();
         for error in [None, Some("synthetic maintenance failure".into())] {
-            observer(Event::HopStarted { collection });
+            observer(Event::HopStarted { collection }, &PATCH::new());
             assert_eq!(work.count(), 2);
             observer(Event::HopFinished {
                 collection, elapsed: Duration::ZERO, census: None,
                 publications: Default::default(), error,
-            });
+            }, &PATCH::new());
             assert_eq!(work.count(), 1);
-            observer(Event::HopCancelled { collection, elapsed: Duration::ZERO });
+            observer(Event::HopCancelled { collection, elapsed: Duration::ZERO }, &PATCH::new());
             assert_eq!(work.count(), 1, "a duplicate ending never double-releases");
         }
-        observer(Event::HopStarted { collection });
-        observer(Event::HopCancelled { collection, elapsed: Duration::ZERO });
+        observer(Event::HopStarted { collection }, &PATCH::new());
+        observer(Event::HopCancelled { collection, elapsed: Duration::ZERO }, &PATCH::new());
         assert_eq!(work.count(), 1);
-        observer(Event::HopStarted { collection });
+        observer(Event::HopStarted { collection }, &PATCH::new());
         drop(observer);
         assert_eq!(work.count(), 1, "observer teardown releases unfinished work");
         drop(reconciliation);
@@ -1399,11 +1735,11 @@ mod tests {
         let work = ActiveWork::default();
         let status = Arc::new(Mutex::new(Status::default()));
         let (metrics, _reports) = mpsc::channel();
-        let mut observer = maintenance_observer(signer.verifying_key(), genid().id, &status, &work, &metrics);
+        let mut observer = maintenance_observer(signer.verifying_key(), genid().id, &status, &work, &metrics, None);
         let mut starts = 0;
         let mut observed = |event: Event| {
             let started = matches!(event, Event::HopStarted { .. });
-            observer(event);
+            observer(event, &PATCH::new());
             if started {
                 starts += 1;
                 assert_eq!(work.count(), 1);
@@ -1421,6 +1757,145 @@ mod tests {
         });
         assert!(starts > 0);
         assert_eq!(work.count(), 0);
+        drop(observer);
+        node.close().unwrap();
+    }
+
+    #[test]
+    fn maintenance_metrics_failures_stay_visible_without_observing_themselves() {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let status = Arc::new(Mutex::new(Status::default()));
+        let work = ActiveWork::default();
+        let (metrics, reports) = mpsc::channel();
+        let diagnostics = Diagnostics::new();
+        let own = CollectionHandle::new([5; 32]);
+        let other = CollectionHandle::new([6; 32]);
+        let mut family = PATCH::new();
+        family.insert(&Entry::new(&own.raw));
+        let mut observer = maintenance_observer(signer.verifying_key(), genid().id,
+            &status, &work, &metrics, Some(&diagnostics));
+        observer(Event::HopStarted { collection: own }, &family);
+        assert_eq!(work.count(), 1);
+        observer(Event::HopFinished {
+            collection: own, elapsed: Duration::ZERO, census: None,
+            publications: trible::maintenance::Publications { merges: 2, ..Default::default() },
+            error: Some("Too many open files (os error 24)".into()),
+        }, &family);
+        assert_eq!(work.count(), 0);
+        assert!(reports.try_iter().next().is_none());
+        assert_eq!(status.lock().unwrap().maintenance_publications, 2);
+        assert!(status.lock().unwrap().node.problem.as_ref().unwrap().contains("Too many open files"));
+        diagnostics.publish_pending(|batch| {
+            assert_eq!(batch.events.iter().flatten().count(), 1, "FD evidence precedes the sample gate");
+            Ok::<_, ()>(())
+        }).unwrap();
+        observer(Event::Failure {
+            reference: format!("blake3:{}", hex::encode(own.raw)),
+            error: "metrics planning failed".into(),
+        }, &family);
+        assert!(reports.try_iter().next().is_none());
+        assert!(status.lock().unwrap().node.problem.as_ref().unwrap().contains("metrics planning failed"));
+        observer(Event::HopFinished {
+            collection: other, elapsed: Duration::ZERO, census: None,
+            publications: Default::default(), error: None,
+        }, &family);
+        assert!(reports.try_iter().next().is_none(), "empty success is not a heartbeat");
+        observer(Event::HopFinished {
+            collection: other, elapsed: Duration::ZERO, census: None,
+            publications: Default::default(), error: Some("ordinary failure".into()),
+        }, &family);
+        let report = reports.try_recv().unwrap();
+        assert_eq!(report.error.as_deref(), Some("ordinary failure"));
+        assert_eq!(report.publications, Some(2), "all real upkeep is counted");
+        assert_eq!(report.failed, Some(3), "sink failures are counted even without their own sample");
+        for reference in ["global", "blake3", "blake3:malformed"] {
+            observer(Event::Failure { reference: reference.into(), error: "unresolved failure".into() }, &family);
+            assert_eq!(reports.try_recv().unwrap().error.as_deref(), Some("unresolved failure"));
+        }
+    }
+
+    #[test]
+    fn maintenance_metrics_feedback_settles_with_real_merges_and_attached_maps() {
+        use triblespace::core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+        use triblespace::core::collection::CollectionStoreExt;
+        use triblespace::core::metadata;
+        use triblespace::prelude::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bootstrap = crate::config::Bootstrap::new(dir.path());
+        let signer = init::prepare(&bootstrap).unwrap();
+        let mut node = NodeStore::open(&bootstrap.pile, signer.clone()).unwrap();
+        let ordinary = node.pile.collection("ordinary fixture",
+            faculties::collection_names::private_policy(signer.verifying_key())).unwrap();
+        for index in 0..16 {
+            node.pile.commit(ordinary, &signer,
+                entity! { metadata::name: format!("fixture {index}") }).unwrap();
+            let value = Sample::now(None, "fixture", "seed", genid().id, Duration::ZERO).unwrap();
+            node.append_metrics(&[value]).unwrap();
+        }
+        let attached = node.pile.attach::<SuccinctArchiveBlob>(node.metrics, ()).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        // A native MAP makes the attachment discoverable; subsequent metrics
+        // writes and root MERGEs demand real attached work during the loop.
+        runtime.block_on(node.pile.maintain_attached(attached, &signer)).unwrap();
+        for _ in 0..8 {
+            node.append_metrics(&[Sample::now(None, "fixture", "seed", genid().id, Duration::ZERO).unwrap()]).unwrap();
+        }
+        let status = Arc::new(Mutex::new(Status::default()));
+        let work = ActiveWork::default();
+        let (metrics, reports) = mpsc::channel();
+        let mut observer = maintenance_observer(signer.verifying_key(), genid().id,
+            &status, &work, &metrics, None);
+        let mut driver = maintenance_driver([]).unwrap();
+        let mut ordinary_samples = 0;
+        let mut metrics_maps = 0;
+        let mut metrics_merges = 0;
+        let metrics_root = node.metrics.handle();
+        let mut settled = false;
+        runtime.block_on(async {
+            // Each iteration drains the real observer into the real writer, as
+            // one controller batch. No clocks, sleeps, endpoints or live data.
+            for _ in 0..32 {
+                let snapshot = node.pile.snapshot().unwrap();
+                let selection = AllAccessible::discover(&snapshot, signer.verifying_key(), []).unwrap();
+                let family = metrics_maintenance_targets(&snapshot, node.metrics.handle()).unwrap();
+                assert!(selection.maintenance.contains(&node.metrics.handle()));
+                assert!(selection.maintenance.contains(&attached.handle()));
+                assert!(family.get(&attached.handle().raw).is_some());
+                assert!(family.get(&ordinary.handle().raw).is_none());
+                driver.retarget(selection.maintenance.iter().copied().map(Target::Handle));
+                let pass = driver.tick(&mut node.pile, &signer, &mut |event| {
+                    if let Event::HopFinished { collection, publications, .. } = &event {
+                        if *collection == attached.handle() { metrics_maps += publications.maps; }
+                        if *collection == metrics_root { metrics_merges += publications.merges; }
+                    }
+                    observer(event, &family);
+                }).await.unwrap();
+                let batch: Vec<_> = reports.try_iter().collect();
+                assert!(batch.iter().all(|sample| sample.error.is_none()));
+                ordinary_samples += batch.len();
+                let quiet = pass.is_none() && batch.is_empty();
+                node.append_metrics(&batch).unwrap();
+                assert_eq!(work.count(), 0);
+                if quiet { settled = true; break; }
+            }
+            assert!(settled, "maintenance must settle after its own samples are persisted");
+            let size = std::fs::metadata(&bootstrap.pile).unwrap().len();
+            let family = metrics_maintenance_targets(&node.pile.snapshot().unwrap(), node.metrics.handle()).unwrap();
+            for _ in 0..3 {
+                assert!(driver.tick(&mut node.pile, &signer,
+                    &mut |event| observer(event, &family)).await.unwrap().is_none());
+                let batch: Vec<_> = reports.try_iter().collect();
+                assert!(batch.is_empty());
+                node.append_metrics(&batch).unwrap();
+            }
+            assert_eq!(std::fs::metadata(&bootstrap.pile).unwrap().len(), size);
+        });
+        assert!(ordinary_samples > 0, "ordinary maintenance still produces persisted observations");
+        assert!(metrics_maps > 0, "fixture exercised real metrics MAP publication");
+        assert!(metrics_merges > 0, "fixture exercised real metrics MERGE publication");
+        assert!(!node.metrics(crate::node_metrics::now_tai_ns().unwrap(), Duration::from_secs(60)).unwrap().is_empty());
+        drop(driver);
         drop(observer);
         node.close().unwrap();
     }
@@ -1533,6 +2008,7 @@ mod tests {
                 &status,
                 &activity,
                 &metrics,
+                None,
                 Attempt::new(signer.verifying_key()),
                 &mut false,
             )
@@ -1552,3 +2028,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod attached_mapping_tests;

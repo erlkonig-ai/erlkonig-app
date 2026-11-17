@@ -9,6 +9,14 @@
 mod mac;
 
 #[cfg(target_os = "macos")]
+mod alert;
+
+#[cfg(target_os = "macos")]
+mod protected_access;
+#[cfg(target_os = "macos")]
+mod local_import;
+
+#[cfg(target_os = "macos")]
 mod crown_display;
 
 #[cfg(target_os = "macos")]

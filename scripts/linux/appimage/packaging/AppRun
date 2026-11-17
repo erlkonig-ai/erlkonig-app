@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+# AppImage portable mode rewrites HOME/config before AppRun. Refuse that mode
+# rather than selecting a different node identity or autostart directory.
+if [ -n "${APPIMAGE:-}" ] && { [ "${HOME:-}" = "$APPIMAGE.home" ] || [ "${XDG_CONFIG_HOME:-}" = "$APPIMAGE.config" ]; }; then
+    echo 'Erlkonig needs your normal home and config directories. Move the adjacent .home/.config portable-mode directory before launching.' >&2
+    exit 2
+fi
+# Do not change PATH, LD_LIBRARY_PATH, GTK/GIO or XDG settings: host CLI children
+# must retain the user's native environment and the same node/store paths.
+appdir=${APPDIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
+exec "$appdir/usr/bin/erlkonig" "$@"

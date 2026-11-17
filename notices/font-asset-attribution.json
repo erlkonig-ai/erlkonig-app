@@ -1,0 +1,353 @@
+[
+  {
+    "repository": "GORBIE",
+    "commit": "07930452a75b15174d4f499d9968e79005b0fb0b",
+    "path": "assets/fonts/IosevkaGorbie/IosevkaGorbie-Regular.ttf",
+    "sha256": "0ff51720340182f6083736c9d6dabdfad7228256959aaaea377d9504f0c82cca",
+    "font_name_records": [
+      {
+        "name_id": 0,
+        "platform_id": 1,
+        "encoding_id": 0,
+        "language_id": 0,
+        "text": "Copyright 2015-2025, Renzhi Li (aka. Belleve Invis, belleve@typeof.net)."
+      },
+      {
+        "name_id": 5,
+        "platform_id": 1,
+        "encoding_id": 0,
+        "language_id": 0,
+        "text": "Version 33.3.6; ttfautohint (v1.8.4)"
+      },
+      {
+        "name_id": 13,
+        "platform_id": 1,
+        "encoding_id": 0,
+        "language_id": 0,
+        "text": "This font software is licensed under the SIL Open Font License, Version 1.1. This license is available with a FAQ at: http://scripts.sil.org/OFL. This font software is distributed on an 'AS IS' basis, without warranties or conditions of any kind, either express or implied. See the SIL Open Font license for the specific language, permissions and limitations governing your use of this font software."
+      },
+      {
+        "name_id": 14,
+        "platform_id": 1,
+        "encoding_id": 0,
+        "language_id": 0,
+        "text": "https://openfontlicense.org/"
+      },
+      {
+        "name_id": 0,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "Copyright 2015-2025, Renzhi Li (aka. Belleve Invis, belleve@typeof.net)."
+      },
+      {
+        "name_id": 5,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "Version 33.3.6; ttfautohint (v1.8.4)"
+      },
+      {
+        "name_id": 13,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "This font software is licensed under the SIL Open Font License, Version 1.1. This license is available with a FAQ at: http://scripts.sil.org/OFL. This font software is distributed on an 'AS IS' basis, without warranties or conditions of any kind, either express or implied. See the SIL Open Font license for the specific language, permissions and limitations governing your use of this font software."
+      },
+      {
+        "name_id": 14,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "https://openfontlicense.org/"
+      }
+    ]
+  },
+  {
+    "repository": "GORBIE",
+    "commit": "07930452a75b15174d4f499d9968e79005b0fb0b",
+    "path": "assets/fonts/IosevkaGorbie/IosevkaGorbie-Bold.ttf",
+    "sha256": "03a4cd6022334b372b65ad454a1f018730c51a15225cc8751cbf14a4acd98363",
+    "font_name_records": [
+      {
+        "name_id": 0,
+        "platform_id": 1,
+        "encoding_id": 0,
+        "language_id": 0,
+        "text": "Copyright 2015-2025, Renzhi Li (aka. Belleve Invis, belleve@typeof.net)."
+      },
+      {
+        "name_id": 5,
+        "platform_id": 1,
+        "encoding_id": 0,
+        "language_id": 0,
+        "text": "Version 33.3.6; ttfautohint (v1.8.4)"
+      },
+      {
+        "name_id": 13,
+        "platform_id": 1,
+        "encoding_id": 0,
+        "language_id": 0,
+        "text": "This font software is licensed under the SIL Open Font License, Version 1.1. This license is available with a FAQ at: http://scripts.sil.org/OFL. This font software is distributed on an 'AS IS' basis, without warranties or conditions of any kind, either express or implied. See the SIL Open Font license for the specific language, permissions and limitations governing your use of this font software."
+      },
+      {
+        "name_id": 14,
+        "platform_id": 1,
+        "encoding_id": 0,
+        "language_id": 0,
+        "text": "https://openfontlicense.org/"
+      },
+      {
+        "name_id": 0,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "Copyright 2015-2025, Renzhi Li (aka. Belleve Invis, belleve@typeof.net)."
+      },
+      {
+        "name_id": 5,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "Version 33.3.6; ttfautohint (v1.8.4)"
+      },
+      {
+        "name_id": 13,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "This font software is licensed under the SIL Open Font License, Version 1.1. This license is available with a FAQ at: http://scripts.sil.org/OFL. This font software is distributed on an 'AS IS' basis, without warranties or conditions of any kind, either express or implied. See the SIL Open Font license for the specific language, permissions and limitations governing your use of this font software."
+      },
+      {
+        "name_id": 14,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "https://openfontlicense.org/"
+      }
+    ]
+  },
+  {
+    "repository": "GORBIE",
+    "commit": "07930452a75b15174d4f499d9968e79005b0fb0b",
+    "path": "assets/fonts/Jersey_15/Jersey15-Regular.ttf",
+    "sha256": "ea9bc13a7c7412d3a9bb3e22cddf8b81c33b68599cb644f9fe79978655fa4afe",
+    "font_name_records": [
+      {
+        "name_id": 0,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "Copyright 2023 The Soft Type Project Authors (https://github.com/scfried/soft-type-jersey)"
+      },
+      {
+        "name_id": 5,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "Version 1.001; ttfautohint (v1.8.4.7-5d5b)"
+      },
+      {
+        "name_id": 13,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is available with a FAQ at: https://openfontlicense.org"
+      },
+      {
+        "name_id": 14,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "https://openfontlicense.org"
+      }
+    ]
+  },
+  {
+    "repository": "GORBIE",
+    "commit": "07930452a75b15174d4f499d9968e79005b0fb0b",
+    "path": "assets/fonts/NewComputerModern/NewCMMath-Regular.otf",
+    "sha256": "60394d357348f68cd301764fe61cc502a5858e1c4ff21b948a1d14d82586a7a2",
+    "font_name_records": [
+      {
+        "name_id": 0,
+        "platform_id": 1,
+        "encoding_id": 0,
+        "language_id": 0,
+        "text": "(C) 2019-2021 Antonis Tsolomitis. \nThis work is released under the GUST Font License -- see http://tug.org/fonts/licenses/GUST-FONT-LICENSE.txt for details."
+      },
+      {
+        "name_id": 5,
+        "platform_id": 1,
+        "encoding_id": 0,
+        "language_id": 0,
+        "text": "4.0"
+      },
+      {
+        "name_id": 0,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "(C) 2019-2021 Antonis Tsolomitis. \nThis work is released under the GUST Font License -- see http://tug.org/fonts/licenses/GUST-FONT-LICENSE.txt for details."
+      },
+      {
+        "name_id": 5,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "4.0"
+      }
+    ]
+  },
+  {
+    "package": "epaint_default_fonts",
+    "version": "0.34.3",
+    "path": "fonts/Hack-Regular.ttf",
+    "sha256": "15f55cc0c85a2988d2b4b3a8cdb5d77fdfbaf319e1bb5309d725db9818fb7125",
+    "font_name_records": [
+      {
+        "name_id": 0,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "Copyright (c) 2018 Source Foundry Authors / Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved."
+      },
+      {
+        "name_id": 5,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "Version 3.003;[3114f1256]-release; ttfautohint (v1.7) -l 6 -r 50 -G 200 -x 10 -H 181 -D latn -f latn -m \"Hack-Regular-TA.txt\" -w G -W -t -X \"\""
+      },
+      {
+        "name_id": 13,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "The work in the Hack project is Copyright 2018 Source Foundry Authors and licensed under the MIT License\n\nThe work in the DejaVu project was committed to the public domain.\n\nBitstream Vera Sans Mono Copyright 2003 Bitstream Inc. and licensed under the Bitstream Vera License with Reserved Font Names \"Bitstream\" and \"Vera\"\n\nMIT License\n\nCopyright (c) 2018 Source Foundry Authors\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n\nBITSTREAM VERA LICENSE\n\nCopyright (c) 2003 by Bitstream, Inc. All Rights Reserved. Bitstream Vera is a trademark of Bitstream, Inc.\n\nPermission is hereby granted, free of charge, to any person obtaining a copy of the fonts accompanying this license (\"Fonts\") and associated documentation files (the \"Font Software\"), to reproduce and distribute the Font Software, including without limitation the rights to use, copy, merge, publish, distribute, and/or sell copies of the Font Software, and to permit persons to whom the Font Software is furnished to do so, subject to the following conditions:\n\nThe above copyright and trademark notices and this permission notice shall be included in all copies of one or more of the Font Software typefaces.\n\nThe Font Software may be modified, altered, or added to, and in particular the designs of glyphs or characters in the Fonts may be modified and additional glyphs or characters may be added to the Fonts, only if the fonts are renamed to names not containing either the words \"Bitstream\" or the word \"Vera\".\n\nThis License becomes null and void to the extent applicable to Fonts or Font Software that has been modified and is distributed under the \"Bitstream Vera\" names.\n\nThe Font Software may be sold as part of a larger software package but no copy of one or more of the Font Software typefaces may be sold by itself.\n\nTHE FONT SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL BITSTREAM OR THE GNOME FOUNDATION BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM OTHER DEALINGS IN THE FONT SOFTWARE.\n\nExcept as contained in this notice, the names of Gnome, the Gnome Foundation, and Bitstream Inc., shall not be used in advertising or otherwise to promote the sale, use or other dealings in this Font Software without prior written authorization from the Gnome Foundation or Bitstream Inc., respectively. For further information, contact: fonts at gnome dot org."
+      },
+      {
+        "name_id": 14,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "https://github.com/source-foundry/Hack/blob/master/LICENSE.md"
+      }
+    ]
+  },
+  {
+    "package": "epaint_default_fonts",
+    "version": "0.34.3",
+    "path": "fonts/NotoEmoji-Regular.ttf",
+    "sha256": "415dc6290378574135b64c808dc640c1df7531973290c4970c51fdeb849cb0c5",
+    "font_name_records": [
+      {
+        "name_id": 0,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "Copyright 2013 Google Inc. All Rights Reserved."
+      },
+      {
+        "name_id": 5,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "Version 1.05 uh"
+      },
+      {
+        "name_id": 13,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "This Font Software is licensed under the SIL Open Font License, Version 1.1. This Font Software is distributed on an \"AS IS\" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the SIL Open Font License for the specific language, permissions and limitations governing your use of this Font Software."
+      },
+      {
+        "name_id": 14,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "http://scripts.sil.org/OFL"
+      }
+    ]
+  },
+  {
+    "package": "epaint_default_fonts",
+    "version": "0.34.3",
+    "path": "fonts/Ubuntu-Light.ttf",
+    "sha256": "80307b8da7649aa4ee4d484b232140e3ce1ec0ca093073d3c53c8f5a5ced7a70",
+    "font_name_records": [
+      {
+        "name_id": 0,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "Copyright 2011 Canonical Ltd.  Licensed under the Ubuntu Font Licence 1.0"
+      },
+      {
+        "name_id": 5,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "0.83"
+      }
+    ]
+  },
+  {
+    "package": "epaint_default_fonts",
+    "version": "0.34.3",
+    "path": "fonts/emoji-icon-font.ttf",
+    "sha256": "f426bec371f484646d002717e2c555a95cd5145e635d83a48bbef83f3abf18ca",
+    "font_name_records": [
+      {
+        "name_id": 5,
+        "platform_id": 1,
+        "encoding_id": 0,
+        "language_id": 0,
+        "text": "Version 1.1"
+      },
+      {
+        "name_id": 5,
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "text": "Version 1.1"
+      }
+    ]
+  },
+  {
+    "repository": "GORBIE",
+    "commit": "07930452a75b15174d4f499d9968e79005b0fb0b",
+    "path": "assets/icon_light.png",
+    "sha256": "ceee5b6d70e7d999846fd609e2445979105e5f7aa924a23beffb804f3f1d7094",
+    "scope": "Referenced by library include_bytes/include_str; final linked inclusion not measured"
+  },
+  {
+    "repository": "GORBIE",
+    "commit": "07930452a75b15174d4f499d9968e79005b0fb0b",
+    "path": "assets/icon_dark.png",
+    "sha256": "d74ea7734cc5d27a1424a594d2c082575aabae89ffda62c3f418a6a0b54464bd",
+    "scope": "Referenced by library include_bytes/include_str; final linked inclusion not measured"
+  },
+  {
+    "repository": "GORBIE",
+    "commit": "07930452a75b15174d4f499d9968e79005b0fb0b",
+    "path": "assets/syntax/ral_light.tmTheme",
+    "sha256": "ac66bafe4ba8ee5777a8136e4ff3322182056cca7e8c6d0297742612e7870ba9",
+    "scope": "Referenced by library include_bytes/include_str; final linked inclusion not measured"
+  },
+  {
+    "repository": "GORBIE",
+    "commit": "07930452a75b15174d4f499d9968e79005b0fb0b",
+    "path": "assets/syntax/ral_dark.tmTheme",
+    "sha256": "959d2aa94fcbd759d7c9bbe33203e9393af05cd3c835c9fd067bb5c38d6ad759",
+    "scope": "Referenced by library include_bytes/include_str; final linked inclusion not measured"
+  },
+  {
+    "repository": "soma",
+    "commit": "117812be71a41fc3bf972387e498f2762a391fc7",
+    "path": "assets/kinematics_data.json",
+    "sha256": "b07324cfe46515d7b3bd5be416f5f2ed87811ac1fcdb0e6ad841119e4ed9ab3b",
+    "scope": "Referenced by library include_bytes/include_str; final linked inclusion not measured"
+  }
+]

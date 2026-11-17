@@ -13,6 +13,129 @@ fn scratch() -> (tempfile::TempDir, PathBuf, SigningKey, NodeStore) {
 }
 
 #[test]
+fn fd_diagnostics_retry_preserves_identity_and_typed_sparse_evidence() {
+    use crate::fd_diagnostics::{Batch, CAPACITY, Census, Exhaustion, Occurrence, Snapshot};
+    let (_dir, path, signer, mut node) = scratch();
+    let before_config = node.poll_config().unwrap().unwrap();
+    let mut types = [0; 12];
+    types[1] = 7;
+    types[11] = 1;
+    let event = Occurrence {
+        session: genid().id, sequence: 7, code: Exhaustion::Process,
+        error_site: crate::fd_diagnostics::ErrorSite::Maintenance,
+        handler: Snapshot { wall_unix_ns: Some(1_790_000_000_123_456_789),
+            monotonic_ns: Some(500), limits: Some((256, u64::MAX)),
+            census: Some(Census { count: 8, types, complete: false }),
+            mcp_http_accepted_streams: Some(12) },
+        sampled_high_water: None, samples: 0, dropped: 3,
+    };
+    let mut pending = Batch { session: genid().id, events: [None; CAPACITY], dropped: 3 };
+    pending.events[0] = Some(event);
+    // Emulate a commit reaching the pile before a caller-visible flush error:
+    // retrying exactly this batch must only reassert its occurrence identity.
+    node.append_fd_events(&pending).unwrap();
+    node.append_fd_events(&pending).unwrap();
+    assert!(!node.config_changed(&before_config).unwrap());
+    assert!(node.metrics(now_tai_ns().unwrap(), Duration::from_secs(60)).unwrap().is_empty());
+    node.close().unwrap();
+    let mut node = NodeStore::open(&path, signer).unwrap();
+    let snapshot = node.pile.snapshot().unwrap();
+    let observed = snapshot.collection_acquiring(node.metrics).unwrap();
+    let facts: TribleSet = observed.view().unwrap();
+    let rows: Vec<_> = find!((event_id: Id, observation: Id, count: u128, complete: bool,
+        soft: u128, hard: u128, unknown: u128, monotonic: u128), pattern!(&facts, [
+        { ?event_id @ metadata::tag: fd::KIND_FD_EXHAUSTION,
+            health_record::attrs::session: event.session,
+            fd::sequence: 7u128, fd::handler_snapshot: ?observation,
+            metadata::name: "fd-limit-process", fd::monotonic_ns: ?monotonic },
+        { ?observation @ fd::fd_count: ?count, fd::census_complete: ?complete,
+            fd::soft_limit: ?soft, fd::hard_limit: ?hard, fd::fd_type: _?bucket },
+        { _?bucket @ metadata::name: "unknown", fd::type_count: ?unknown },
+    ])).collect();
+    assert_eq!(rows.len(), 1);
+    let (event_id, observation, count, complete, soft, hard, unknown, monotonic) = rows[0];
+    assert_eq!((count, complete, soft, hard, unknown, monotonic), (8, false, 256, u64::MAX as u128, 1, 500));
+    assert!(!exists!(pattern!(&facts, [{ event_id @ fd::sampled_high_water: _?high_water }])));
+    assert!(!exists!(pattern!(&facts, [{ event_id @ metadata::description: _?text }])));
+    assert!(exists!(pattern!(&facts, [{ event_id @ fd::error_site: "maintenance" }])));
+    assert!(exists!(pattern!(&facts, [{ observation @ fd::mcp_http_accepted_streams: 12u128 }])));
+    assert!(exists!(pattern!(&facts, [{ metadata::tag: fd::KIND_FD_CAPTURE_LOSS,
+        fd::captures_dropped: 3u128, fd::queue_capacity: CAPACITY as u128 }])));
+    let types: Vec<_> = find!(count: u128, pattern!(&facts, [
+        { observation @ fd::fd_type: _?bucket }, { _?bucket @ fd::type_count: ?count },
+    ])).collect();
+    assert_eq!(types.len(), 12);
+    assert_eq!(types.into_iter().sum::<u128>(), 8);
+    drop(observed);
+    drop(snapshot);
+    node.close().unwrap();
+}
+
+#[test]
+fn fd_unknown_census_is_absent_not_zero_and_clocks_survive_deferred_publish() {
+    use crate::fd_diagnostics::{Batch, CAPACITY, Exhaustion, Occurrence, Snapshot};
+    let (_dir, _path, _signer, mut node) = scratch();
+    let occurrence = Occurrence {
+        session: genid().id, sequence: 1, code: Exhaustion::System,
+        error_site: crate::fd_diagnostics::ErrorSite::Maintenance,
+        handler: Snapshot::default(), sampled_high_water: None, samples: 0, dropped: 0,
+    };
+    let mut batch = Batch { session: genid().id, events: [None; CAPACITY], dropped: 0 };
+    batch.events[0] = Some(occurrence);
+    node.append_fd_events(&batch).unwrap();
+    let snapshot = node.pile.snapshot().unwrap();
+    let observed = snapshot.collection_acquiring(node.metrics).unwrap();
+    let facts: TribleSet = observed.view().unwrap();
+    let (event, handler) = find!((event: Id, handler: Id), pattern!(&facts, [
+        { ?event @ metadata::tag: fd::KIND_FD_EXHAUSTION,
+            metadata::name: "fd-limit-system", fd::handler_snapshot: ?handler },
+    ])).next().unwrap();
+    assert!(!exists!(pattern!(&facts, [{ handler @ fd::fd_count: _?count }])));
+    assert!(!exists!(pattern!(&facts, [{ handler @ fd::soft_limit: _?limit }])));
+    assert!(!exists!(pattern!(&facts, [{ handler @ fd::mcp_http_accepted_streams: _?count }])));
+    assert!(!exists!(pattern!(&facts, [{ event @ metadata::created_at: _?time }])));
+    assert!(!exists!(pattern!(&facts, [{ event @ fd::monotonic_ns: _?time }])));
+    drop(observed);
+    drop(snapshot);
+    node.close().unwrap();
+}
+
+#[test]
+fn fd_real_commit_then_simulated_failure_retries_one_occurrence_after_reopen() {
+    let (_dir, path, signer, mut node) = scratch();
+    let diagnostics = crate::fd_diagnostics::Diagnostics::new();
+    let session = genid().id;
+    diagnostics.maintenance_failure(session, "synthetic maintenance: Too many open files (os error 24)");
+    let mut first = None;
+    let result = diagnostics.publish_pending(|batch| -> Result<()> {
+        first = batch.events[0];
+        node.append_fd_events(batch)?;
+        // Simulated unknown commit/flush outcome, not an actual disk fault.
+        bail!("synthetic failure after successful actual append");
+    });
+    assert!(result.is_err());
+    diagnostics.publish_pending(|batch| {
+        assert_eq!(batch.events[0], first);
+        node.append_fd_events(batch)
+    }).unwrap();
+    node.close().unwrap();
+    let mut node = NodeStore::open(&path, signer).unwrap();
+    let snapshot = node.pile.snapshot().unwrap();
+    let observed = snapshot.collection_acquiring(node.metrics).unwrap();
+    let facts: TribleSet = observed.view().unwrap();
+    let events: Vec<_> = find!((event: Id, monotonic: u128), pattern!(&facts, [{
+        ?event @ metadata::tag: fd::KIND_FD_EXHAUSTION,
+        health_record::attrs::session: session, fd::sequence: 1u128,
+        fd::monotonic_ns: ?monotonic,
+    }])).collect();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].1, first.unwrap().handler.monotonic_ns.unwrap());
+    drop(observed);
+    drop(snapshot);
+    node.close().unwrap();
+}
+
+#[test]
 fn service_causes_and_cleanup_events_survive_reopen_independently() {
     let (_dir, path, signer, mut node) = scratch();
     let attempt = genid().id;

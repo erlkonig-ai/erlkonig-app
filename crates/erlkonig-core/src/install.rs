@@ -989,6 +989,18 @@ mod tests {
         );
     }
     #[test]
+    fn appimage_mcp_command_keeps_outer_path_and_exact_arguments() {
+        let layout = Layout::new("/home/test/App Data");
+        let executable = Path::new("/home/test/Applications/Erlkonig 日本語.AppImage");
+        let url = "http://127.0.0.1:41773/";
+        let value: Value = serde_json::from_slice(&mcp_json(&layout, executable, url).unwrap()).unwrap();
+        let server = &value["mcpServers"]["faculties"];
+        assert_eq!(server["command"], executable.to_str().unwrap());
+        assert_eq!(server["args"], json!(["mcp-stdio", "--data-dir", "/home/test/App Data", "--url", url]));
+        assert!(server.get("env").is_none());
+    }
+
+    #[test]
     fn packages_share_skill_and_argv_without_reading_a_secret() {
         let temp = tempfile::tempdir().unwrap();
         let layout = Layout::new(temp.path().join("App Data"));

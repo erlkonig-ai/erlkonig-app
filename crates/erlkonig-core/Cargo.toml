@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[[example]]
+name = "accept-fixture"
+path = "../../scripts/accept/fixture.rs"
+
 [dependencies]
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -28,7 +32,10 @@ triblespace-net.workspace = true
 trible.workspace = true
 ed25519-dalek.workspace = true
 iroh-base.workspace = true
+zeroize.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }

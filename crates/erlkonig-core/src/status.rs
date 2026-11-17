@@ -196,6 +196,17 @@ mod tests {
 
 /// Writes a private sibling then renames. Never follows a pre-existing temp link.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_checked(path, bytes, || Ok(()))
+}
+
+/// The callback runs after the private temp file is durable, immediately
+/// before rename. It is a cooperative publication boundary, not exclusion of
+/// arbitrary external writers. A rejected publication removes its temp file.
+pub(crate) fn write_atomic_checked(
+    path: &Path,
+    bytes: &[u8],
+    before_publish: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other("no file name"))?;
@@ -209,6 +220,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        before_publish()?;
         fs::rename(&tmp, path)
     })();
     if result.is_err() {
