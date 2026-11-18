@@ -313,6 +313,19 @@ records its peer's measurements every 60 seconds. A destination edit takes
 effect at the next sample. Readers determine freshness from report timestamps.
 `config_inspect` shows the configured destination and whether a write failed.
 
+Aggregate sync telemetry also starts disabled. Pass the latest `observation`
+and `destination: {"root":"blake3:…","worker":"app-sync"}` to
+`config_set_sync_telemetry`, or pass `destination: null` to turn it off.
+Choose an existing source collection that admits the node as a writer.
+Readers can see the node identity, worker label, hydration, serving, repair,
+publication and process measurements. The sync loop samples before its first
+reconcile and every 60 seconds at a loop boundary. It applies destination or
+label changes at that boundary and starts a fresh measurement session for
+the new pair. Conflicting choices suspend publication until reconciled.
+`config_inspect` shows the destination, worker and publication failure flag.
+Workspace routes, native sync selection and swarm-health reporting each have
+their own configuration.
+
 Every configuration edit passes the opaque observation returned by
 `config_inspect`. The token fingerprints native Config foundations without
 exposing their blob handles. Stale edits fail; concurrent native revisions

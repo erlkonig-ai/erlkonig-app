@@ -1881,4 +1881,155 @@ fn native_health_reporting_rejects_a_writable_derived_collection() {
     })).unwrap_err();
     assert!(error.to_string().contains("source collection"));
     assert_eq!(inspected["observation"], f.inspect()["observation"]);
+    let error = f.call("config_set_sync_telemetry", json!({
+        "observation":inspected["observation"],
+        "destination":{"root":format!("blake3:{}",hex::encode(derived.handle().raw)),"worker":"fixture"}
+    })).unwrap_err();
+    assert!(error.to_string().contains("source collection"));
+    assert_eq!(inspected["observation"], f.inspect()["observation"]);
+}
+
+#[test]
+fn native_sync_telemetry_uses_the_configured_pair_and_preserves_its_session() {
+    use crate::sync_telemetry::Reporter;
+    use std::time::Duration;
+    use triblespace::core::{clock::epoch_now, collection::CollectionSnapshotExt};
+    use triblespace_net::{dashboard::CountMetric, health::HealthSnapshot, reconcile::ReconcileStats, telemetry};
+
+    let f = Fixture::new();
+    let guard = || f.config.node.lock().unwrap();
+    let (destination, other, signer) = {
+        let mut guard = guard();
+        let node = guard.as_mut().unwrap();
+        let signer = node.signer.verifying_key();
+        let policy = || faculties::collection_names::private_policy(signer);
+        (node.pile.collection("destination", policy()).unwrap(),
+         node.pile.collection("other", policy()).unwrap(), signer)
+    };
+    let health = HealthSnapshot {
+        node: iroh_base::EndpointId::from_bytes(signer.as_bytes()).unwrap(),
+        started_at: None, observed_at: None, store: Default::default(),
+        collections: vec![], publication: Default::default(), blob_serving: Default::default(),
+        peerings: vec![], grants: vec![], named_unselected: vec![],
+    };
+    let read = |collection| {
+        let snapshot = guard().as_mut().unwrap().pile.snapshot().unwrap();
+        let facts = snapshot.collection(collection).unwrap().view::<TribleSet>().unwrap();
+        let now = epoch_now().to_tai_duration().total_nanoseconds();
+        telemetry::observe(&facts, &snapshot, now, Duration::from_secs(180))
+    };
+    let configure = |target: Value| f.call("config_set_sync_telemetry", json!({
+        "observation":f.inspect()["observation"], "destination":target,
+    }));
+    let choice = |root: CollectionHandle, worker: &str| json!({
+        "root":format!("blake3:{}",hex::encode(root.raw)), "worker":worker,
+    });
+    let mut reporter = Reporter::default();
+    let publish = |r: &mut Reporter| r.publish(guard().as_mut().unwrap(), &health);
+    let count = || guard().as_mut().unwrap().pile.snapshot().unwrap().records().unwrap().count();
+
+    assert_eq!(f.inspect()["sync_telemetry"], json!({"destination":null}));
+    let before = count();
+    publish(&mut reporter).unwrap();
+    assert!(reporter.publisher().is_none());
+    assert_eq!(before, count());
+    let target = choice(destination.handle(), "app-sync");
+    let stale = f.inspect()["observation"].clone();
+    assert_eq!(configure(target.clone()).unwrap()["destination"], target);
+    let observed = f.inspect()["observation"].clone();
+    configure(target.clone()).unwrap();
+    assert_eq!(observed, f.inspect()["observation"]);
+    assert!(f.call("config_set_sync_telemetry", json!({"observation":stale,"destination":null})).is_err());
+    assert!(configure(choice(destination.handle(), "bad\nlabel")).is_err());
+    assert!(configure(json!({"root":target["root"]})).is_err());
+
+    publish(&mut reporter).unwrap();
+    reporter.publisher().unwrap().reconciled(
+        &ReconcileStats { landed: 7, received_bytes: 321, pending_blobs: Some(2), ..Default::default() },
+        Duration::from_millis(3),
+    );
+    publish(&mut reporter).unwrap();
+    let reports = read(destination);
+    let roles: BTreeSet<_> = reports.iter().map(|r| r.role.as_str()).collect();
+    assert_eq!(roles, BTreeSet::from(["hydration","serve","repair","publication","process"]));
+    assert_eq!(reports.len(), 5);
+    assert!(reports.iter().all(|r| r.node == signer.to_bytes() && r.worker == "app-sync" && r.session == reports[0].session));
+    let hydration = reports.iter().find(|r| r.role == "hydration").unwrap();
+    for (metric, value) in [(telemetry::Metric::Completed, 7), (telemetry::Metric::ReceivedBytes, 321),
+                            (telemetry::Metric::Queued, 2), (telemetry::Metric::WorkNs, 3_000_000)] {
+        assert_eq!(hydration.metrics.iter().find(|m| m.metric == metric).unwrap().value, CountMetric::Value(value));
+    }
+    assert!(read(other).is_empty());
+
+    configure(choice(destination.handle(), "renamed-worker")).unwrap();
+    publish(&mut reporter).unwrap();
+    let after_rename = read(destination);
+    let renamed = after_rename.iter().find(|r| r.worker == "renamed-worker" && r.role == "hydration").unwrap();
+    assert_ne!(renamed.session, hydration.session);
+    assert_eq!(renamed.metrics.iter().find(|m| m.metric == telemetry::Metric::Completed).unwrap().value, CountMetric::Value(0));
+    assert_eq!(after_rename.len(), 10);
+
+    // Competing complete proposals never select a root from one and a worker from the other.
+    f.annotate(entity! {config::anchor:attrs::SYNC_TELEMETRY,
+        config::selects:other.handle(), telemetry::attrs::worker:"other-worker"});
+    assert!(f.inspect()["sync_telemetry"]["problem"].is_string());
+    let before = count();
+    assert!(publish(&mut reporter).is_err());
+    assert!(reporter.publisher().is_none());
+    assert_eq!(count(), before);
+    configure(choice(other.handle(), "other-worker")).unwrap();
+    publish(&mut reporter).unwrap();
+    let next = read(other);
+    assert_eq!(next.len(), 5);
+    assert!(next.iter().all(|r| r.worker == "other-worker" && r.session != hydration.session));
+    let next_hydration = next.iter().find(|r| r.role == "hydration").unwrap();
+    assert_eq!(next_hydration.metrics.iter().find(|m| m.metric == telemetry::Metric::Completed).unwrap().value, CountMetric::Value(0));
+    assert_eq!(read(destination).iter().map(|r| r.report).collect::<BTreeSet<_>>(),
+               after_rename.iter().map(|r| r.report).collect::<BTreeSet<_>>());
+
+    configure(Value::Null).unwrap();
+    let before = count();
+    publish(&mut reporter).unwrap();
+    assert!(reporter.publisher().is_none());
+    assert_eq!(count(), before);
+}
+
+#[test]
+fn native_sync_telemetry_requires_effective_write_before_any_append() {
+    use crate::sync_telemetry::Reporter;
+    use triblespace::core::collection::{grant_collection_read, grant_collection_write};
+    use triblespace_net::{health::HealthSnapshot, telemetry};
+
+    let f = Fixture::new();
+    let foreign = ed25519_dalek::SigningKey::from_bytes(&[72; 32]);
+    let (root, signer) = {
+        let mut guard = f.config.node.lock().unwrap();
+        let node = guard.as_mut().unwrap();
+        let signer = node.signer.verifying_key();
+        let root = node.pile.collection("readable", faculties::collection_names::private_policy(foreign.verifying_key())).unwrap().handle();
+        grant_collection_read(&mut node.pile, root, &foreign, signer).unwrap();
+        (root, signer)
+    };
+    let config = f.inspect();
+    let result = f.call("config_set_sync_telemetry", json!({"observation":config["observation"],
+        "destination":{"root":format!("blake3:{}", hex::encode(root.raw)), "worker":"controlled"}}));
+    assert!(result.unwrap_err().to_string().contains("not admitted"));
+    assert_eq!(config["observation"], f.inspect()["observation"]);
+    f.annotate(entity! {config::anchor:attrs::SYNC_TELEMETRY,
+        config::selects:root, telemetry::attrs::worker:"controlled"});
+    let mut guard = f.config.node.lock().unwrap();
+    let node = guard.as_mut().unwrap();
+    let before = node.pile.snapshot().unwrap().records().unwrap().count();
+    let health = HealthSnapshot {
+        node: iroh_base::EndpointId::from_bytes(signer.as_bytes()).unwrap(),
+        started_at: None, observed_at: None, store: Default::default(),
+        collections: vec![], publication: Default::default(), blob_serving: Default::default(),
+        peerings: vec![], grants: vec![], named_unselected: vec![],
+    };
+    let mut reporter = Reporter::default();
+    assert!(reporter.publish(node, &health).is_err());
+    assert_eq!(before, node.pile.snapshot().unwrap().records().unwrap().count());
+    grant_collection_write(&mut node.pile, root, &foreign, signer).unwrap();
+    reporter.publish(node, &health).unwrap();
+    assert!(reporter.publisher().is_some());
 }

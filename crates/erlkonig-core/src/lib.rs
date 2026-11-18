@@ -22,6 +22,7 @@ mod local_files;
 pub mod protected_access;
 pub mod status;
 mod swarm_health;
+mod sync_telemetry;
 pub mod transport;
 pub mod words;
 pub mod workspace;

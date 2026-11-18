@@ -74,6 +74,11 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"root":{"type":["string","null"]}},"required":["observation","root"],"additionalProperties":false}"#,
     },
     Tool {
+        name: "config_set_sync_telemetry",
+        description: "Choose where the node's sync worker publishes aggregate work and process measurements. Pass a destination with an existing writable source collection root and a printable worker label, or null to disable. Off by default. Use the latest config_inspect observation. Reporting grants no rights and selects no collections.",
+        input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"destination":{"anyOf":[{"type":"null"},{"type":"object","properties":{"root":{"type":"string"},"worker":{"type":"string","minLength":1}},"required":["root","worker"],"additionalProperties":false}]}},"required":["observation","destination"],"additionalProperties":false}"#,
+    },
+    Tool {
         name: "config_set_settings",
         description: "Save the complete typed port, sync and maintenance settings after config_inspect. Explicitly supersedes observed settings forks; never guesses a winner. Native collection selection and participant discovery are independent; no peer bootstrap setting exists. Sync/maintenance apply while running; a changed MCP port takes effect after restarting Erlkonig and refreshing client integration. Port 0 requests an ephemeral local port. No keys, tokens, arbitrary paths or collection capabilities are accepted.",
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"mcp_port":{"type":"integer","minimum":0,"maximum":65535},"sync_enabled":{"type":"boolean"},"maintenance_enabled":{"type":"boolean"}},"required":["observation","mcp_port","sync_enabled","maintenance_enabled"],"additionalProperties":false}"#,
@@ -147,6 +152,27 @@ struct HealthReporting {
     observation: String,
     #[serde(deserialize_with = "Deserialize::deserialize")]
     root: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TelemetryTarget {
+    root: String,
+    worker: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncTelemetry {
+    observation: String,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    destination: Option<TelemetryTarget>,
+}
+
+fn telemetry_json(target: Option<&crate::sync_telemetry::Destination>) -> Value {
+    json!({"destination":target.map(|t| json!({
+        "root":format!("blake3:{}", hex::encode(t.root.raw)), "worker":t.worker
+    }))})
 }
 
 #[derive(Deserialize)]
@@ -325,13 +351,17 @@ impl ConfigMcp {
                     Ok(root) => json!({"root":root.map(|root| format!("blake3:{}", hex::encode(root.raw)))}),
                     Err(error) => json!({"problem":error.to_string()}),
                 };
+                let sync_telemetry = match view.sync_telemetry() {
+                    Ok(target) => telemetry_json(target.as_ref()),
+                    Err(error) => json!({"problem":error.to_string()}),
+                };
                 let (settings, problem) = match view.settings() {
                     Ok(value) => (settings_json(&value), None),
                     Err(error) => (Value::Null, Some(error.to_string())),
                 };
                 let status = self.services.status.lock().unwrap_or_else(|e| e.into_inner());
                 json!({"node_id":hex::encode(self.binding.signer), "observation":view.observation()?,
-                    "health_reporting":health_reporting, "settings":settings, "settings_problem":problem, "settings_revisions":revisions,
+                    "health_reporting":health_reporting, "sync_telemetry":sync_telemetry, "settings":settings, "settings_problem":problem, "settings_revisions":revisions,
                     "mcp_url":self.mcp_url,
                     // Raw session errors can include paths or capability handles.
                     // Keep their details in the local UI, not MCP inspection.
@@ -342,6 +372,7 @@ impl ConfigMcp {
                         "retry_stop_reason":status.node.retry_stop_reason,
                         "session_failed":status.node.problem.is_some(),
                         "health_reporting_failed":status.health_reporting_problem.is_some(),
+                        "sync_telemetry_failed":status.sync_telemetry_problem.is_some(),
                         "cleanup_failures":status.node.cleanup_failures,
                         "retry_pending":status.node.retry_pending,
                         "retry_available":status.config_problem.is_none()
@@ -473,6 +504,19 @@ impl ConfigMcp {
                 let root = args.root.as_deref().map(parse_handle).transpose()?;
                 node.set_health_destination(&view, root)?;
                 json!({"root":root.map(|value| format!("blake3:{}", hex::encode(value.raw)))})
+            }
+            "config_set_sync_telemetry" => {
+                let args: SyncTelemetry = mcp::decode_arguments(arguments)?;
+                current(&view, &args.observation)?;
+                let target = match args.destination {
+                    Some(target) => Some(crate::sync_telemetry::Destination {
+                        root: parse_handle(&target.root)?,
+                        worker: target.worker,
+                    }),
+                    None => None,
+                };
+                node.set_sync_telemetry(&view, target.as_ref())?;
+                telemetry_json(target.as_ref())
             }
             "config_set_settings" => {
                 let args: Settings = mcp::decode_arguments(arguments)?;

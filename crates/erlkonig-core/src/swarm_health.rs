@@ -1,15 +1,13 @@
 //! The node owner's one explicit destination for native peer observations.
 
-use anyhow::{Context, Result, bail};
-use ed25519_dalek::VerifyingKey;
+use anyhow::{Result, bail};
 use faculties::schemas::config::config;
 use std::collections::BTreeSet;
 use triblespace::core::{
     clock::{epoch_now, mono_now},
-    collection::{Collection, CollectionHandle, CollectionStoreExt, descriptor},
+    collection::{CollectionHandle, CollectionStoreExt},
     metadata,
-    query::register::{ObservationOrder, maximal},
-    repo::{BlobStoreGet, StorageFlush, pile::PileSnapshot},
+    repo::StorageFlush,
 };
 use triblespace::prelude::*;
 use triblespace_net::{
@@ -19,23 +17,14 @@ use triblespace_net::{
 
 use crate::{
     node_schema::HEALTH_REPORTING,
-    node_store::{ConfigView, NodeStore},
+    node_store::{ConfigView, NodeStore, report_destination, reporting_revisions},
 };
-
-fn revisions(facts: &TribleSet) -> Vec<Id> {
-    let order = ObservationOrder::new(facts, metadata::supersedes.id());
-    find!(revision: Id, and!(
-        pattern!(facts, [{ ?revision @ config::anchor: HEALTH_REPORTING }]),
-        maximal(revision, &order),
-    ))
-    .collect()
-}
 
 impl ConfigView {
     pub(crate) fn health_destination(&self) -> Result<Option<CollectionHandle>> {
         let facts = self.facts()?;
         let mut choices = BTreeSet::new();
-        for revision in revisions(&facts) {
+        for revision in reporting_revisions(&facts, HEALTH_REPORTING) {
             let mut roots = find!(root: CollectionHandle,
                 pattern!(&facts, [{ revision @ config::selects: ?root }]))
             .peekable();
@@ -53,23 +42,6 @@ impl ConfigView {
     }
 }
 
-fn destination(
-    snapshot: &PileSnapshot,
-    handle: CollectionHandle,
-    signer: VerifyingKey,
-) -> Result<Collection<blobencodings::SimpleArchive>> {
-    let collection =
-        Collection::open(snapshot, handle).context("open native health destination")?;
-    let facts: TribleSet = snapshot.get(handle)?;
-    if descriptor::source(&facts)?.is_some() {
-        bail!("health destination must be a source collection");
-    }
-    if !collection.writer_is_admitted(snapshot, signer)? {
-        bail!("node key lacks WRITE admission to the health destination");
-    }
-    Ok(collection)
-}
-
 impl NodeStore {
     pub(crate) fn set_health_destination(
         &mut self,
@@ -80,7 +52,7 @@ impl NodeStore {
             bail!("node configuration changed since inspection");
         }
         if let Some(handle) = root {
-            destination(
+            report_destination(
                 expected.observed.snapshot(),
                 handle,
                 self.signer.verifying_key(),
@@ -89,7 +61,7 @@ impl NodeStore {
         if expected.health_destination().is_ok_and(|current| current == root) {
             return Ok(());
         }
-        let previous = revisions(&expected.facts()?);
+        let previous = reporting_revisions(&expected.facts()?, HEALTH_REPORTING);
         self.pile.commit(
             self.config,
             &self.signer,
@@ -122,7 +94,7 @@ impl Reporter {
             return Ok(());
         };
         let signer = node.signer.verifying_key();
-        let collection = destination(view.observed.snapshot(), root, signer)?;
+        let collection = report_destination(view.observed.snapshot(), root, signer)?;
         // Restore the updated recorder only after successful publication. A
         // failed write must never seed the next sample's recovery episode.
         let previous = self.active.take().filter(|(old, _)| *old == root);

@@ -13,6 +13,8 @@ use triblespace::prelude::*;
 pub const NODE_SETTINGS: Id = id_hex!("E0A9165929ABA080F204EB244CD49C3A");
 /// Node-local native health publication destination. Minted with `trible genid` on 2026-11-18.
 pub const HEALTH_REPORTING: Id = id_hex!("3A85799153CD8CB38ABF582C4EFB6B7E");
+/// Node-local sync telemetry destination and worker. Minted with `trible genid` on 2026-11-18.
+pub const SYNC_TELEMETRY: Id = id_hex!("0AB2536130D68525125C9B550DD40F8E");
 /// A revision of one explicitly enrolled managed pile.
 pub const MANAGED_PILE: Id = id_hex!("55BCBF80A24F613FF984BD79DF1D6360");
 /// An explicit query workspace revision, separate from service enrollment.

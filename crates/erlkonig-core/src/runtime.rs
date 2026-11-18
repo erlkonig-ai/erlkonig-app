@@ -1066,6 +1066,8 @@ fn node_session(
         };
         publish_health(None);
         let mut next_health = Instant::now();
+        let mut next_telemetry = Instant::now();
+        let mut telemetry = crate::sync_telemetry::Reporter::default();
         let mut peer = Peer::new(
             store,
             signer.clone(),
@@ -1142,7 +1144,17 @@ fn node_session(
                             selection = next;
                         }
                         previous_snapshot = Some(snapshot);
+                        if Instant::now() >= next_telemetry {
+                            let health = peer.health();
+                            let result = with_node(&node, |node| telemetry.publish(node, &health));
+                            update(status, |s| s.sync_telemetry_problem = result.err().map(|error| error.to_string()));
+                            next_telemetry = Instant::now() + triblespace_net::health_record::REPORT_EVERY;
+                        }
+                        let measured = telemetry.publisher().map(|_| Instant::now());
                         let progress = activity.during(peer.reconcile()).await;
+                        if let (Some(publisher), Some(measured)) = (telemetry.publisher(), measured) {
+                            publisher.reconciled(&progress, measured.elapsed());
+                        }
                         received += progress.received_bytes as u128;
                         let health = peer.health();
                         if Instant::now() >= next_health {
@@ -1447,6 +1459,53 @@ mod tests {
         assert!(status.service_events_problem.as_ref().unwrap().contains("node store is closed"));
         assert!(status.summary().contains("service diagnostics could not be saved"));
         assert!(status.node.problem.is_none());
+    }
+
+    #[test]
+    #[ignore = "starts a disposable endpoint and waits one native reporting interval"]
+    fn native_sync_telemetry_publishes_returned_ticks_from_the_running_owner() {
+        use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
+        use triblespace::prelude::TribleSet;
+        use triblespace_net::{dashboard::CountMetric, health_record::REPORT_EVERY, telemetry};
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path().join("data"));
+        std::fs::create_dir(&layout.dir).unwrap();
+        let key = init::prepare(&layout.bootstrap()).unwrap();
+        let signer = key.verifying_key();
+        let mut node = NodeStore::open(&layout.default_pile(), key).unwrap();
+        let view = node.config().unwrap();
+        node.put_settings(&view, &NodeSettings { mcp_port: 0,
+            sync_enabled: true, maintenance_enabled: false }).unwrap();
+        let collection = node.pile.collection("fixture telemetry", faculties::collection_names::private_policy(signer)).unwrap();
+        let view = node.config().unwrap();
+        node.set_sync_telemetry(&view, Some(&crate::sync_telemetry::Destination {
+            root: collection.handle(), worker: "fixture-owner".into(),
+        })).unwrap();
+        node.close().unwrap();
+
+        let mut app = Runtime::start_with_guard(&layout, Arc::new(|| Ok(()))).unwrap();
+        wait_for(&app, |s| s.node.services == ServiceState::Running);
+        let limit = Instant::now() + REPORT_EVERY + Duration::from_secs(30);
+        let reports = loop {
+            let reports = with_node(&app.node, |node| {
+                let snapshot = node.pile.snapshot()?;
+                let facts: TribleSet = snapshot.collection(collection)?.view()?;
+                Ok(telemetry::observe(&facts, &snapshot, crate::node_metrics::now_tai_ns()?, REPORT_EVERY * 3))
+            }).unwrap();
+            if reports.iter().any(|r| r.previous_created_ns.is_some()) {
+                break reports;
+            }
+            assert!(Instant::now() < limit, "timed out waiting for two samples: {:?}", app.status());
+            thread::sleep(Duration::from_millis(500));
+        };
+        app.finish().unwrap();
+        assert_eq!(reports.len(), 5);
+        assert!(reports.iter().all(|r| r.worker == "fixture-owner" && r.node == signer.to_bytes()
+            && r.previous_created_ns.is_some() && r.session == reports[0].session));
+        let hydration = reports.iter().find(|r| r.role == "hydration").unwrap();
+        assert!(hydration.metrics.iter().any(|m| m.metric == telemetry::Metric::WorkNs
+            && matches!(m.value, CountMetric::Value(ns) if ns > 0)));
     }
 
     #[test]

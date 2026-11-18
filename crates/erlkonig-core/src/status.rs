@@ -72,6 +72,7 @@ pub struct Status {
     pub config_problem: Option<String>,
     pub metrics_problem: Option<String>,
     pub health_reporting_problem: Option<String>,
+    pub sync_telemetry_problem: Option<String>,
     /// Service-event persistence is separate from periodic counter samples.
     /// A successful sample must not erase a lost failure diagnostic.
     pub service_events_problem: Option<String>,
@@ -92,7 +93,7 @@ impl Status {
         }
         if self.problem.is_some() || self.config_problem.is_some()
             || self.metrics_problem.is_some() || self.service_events_problem.is_some()
-            || self.health_reporting_problem.is_some()
+            || self.health_reporting_problem.is_some() || self.sync_telemetry_problem.is_some()
             || self.node.problem.is_some()
         {
             Some("Attention needed")
@@ -141,6 +142,9 @@ impl Status {
         }
         if let Some(problem) = &self.health_reporting_problem {
             text.push_str(&format!(" · health report could not be saved: {problem}"));
+        }
+        if let Some(problem) = &self.sync_telemetry_problem {
+            text.push_str(&format!(" · sync telemetry could not be saved: {problem}"));
         }
         if let Some(problem) = &self.service_events_problem {
             text.push_str(&format!(" · service diagnostics could not be saved: {problem}"));

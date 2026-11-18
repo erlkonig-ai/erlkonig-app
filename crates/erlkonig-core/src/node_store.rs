@@ -10,10 +10,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use faculties::schemas::config::config;
 use triblespace::core::collection::{
-    Collection, CollectionHandle, CollectionSnapshot, CollectionSnapshotExt, CollectionStoreExt,
+    Collection, CollectionHandle, CollectionSnapshot, CollectionSnapshotExt, CollectionStoreExt, descriptor,
 };
 use triblespace::core::metadata::{self, MetaDescribe};
 use triblespace::core::query::register::{ObservationOrder, maximal};
@@ -43,6 +43,32 @@ impl Default for NodeSettings {
     }
 }
 
+pub(crate) fn reporting_revisions(facts: &TribleSet, anchor: Id) -> Vec<Id> {
+    let order = ObservationOrder::new(facts, metadata::supersedes.id());
+    find!(revision: Id, and!(
+        pattern!(facts, [{ ?revision @ config::anchor: anchor }]),
+        maximal(revision, &order),
+    ))
+    .collect()
+}
+
+pub(crate) fn report_destination(
+    snapshot: &PileSnapshot,
+    handle: CollectionHandle,
+    signer: VerifyingKey,
+) -> Result<Collection<blobencodings::SimpleArchive>> {
+    let collection =
+        Collection::open(snapshot, handle).context("open native reporting destination")?;
+    let facts: TribleSet = snapshot.get(handle)?;
+    if descriptor::source(&facts)?.is_some() {
+        bail!("reporting destination must be a source collection");
+    }
+    if !collection.writer_is_admitted(snapshot, signer)? {
+        bail!("node key lacks WRITE admission to the reporting destination");
+    }
+    Ok(collection)
+}
+
 /// A frozen native observation. Query results are computed where requested.
 #[derive(Clone)]
 pub struct ConfigView {
@@ -61,7 +87,7 @@ impl ConfigView {
             text_reads: Default::default(),
         })
     }
-    fn text(
+    pub(crate) fn text(
         &self,
         handle: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
     ) -> Result<String> {
@@ -111,8 +137,12 @@ impl ConfigView {
         let facts = self.facts()?;
         let order = ObservationOrder::new(&facts, metadata::supersedes.id());
         let names = find!((state: Id, name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>), and!(
-            pattern!(&facts, [{ ?state @ metadata::tag: attrs::WORKSPACE,
-                attrs::enrolled: true, metadata::name: ?name }]),
+            or!(
+                pattern!(&facts, [{ ?state @ metadata::tag: attrs::WORKSPACE,
+                    attrs::enrolled: true, metadata::name: ?name }]),
+                pattern!(&facts, [{ ?state @ config::anchor: attrs::SYNC_TELEMETRY,
+                    triblespace_net::telemetry::attrs::worker: ?name }]),
+            ),
             maximal(state, &order),
         )).map(|(_, name)| name).collect::<std::collections::BTreeSet<_>>();
         for name in names {
