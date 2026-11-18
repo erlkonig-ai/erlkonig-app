@@ -302,6 +302,17 @@ and maintenance of their supported attached collections. **Pause sync / Resume s
 is also available from the crown menu; it leaves maintenance settings alone.
 There is no active-workspace selector, keyring or per-workspace service mode.
 
+Native swarm-health reporting starts disabled. To enable it, call
+`config_set_health_reporting` with the observation from `config_inspect` and
+the exact `root` of an existing writable source collection. Pass `null` to
+disable it. Readers of that root can see this node's endpoint, collection and
+peer identities, and store and DHT measurements across the node. The choice is
+node-wide and independent of workspace routes, grants and replication selection.
+The sync owner publishes a startup observation before opening its endpoint, then
+records its peer's measurements every 60 seconds. A destination edit takes
+effect at the next sample. Readers determine freshness from report timestamps.
+`config_inspect` shows the configured destination and whether a write failed.
+
 Every configuration edit passes the opaque observation returned by
 `config_inspect`. The token fingerprints native Config foundations without
 exposing their blob handles. Stale edits fail; concurrent native revisions

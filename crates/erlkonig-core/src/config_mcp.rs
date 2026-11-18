@@ -69,6 +69,11 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"anchor":{"type":"string","minLength":32,"maxLength":32},"roots":{"type":"array","items":{"type":"string"},"minItems":1},"label":{"type":"string","minLength":1}},"required":["observation","anchor","roots"],"additionalProperties":false}"#,
     },
     Tool {
+        name: "config_set_health_reporting",
+        description: "Choose one existing source collection for this node's native swarm-health reports, or pass null to disable. Reporting is off by default. While sync runs, readers of the destination can see host, peer, collection and DHT observations across this node. Requires WRITE admission and the latest config_inspect observation. Does not create, grant or select a collection for sync.",
+        input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"root":{"type":["string","null"]}},"required":["observation","root"],"additionalProperties":false}"#,
+    },
+    Tool {
         name: "config_set_settings",
         description: "Save the complete typed port, sync and maintenance settings after config_inspect. Explicitly supersedes observed settings forks; never guesses a winner. Native collection selection and participant discovery are independent; no peer bootstrap setting exists. Sync/maintenance apply while running; a changed MCP port takes effect after restarting Erlkonig and refreshing client integration. Port 0 requests an ephemeral local port. No keys, tokens, arbitrary paths or collection capabilities are accepted.",
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"mcp_port":{"type":"integer","minimum":0,"maximum":65535},"sync_enabled":{"type":"boolean"},"maintenance_enabled":{"type":"boolean"}},"required":["observation","mcp_port","sync_enabled","maintenance_enabled"],"additionalProperties":false}"#,
@@ -134,6 +139,14 @@ struct Edit {
 struct Remove {
     observation: String,
     workspace: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealthReporting {
+    observation: String,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    root: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -308,13 +321,17 @@ impl ConfigMcp {
                     "sync_enabled":find!(value: bool, pattern!(&facts,[{state @ attrs::sync_enabled: ?value}])).collect::<Vec<_>>(),
                     "maintenance_enabled":find!(value: bool, pattern!(&facts,[{state @ attrs::maintenance_enabled: ?value}])).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>();
+                let health_reporting = match view.health_destination() {
+                    Ok(root) => json!({"root":root.map(|root| format!("blake3:{}", hex::encode(root.raw)))}),
+                    Err(error) => json!({"problem":error.to_string()}),
+                };
                 let (settings, problem) = match view.settings() {
                     Ok(value) => (settings_json(&value), None),
                     Err(error) => (Value::Null, Some(error.to_string())),
                 };
                 let status = self.services.status.lock().unwrap_or_else(|e| e.into_inner());
                 json!({"node_id":hex::encode(self.binding.signer), "observation":view.observation()?,
-                    "settings":settings, "settings_problem":problem, "settings_revisions":revisions,
+                    "health_reporting":health_reporting, "settings":settings, "settings_problem":problem, "settings_revisions":revisions,
                     "mcp_url":self.mcp_url,
                     // Raw session errors can include paths or capability handles.
                     // Keep their details in the local UI, not MCP inspection.
@@ -324,6 +341,7 @@ impl ConfigMcp {
                         "stop_reason":status.node.stop_reason,
                         "retry_stop_reason":status.node.retry_stop_reason,
                         "session_failed":status.node.problem.is_some(),
+                        "health_reporting_failed":status.health_reporting_problem.is_some(),
                         "cleanup_failures":status.node.cleanup_failures,
                         "retry_pending":status.node.retry_pending,
                         "retry_available":status.config_problem.is_none()
@@ -448,6 +466,13 @@ impl ConfigMcp {
                 let roots = args.roots.iter().map(|root| parse_handle(root)).collect::<Result<BTreeSet<_>>>()?;
                 let accepted = node.enroll_pending_share(&view, anchor(&args.anchor)?, &roots, args.label.as_deref())?;
                 enrolled_json(&accepted)
+            }
+            "config_set_health_reporting" => {
+                let args: HealthReporting = mcp::decode_arguments(arguments)?;
+                current(&view, &args.observation)?;
+                let root = args.root.as_deref().map(parse_handle).transpose()?;
+                node.set_health_destination(&view, root)?;
+                json!({"root":root.map(|value| format!("blake3:{}", hex::encode(value.raw)))})
             }
             "config_set_settings" => {
                 let args: Settings = mcp::decode_arguments(arguments)?;

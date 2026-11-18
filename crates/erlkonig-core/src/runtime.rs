@@ -1059,6 +1059,13 @@ fn node_session(
     };
     let result = if settings.sync_enabled {
         let mut driver = maintenance_driver([])?;
+        let mut reporter = crate::swarm_health::Reporter::default();
+        let mut publish_health = |health: Option<&triblespace_net::health::HealthSnapshot>| {
+            let result = with_node(&node, |node| reporter.publish(node, health));
+            update(status, |s| s.health_reporting_problem = result.err().map(|error| format!("{error:#}")));
+        };
+        publish_health(None);
+        let mut next_health = Instant::now();
         let mut peer = Peer::new(
             store,
             signer.clone(),
@@ -1138,6 +1145,10 @@ fn node_session(
                         let progress = activity.during(peer.reconcile()).await;
                         received += progress.received_bytes as u128;
                         let health = peer.health();
+                        if Instant::now() >= next_health {
+                            publish_health(Some(&health));
+                            next_health = Instant::now() + triblespace_net::health_record::REPORT_EVERY;
+                        }
                         let sent = health.blob_serving.sent_bytes;
                         let waiting = health.named_unselected.iter().map(|root| format!("blake3:{}", hex::encode(root.raw))).collect::<Vec<_>>();
                         update(status, |s| if s.node.grants_waiting != waiting { s.node.grants_waiting = waiting; });

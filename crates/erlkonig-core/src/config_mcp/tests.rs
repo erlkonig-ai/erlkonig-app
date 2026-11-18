@@ -1748,3 +1748,137 @@ fn sharing_catalog_and_result_use_only_native_grants() {
     assert_eq!(result["sync_complete"], false);
     assert_eq!(recipient.inspect()["workspaces"], json!([]), "grant publishing never enrolls another node");
 }
+
+#[test]
+fn native_health_reporting_uses_only_the_explicit_host_destination() {
+    use crate::swarm_health::Reporter;
+    use triblespace::core::clock::mono_now;
+    use triblespace::core::collection::{CollectionSnapshotExt, grant_collection_read, grant_collection_write};
+    use triblespace_net::{health::{HealthSnapshot, StoreHealth}, health_record as health};
+
+    let f = Fixture::new();
+    let node_guard = || f.config.node.lock().unwrap();
+    let foreign = ed25519_dalek::SigningKey::from_bytes(&[72; 32]);
+    let (shared, workspace, signer) = {
+        let mut guard = node_guard();
+        let node = guard.as_mut().unwrap();
+        let signer = node.signer.verifying_key();
+        let shared = node.pile.collection("shared fixture", faculties::collection_names::private_policy(foreign.verifying_key())).unwrap();
+        let workspace = node.pile.collection("workspace fixture", faculties::collection_names::private_policy(signer)).unwrap();
+        grant_collection_read(&mut node.pile, shared.handle(), &foreign, signer).unwrap();
+        (shared, workspace, signer)
+    };
+    f.put_local_workspace("workspace with health", [(health::DEFAULT_SCOPE_ID, workspace.handle())].into());
+    let selected = || {
+        let mut guard = node_guard();
+        let snapshot = guard.as_mut().unwrap().pile.snapshot().unwrap();
+        crate::workspace::selected_sync_roots(&snapshot, signer).unwrap()
+    };
+    let initially_selected = selected();
+    let mut reporter = Reporter::default();
+    let mut publish = |sample: Option<&HealthSnapshot>| {
+        reporter.publish(node_guard().as_mut().unwrap(), sample)
+    };
+    let read = |collection| {
+        node_guard().as_mut().unwrap().pile.snapshot().unwrap()
+            .collection_acquiring(collection).unwrap().view::<TribleSet>().unwrap()
+    };
+    let configure = |root: Value| f.call("config_set_health_reporting",
+        json!({"observation":f.inspect()["observation"],"root":root}));
+    let root = json!(format!("blake3:{}", hex::encode(shared.handle().raw)));
+
+    let record_count = || node_guard().as_mut().unwrap().pile.snapshot().unwrap().records().unwrap().count();
+    assert!(f.inspect()["health_reporting"]["root"].is_null());
+    let before = record_count();
+    publish(None).unwrap();
+    assert_eq!(record_count(), before);
+    assert!(read(workspace).is_empty());
+    assert!(configure(root.clone()).unwrap_err().to_string().contains("WRITE"));
+    assert!(configure(json!(format!("blake3:{}", "ff".repeat(32)))).is_err());
+    assert!(f.call("config_set_health_reporting", json!({"observation":f.inspect()["observation"]})).is_err());
+    assert!(read(shared).is_empty());
+
+    // Bypass the setter to exercise publication's own admission check.
+    f.annotate(entity! { config::anchor: attrs::HEALTH_REPORTING, config::selects: shared.handle() });
+    let before = record_count();
+    assert!(publish(None).unwrap_err().to_string().contains("WRITE"));
+    assert_eq!(record_count(), before, "an unauthorized append would be invisible in the admitted view");
+    {
+        let mut guard = node_guard();
+        grant_collection_write(&mut guard.as_mut().unwrap().pile, shared.handle(), &foreign, signer).unwrap();
+    }
+    configure(Value::Null).unwrap();
+    let stale = f.inspect()["observation"].clone();
+    assert_eq!(configure(root.clone()).unwrap()["root"], root);
+    let configured = f.inspect()["observation"].clone();
+    configure(root.clone()).unwrap();
+    assert_eq!(f.inspect()["observation"], configured);
+    assert!(f.call("config_set_health_reporting", json!({"observation":stale,"root":null})).is_err());
+    assert_eq!(f.inspect()["health_reporting"]["root"], root);
+
+    publish(None).unwrap();
+    let startup = read(shared);
+    assert!(exists!(pattern!(&startup, [
+        { _?report @ metadata::tag: &health::KIND_REPORT, health::attrs::condition: _?condition,
+            health::attrs::node: _?node },
+        { _?node @ health::attrs::endpoint: signer },
+        { _?condition @ metadata::tag: &health::HOST, health::attrs::state: &health::UNKNOWN },
+    ])));
+    let now = mono_now();
+    let observed = HealthSnapshot {
+        node: iroh_base::PublicKey::from_bytes(signer.as_bytes()).unwrap(),
+        started_at: Some(now), observed_at: Some(now),
+        store: StoreHealth { resident_blobs: 31, serving_snapshot: true, last_snapshot_observed_at: Some(now), ..Default::default() },
+        publication: Default::default(), blob_serving: Default::default(),
+        collections: vec![], peerings: vec![], grants: vec![], named_unselected: vec![],
+    };
+    publish(Some(&observed)).unwrap();
+    let facts = read(shared);
+    assert!(exists!(pattern!(&facts, [
+        { _?startup @ health::attrs::session: _?session, health::attrs::condition: _?unknown },
+        { _?unknown @ metadata::tag: &health::HOST, health::attrs::state: &health::UNKNOWN },
+        { _?report @ health::attrs::session: _?session, health::attrs::condition: _?store },
+        { _?store @ metadata::tag: &health::STORE, health::attrs::resident_blobs: 31u64 },
+    ])));
+    assert!(read(workspace).is_empty());
+    assert_eq!(selected(), initially_selected);
+
+    // A concurrent disable cannot be hidden by another head selecting a root.
+    f.annotate(entity! { config::anchor: attrs::HEALTH_REPORTING });
+    assert!(f.inspect()["health_reporting"]["problem"].is_string());
+    assert!(publish(Some(&observed)).is_err());
+    assert!(configure(Value::Null).unwrap()["root"].is_null());
+    publish(Some(&observed)).unwrap();
+    assert_eq!(read(shared), facts);
+    assert!(read(workspace).is_empty());
+}
+
+#[test]
+fn native_health_reporting_rejects_a_writable_derived_collection() {
+    use triblespace::core::capability::policy::resource_policy;
+    use triblespace::core::collection::{
+        Collection, KIND_COLLECTION_DESCRIPTOR, KIND_COLLECTION_MAPPING, collection_mapping,
+        collection_representation, collection_source, mapping_algorithm,
+    };
+    use triblespace::core::metadata::MetaDescribe;
+
+    let f = Fixture::new();
+    let derived: Collection<blobencodings::SimpleArchive> = {
+        let mut guard = f.config.node.lock().unwrap();
+        let node = guard.as_mut().unwrap();
+        let algorithm = genid();
+        node.pile.register_collection(entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_source: node.metrics.handle(),
+            resource_policy*: faculties::collection_names::private_policy(node.signer.verifying_key()).fragment(),
+            collection_representation*: blobencodings::SimpleArchive::describe(),
+            collection_mapping*: entity! { metadata::tag: KIND_COLLECTION_MAPPING, mapping_algorithm: &algorithm },
+        }).unwrap()
+    };
+    let inspected = f.inspect();
+    let error = f.call("config_set_health_reporting", json!({
+        "observation":inspected["observation"],"root":format!("blake3:{}",hex::encode(derived.handle().raw))
+    })).unwrap_err();
+    assert!(error.to_string().contains("source collection"));
+    assert_eq!(inspected["observation"], f.inspect()["observation"]);
+}
