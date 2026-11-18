@@ -212,7 +212,13 @@ membership. Grants are additive and non-expiring; editing/removing a workspace
 does not revoke another node's authority. A narrower share does not remove
 permissions the recipient already holds.
 
-Grants are valid immediately. Native peer exchange delivers proofs; sync and
+With a quorum policy, each authorized signer uses the same share operation
+for the same recipient and collections. The response reports `pending` until
+local native evidence admits every requested action. Each collection’s READ
+and WRITE alternatives report `have` distinct contributing roots and the
+required `threshold`. The recipient can inspect these counts with
+`config_list_pending_shares`. Repeating a share after evidence arrives
+reports the updated counts. Native peer exchange delivers proofs; sync and
 repair acquire descriptors and their names. A grant alone neither enrolls a
 workspace nor selects its roots for Full synchronization. On the recipient's
 own node, inspect native evidence with `config_list_pending_shares` and local

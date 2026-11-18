@@ -466,7 +466,9 @@ fn sharing_read_write_admits_authored_commit_and_opt_in_delegation_is_bounded() 
     let third_id = &accepted_third["workspace"]["workspace"];
     recipient.repair_authority_to(&third, &local);
     assert!(third.admission(&third.workspace(third_id)).iter().all(|value| *value == (true, false)));
+    let before = third.proofs();
     assert!(third.share(third_id, &fourth, "read_write", Some(true)).is_err(), "cannot broaden actions");
+    assert_eq!(third.proofs(), before, "denied WRITE leaves staged READ unpublished");
     third.share(third_id, &fourth, "read_only", None).unwrap();
     let final_accept = fourth.enroll_native(&third, &third.workspace(third_id)).unwrap();
     third.repair_authority_to(&fourth, &third.workspace(third_id));
@@ -607,6 +609,167 @@ fn sharing_uses_independent_quorum_paths_and_ignores_unavailable_future_policy()
     let snapshot = node.pile.snapshot().unwrap();
     assert_eq!(snapshot.proofs().unwrap().filter(|proof| proof.as_ref().unwrap().leaf_key() == node.signer.verifying_key()).count(),
         2, "two recipient-bound rooted paths; native AUTH also retains the issuer's parent proof");
+}
+
+#[test]
+fn sharing_counts_distinct_resident_roots_for_each_policy_until_invocation_is_admitted() {
+    use triblespace::core::capability::{capability_action, capability_delegate_action, policy};
+    use triblespace::core::collection::{ACTION_READ, AdmissionPolicy, Collection, CollectionPolicy, records};
+    use triblespace::core::repo::{CapabilityProofStore, transfer};
+
+    let first = Fixture::new();
+    let second = Fixture::new();
+    let other = Fixture::new();
+    let recipient = Fixture::new();
+    let key = |fixture: &Fixture| VerifyingKey::from_bytes(&fixture.config.binding.signer).unwrap();
+    let (a, b, c) = (key(&first), key(&second), key(&other));
+    let spare = ed25519_dalek::SigningKey::from_bytes(&[49; 32]).verifying_key();
+    let write_only_root = ed25519_dalek::SigningKey::from_bytes(&[89; 32]);
+    let role = workspace::roles().into_iter().find(|(_, name)| *name == "compass").unwrap().0;
+    let anchor = genid().id;
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::quorum([a, b, spare], 2, None).unwrap(),
+        AdmissionPolicy::quorum([a, b, c, write_only_root.verifying_key()], 1, None).unwrap(),
+    ).with_capability(
+        entity! { capability_action: ACTION_READ },
+        AdmissionPolicy::quorum([c, spare], 2, None).unwrap(),
+    );
+
+    // Register the same public descriptor on each fixture, as if acquired
+    // natively. All three signers can bind it through their own WRITE access.
+    let bind = |fixture: &Fixture| {
+        let root = {
+            let mut guard = fixture.config.node.lock().unwrap();
+            let node = guard.as_mut().unwrap();
+            let collection: Collection<blobencodings::SimpleArchive> = node.pile.register_collection(entity! {
+                metadata::tag*: [records::KIND_COLLECTION_DESCRIPTOR, anchor],
+                records::collection_name: "Council",
+                records::collection_representation*: <blobencodings::SimpleArchive as triblespace::core::metadata::MetaDescribe>::describe(),
+                attrs::collection_role: role,
+                policy::resource_policy*: policy.fragment(),
+            }).unwrap();
+            collection.handle()
+        };
+        let label = format!("Council {}", hex::encode(fixture.config.binding.signer));
+        let workspace = fixture.call("config_create_workspace", json!({
+            "observation":fixture.inspect()["observation"], "label":label,
+            "routes":[{"role":"compass", "root":format!("blake3:{}", hex::encode(root.raw))}],
+        })).unwrap();
+        (workspace["workspace"].clone(), root)
+    };
+    let (first_id, root) = bind(&first);
+    let (second_id, second_root) = bind(&second);
+    let (other_id, other_root) = bind(&other);
+    assert_eq!((second_root, other_root), (root, root));
+    first.publish_descriptors_to(&recipient, &first.workspace(&first_id));
+
+    // Native resource participants can acquire proofs before they have
+    // collection READ. Transfer only this resource's exact evidence.
+    let acquire = |source: &Fixture, target: &Fixture| {
+        let mut guard = source.config.node.lock().unwrap();
+        let snapshot = guard.as_mut().unwrap().pile.snapshot().unwrap();
+        let mut guard = target.config.node.lock().unwrap();
+        let node = guard.as_mut().unwrap();
+        for proof in snapshot.proofs().unwrap() {
+            let proof = proof.unwrap();
+            if proof.resource().into_bytes() != root.raw {
+                continue;
+            }
+            for copied in transfer(&snapshot, &mut node.pile, proof.blob_references()) { copied.unwrap(); }
+            node.pile.insert_proof(proof).unwrap();
+        }
+        node.pile.flush().unwrap();
+    };
+    let counts = |action: &Value| {
+        let mut counts = BTreeMap::new();
+        for alternative in action["alternatives"].as_array().unwrap() {
+            let roots = alternative["roots"].as_array().unwrap();
+            assert_eq!(alternative["threshold"], 2);
+            assert_eq!(alternative["contributing_roots"].as_array().unwrap().len() as u64,
+                alternative["have"].as_u64().unwrap());
+            counts.insert(roots.len(), alternative["have"].as_u64().unwrap());
+        }
+        counts
+    };
+    let pending = first.share(&first_id, &recipient, "read_write", Some(true)).unwrap();
+    assert_eq!(pending["status"], "pending");
+    assert_eq!(pending["collections"][0]["write"]["admitted"], true);
+    assert_eq!(counts(&pending["collections"][0]["read"]), BTreeMap::from([(2, 0), (3, 1)]));
+    let before = first.proofs();
+    assert_eq!(first.share(&first_id, &recipient, "read_write", Some(true)).unwrap(), pending);
+    assert_eq!(first.proofs(), before);
+
+    // A configured subject supplies its own quorum share. Repeating an
+    // invite to itself must not grow a chain of identical self-delegations.
+    let own = first.share(&first_id, &first, "read_only", Some(true)).unwrap();
+    assert_eq!(counts(&own["collections"][0]["read"]), BTreeMap::from([(2, 0), (3, 1)]));
+    let own_proofs = first.proofs();
+    assert_eq!(first.share(&first_id, &first, "read_only", Some(true)).unwrap(), own);
+    assert_eq!(first.proofs(), own_proofs);
+
+    // A different signed path from the same trust root is still one share.
+    first.share(&first_id, &recipient, "read_only", None).unwrap();
+    acquire(&first, &recipient);
+    let observed = recipient.list_pending();
+    let row = &observed["shares"][0]["collections"][0];
+    assert_eq!(counts(&row["admission"]["read"]), BTreeMap::from([(2, 0), (3, 1)]));
+    assert_eq!(row["admitted"], json!({"read":false,"write":true}));
+    assert_eq!(recipient.admission(&first.workspace(&first_id)), [(false, true)]);
+
+    acquire(&first, &other);
+    let other_share = other.share(&other_id, &recipient, "read_only", None).unwrap();
+    assert_eq!(other_share["status"], "pending", "alternatives cannot pool votes");
+    assert_eq!(counts(&other_share["collections"][0]["read"]), BTreeMap::from([(2, 1), (3, 1)]));
+    acquire(&other, &second);
+    let complete = second.share(&second_id, &recipient, "read_only", None).unwrap();
+    assert_eq!(complete["status"], "admitted");
+    let read = &complete["collections"][0]["read"];
+    assert_eq!(counts(read), BTreeMap::from([(2, 1), (3, 2)]));
+    for alternative in read["alternatives"].as_array().unwrap() {
+        let expected: BTreeSet<_> = if alternative["roots"].as_array().unwrap().len() == 3 {
+            [a, b].into_iter().map(|key| hex::encode(key.as_bytes())).collect()
+        } else {
+            BTreeSet::from([hex::encode(c.as_bytes())])
+        };
+        let actual: BTreeSet<String> = serde_json::from_value(alternative["contributing_roots"].clone()).unwrap();
+        assert_eq!(actual, expected);
+    }
+    acquire(&second, &recipient);
+    let row = &recipient.list_pending()["shares"][0]["collections"][0];
+    assert_eq!(row["admitted"], json!({"read":true,"write":true}));
+    assert_eq!(recipient.admission(&first.workspace(&first_id)), [(true, true)]);
+
+    // Only a has given this recipient a delegable share. Onward sharing
+    // contributes a's READ vote only, despite this node's full invocation.
+    let onward = Fixture::new();
+    let recipient_binding = recipient.call("config_create_workspace", json!({
+        "observation":recipient.inspect()["observation"], "label":"Council member",
+        "routes":[{"role":"compass", "root":format!("blake3:{}", hex::encode(root.raw))}],
+    })).unwrap();
+    let partial = recipient.share(&recipient_binding["workspace"], &onward, "read_only", None).unwrap();
+    assert_eq!(partial["status"], "pending");
+    assert_eq!(counts(&partial["collections"][0]["read"]), BTreeMap::from([(2, 0), (3, 1)]));
+
+    // A valid signed/delegable READ definition rooted outside both READ
+    // policies cannot contribute. Resident votes already admitting the
+    // invitee cannot authorize an unrelated signer to issue a share.
+    let stranger = Fixture::new();
+    first.publish_descriptors_to(&stranger, &first.workspace(&first_id));
+    acquire(&second, &stranger);
+    let stranger_id = stranger.put_local_workspace("Known council", first.workspace(&first_id).routes);
+    {
+        let mut guard = stranger.config.node.lock().unwrap();
+        let node = guard.as_mut().unwrap();
+        let handle = node.pile.put::<blobencodings::SimpleArchive, _>(entity! {
+            capability_action: ACTION_READ, capability_delegate_action: ACTION_READ,
+        }.facts().clone()).unwrap();
+        node.pile.insert_proof(triblespace::core::capability::CapabilityProof::new(
+            root.into(), &write_only_root, handle, key(&stranger),
+        )).unwrap();
+    }
+    let before = stranger.proofs();
+    assert!(stranger.share(&json!(format!("{stranger_id:X}")), &recipient, "read_only", None).is_err());
+    assert_eq!(stranger.proofs(), before);
 }
 
 #[test]
@@ -1743,7 +1906,7 @@ fn sharing_catalog_and_result_use_only_native_grants() {
     assert_eq!(properties, BTreeSet::from(["observation", "workspace", "recipient", "access", "delegate"]));
     let result = owner.share(&workspace, &recipient, "read_only", None).unwrap();
     let fields = result.as_object().unwrap().keys().map(String::as_str).collect::<BTreeSet<_>>();
-    assert_eq!(fields, BTreeSet::from(["workspace", "recipient", "delegate", "issuer_routing_hint", "publication", "sync_complete"]));
+    assert_eq!(fields, BTreeSet::from(["workspace", "recipient", "delegate", "issuer_routing_hint", "publication", "sync_complete", "status", "collections"]));
     assert_eq!(result["publication"], "local_native_grants");
     assert_eq!(result["sync_complete"], false);
     assert_eq!(recipient.inspect()["workspaces"], json!([]), "grant publishing never enrolls another node");

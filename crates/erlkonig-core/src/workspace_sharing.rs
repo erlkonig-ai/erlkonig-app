@@ -3,18 +3,18 @@
 //! Sharing publishes exact native grant evidence. Peer exchange and repair
 //! deliver proofs and descriptors; recipient workspace enrollment stays local.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::VerifyingKey;
-use serde::Deserialize;
-use triblespace::core::blob::encodings::UnknownBlob;
-use triblespace::core::capability::{capability_action, capability_delegate_action};
-use triblespace::core::collection::{
-    ACTION_READ, ACTION_WRITE, AdmissionPolicy, Collection, CollectionGrantError,
-    CollectionHandle, descriptor, grant_collection_capability,
+use serde::{Deserialize, Serialize};
+use triblespace::core::capability::{
+    CapabilityProof, CapabilityRequest, QuorumOutcome, capability_action, capability_delegate_action,
 };
-use triblespace::core::metadata;
+use triblespace::core::collection::{
+    ACTION_READ, ACTION_WRITE, AdmissionPolicy, Collection, CollectionHandle,
+    collection_action_is_admitted_by_descriptor, descriptor,
+};
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::{
     BlobStoreGet, BlobStoreList, BlobStorePut, CapabilityProofRead, CapabilityProofStore,
@@ -57,60 +57,84 @@ pub(crate) fn public_identity(value: &str) -> Result<VerifyingKey> {
     Ok(key)
 }
 
-/// Stage this exact descriptor, its name and resident admission definitions
-/// needed to prepare native grants.
-fn root_material<S: BlobStoreGet + BlobStoreList>(
-    source: &S,
-    staging: &mut MemoryRepo,
-    root: CollectionHandle,
-) -> Result<BTreeSet<Inline<inlineencodings::Handle<UnknownBlob>>>> {
-    let facts: TribleSet = source
-        .get(root)
-        .context("workspace root descriptor unavailable")?;
-    let mut handles = BTreeSet::from([root.transmute()]);
-    for (handle, _) in descriptor::capability_policies(&facts, None) {
-        if source.contains_blob(handle)? {
-            let definition: TribleSet = source.get(handle)?;
-            if exists!(pattern!(&definition, [{ capability_action: ACTION_READ }]))
-                || exists!(pattern!(&definition, [{ capability_action: ACTION_WRITE }]))
-            {
-                handles.insert(handle.transmute());
-            }
-        }
-    }
-    for name in find!(name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>, pattern!(&facts, [
-        { metadata::tag: triblespace::core::collection::records::KIND_COLLECTION_DESCRIPTOR,
-            triblespace::core::collection::records::collection_name: ?name },
-    ])) {
-        if source.contains_blob(name)? {
-            handles.insert(name.transmute());
-        }
-    }
-    for copied in transfer(source, staging, handles.iter().copied()) {
-        copied.context("copy workspace root admission material")?;
-    }
-    Collection::<blobencodings::SimpleArchive>::open(&staging.snapshot()?, root)?;
-    Ok(handles)
+/// Resident invocation support at one resource/action. Each alternative has
+/// its own distinct trust roots. No invitation or vote counter is stored.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ActionAdmission {
+    pub admitted: bool,
+    alternatives: Vec<PolicySupport>,
 }
 
-fn admitted(
-    staging: &mut MemoryRepo,
-    workspace: &Workspace,
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "policy", rename_all = "snake_case")]
+enum PolicySupport {
+    Open,
+    Quorum {
+        threshold: u32,
+        have: usize,
+        roots: Vec<String>,
+        contributing_roots: Vec<String>,
+    },
+}
+
+pub(crate) fn action_admission(
+    reader: &impl BlobStoreGet,
+    root: CollectionHandle,
+    facts: &TribleSet,
     subject: VerifyingKey,
-    write: bool,
-) -> Result<()> {
-    let snapshot = staging.snapshot()?;
-    for root in workspace.routes.values().copied().collect::<BTreeSet<_>>() {
-        let collection = Collection::<blobencodings::SimpleArchive>::open(&snapshot, root)?;
-        if !collection.reader_is_admitted(&snapshot, subject)?
-            || (write && !collection.writer_is_admitted(&snapshot, subject)?)
+    action: Id,
+    proofs: &[CapabilityProof],
+) -> ActionAdmission {
+    let representation = Some(blobencodings::SimpleArchive::id());
+    let admission = collection_action_is_admitted_by_descriptor(
+        reader, root, facts, representation, action, subject, proofs,
+    );
+    let admitted = matches!(admission, QuorumOutcome::Met);
+
+    // A policy root supplies its own share. For every other contributor,
+    // verify a signed prefix to this subject for this exact resource/action.
+    let request = CapabilityRequest::new(root.into(), action);
+    let mut support = BTreeSet::from([subject.to_bytes()]);
+    for proof in proofs {
+        let origin = proof.root_key();
+        if !support.contains(origin.as_bytes())
+            && proof.verify(reader, origin, subject, request).is_ok()
         {
-            bail!(
-                "prepared grant does not provide the requested native admission for every workspace root"
-            );
+            support.insert(origin.to_bytes());
         }
     }
-    Ok(())
+    let alternatives = descriptor::admission_policies(reader, facts, action, representation)
+        .map(|policy| match policy {
+            AdmissionPolicy::Open => PolicySupport::Open,
+            AdmissionPolicy::Quorum(quorum) => {
+                let contributing_roots: Vec<_> = quorum.roots().iter()
+                    .filter(|key| support.contains(key.as_bytes()))
+                    .map(|key| hex::encode(key.as_bytes()))
+                    .collect();
+                PolicySupport::Quorum {
+                    threshold: quorum.invoke_threshold(),
+                    have: contributing_roots.len(),
+                    roots: quorum.roots().iter().map(|key| hex::encode(key.as_bytes())).collect(),
+                    contributing_roots,
+                }
+            }
+        })
+        .collect();
+    ActionAdmission { admitted, alternatives }
+}
+
+#[derive(Serialize)]
+pub(crate) struct SharedCollection {
+    root: String,
+    read: ActionAdmission,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    write: Option<ActionAdmission>,
+}
+
+impl SharedCollection {
+    pub fn admitted(&self) -> bool {
+        self.read.admitted && self.write.as_ref().is_none_or(|write| write.admitted)
+    }
 }
 
 impl NodeStore {
@@ -121,7 +145,7 @@ impl NodeStore {
         subject: VerifyingKey,
         access: Access,
         delegate: bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<SharedCollection>> {
         if self.config_changed(expected)? {
             bail!("node configuration changed; inspect before sharing");
         }
@@ -136,21 +160,32 @@ impl NodeStore {
         let mut staging = MemoryRepo::default();
         let mut material = BTreeSet::new();
         let roots: BTreeSet<_> = workspace.routes.values().copied().collect();
-        for root in &roots {
-            material.extend(root_material(&source, &mut staging, *root)?);
-        }
         let actions = if access.write() {
             vec![ACTION_READ, ACTION_WRITE]
         } else {
             vec![ACTION_READ]
         };
-        // Existing proofs are queried only for the exact bundle and issuer.
-        // Their definitions are brought in only when a path is tried.
-        let parents = source
-            .proofs()?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        // Keep only prefixes this signer can extend over a requested collection.
+        let mut parents_by_collection = BTreeMap::<_, Vec<_>>::new();
+        for proof in source.proofs()? {
+            let proof = proof?;
+            let root = CollectionHandle::new(proof.resource().into_bytes());
+            if roots.contains(&root) && proof.root_key() != signer {
+                for prefix in proof.prefixes().filter(|prefix| prefix.subject() == signer) {
+                    parents_by_collection.entry(root).or_default().push(prefix.to_proof());
+                }
+            }
+        }
         for root in &roots {
+            Collection::<blobencodings::SimpleArchive>::open(&source, *root)?;
+            let facts: TribleSet = source.get(*root)?;
             for action in &actions {
+                let policies: Vec<_> = descriptor::admission_policies(
+                    &source, &facts, *action, Some(blobencodings::SimpleArchive::id()),
+                ).collect();
+                if policies.contains(&AdmissionPolicy::Open) {
+                    continue;
+                }
                 let definition = entity! {
                     capability_action: *action,
                     capability_delegate_action*: delegate.then_some(*action),
@@ -158,25 +193,26 @@ impl NodeStore {
                 let handle =
                     staging.put::<blobencodings::SimpleArchive, _>(definition.facts().clone())?;
                 material.insert(handle.transmute());
-                match grant_collection_capability(
-                    &mut staging,
-                    *root,
-                    handle,
-                    &self.signer,
-                    subject,
-                ) {
-                    Ok(_) | Err(CollectionGrantError::RootNotAuthorized { .. }) => {}
-                    Err(CollectionGrantError::OpenPolicy { .. }) => continue,
-                    Err(error) => {
-                        return Err(error).context("prepare native collection grant");
-                    }
+                let mut contributed = false;
+                if policies.iter().any(|policy| policy.has_root(signer)) {
+                    let proof = CapabilityProof::new((*root).into(), &self.signer, handle, subject);
+                    staging.insert_proof(proof)?;
+                    contributed = true;
                 }
                 // A configured root supplies only its own quorum share. It
                 // may also hold independently rooted delegation paths needed
                 // for the recipient to meet the native threshold.
-                for parent in parents.iter().filter(|proof| {
-                    proof.resource().into_bytes() == root.raw && proof.leaf_key() == signer
-                }) {
+                for parent in parents_by_collection.get(root).into_iter().flatten() {
+                    if !policies.iter().any(|policy| policy.has_root(parent.root_key())) {
+                        continue;
+                    }
+                    // Repeating a self-share must not append another identical
+                    // edge to a path the signer has already issued to itself.
+                    if subject == signer && parent.leaf_issuer() == signer
+                        && parent.capabilities().last() == Some(handle)
+                    {
+                        continue;
+                    }
                     let dependencies: Vec<_> = parent.blob_references().collect();
                     let mut resident = true;
                     for handle in &dependencies {
@@ -192,21 +228,16 @@ impl NodeStore {
                         continue;
                     };
                     let snapshot = staging.snapshot()?;
-                    if child.validate_delegation(&snapshot).is_ok()
-                        && descriptor::validate_proof_evidence(
-                            *root,
-                            &snapshot.get(*root)?,
-                            &child,
-                        )
-                        .is_ok()
-                    {
+                    if child.validate_delegation(&snapshot).is_ok() {
                         staging.insert_proof(child)?;
-                        material.extend(dependencies);
+                        contributed = true;
                     }
+                }
+                if !contributed {
+                    bail!("issuer cannot contribute a native grant for every requested workspace collection and action");
                 }
             }
         }
-        admitted(&mut staging, &workspace, subject, access.write())?;
         for role in workspace.routes.keys() {
             crate::workspace::role_name(*role)
                 .context("workspace has an unknown faculty role")?;
@@ -222,7 +253,24 @@ impl NodeStore {
             self.pile.insert_proof(proof?)?;
         }
         self.pile.flush()?;
-        Ok(())
+        let snapshot = self.pile.snapshot()?;
+        let mut proofs_by_resource = BTreeMap::<_, Vec<_>>::new();
+        for proof in snapshot.proofs()? {
+            let proof = proof?;
+            let resource = CollectionHandle::new(proof.resource().into_bytes());
+            if roots.contains(&resource) && proof.delegated_keys().any(|key| key == subject) {
+                proofs_by_resource.entry(resource).or_default().push(proof);
+            }
+        }
+        roots.into_iter().map(|root| {
+            let facts: TribleSet = snapshot.get(root)?;
+            let proofs = proofs_by_resource.get(&root).map(Vec::as_slice).unwrap_or_default();
+            let admission = |action| action_admission(&snapshot, root, &facts, subject, action, proofs);
+            Ok(SharedCollection {
+                root: format!("blake3:{}", hex::encode(root.raw)),
+                read: admission(ACTION_READ),
+                write: access.write().then(|| admission(ACTION_WRITE)),
+            })
+        }).collect()
     }
-
 }

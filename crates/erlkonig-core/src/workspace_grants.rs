@@ -49,7 +49,7 @@ use triblespace::prelude::*;
 use crate::node_schema as attrs;
 use crate::node_store::{ConfigView, NodeStore};
 use crate::workspace::Workspace;
-use crate::workspace_sharing::Enrolled;
+use crate::workspace_sharing::{ActionAdmission, Enrolled, action_admission};
 
 /// Hex of a collection handle, as the listing prints it.
 fn handle_hex(root: &CollectionHandle) -> String {
@@ -80,7 +80,7 @@ pub(crate) struct GrantedCollection {
     pub definitions_pending: usize,
     /// Native READ/WRITE admission under the resident descriptor, when it
     /// could be evaluated.
-    pub admitted: Option<(bool, bool)>,
+    pub admission: Option<(ActionAdmission, ActionAdmission)>,
     /// Current local workspaces routing this root.
     pub routed_in: Vec<LocalRoute>,
 }
@@ -93,6 +93,10 @@ pub(crate) struct LocalRoute {
 }
 
 impl GrantedCollection {
+    pub fn admitted(&self) -> Option<(bool, bool)> {
+        self.admission.as_ref().map(|(read, write)| (read.admitted, write.admitted))
+    }
+
     /// Routed by a current local workspace carrying `anchor`.
     fn routed_under(&self, anchor: Option<Id>) -> bool {
         self.routed_in.iter().any(|route| Some(route.anchor) == anchor)
@@ -136,7 +140,7 @@ impl PendingShare {
     /// the group. Never derived from claims; a root whose admission could
     /// not be evaluated counts as not admitted.
     pub(crate) fn admitted_access(&self) -> &'static str {
-        let admitted = || self.collections.iter().map(|row| row.admitted.unwrap_or((false, false)));
+        let admitted = || self.collections.iter().map(|row| row.admitted().unwrap_or((false, false)));
         if admitted().all(|(read, write)| read && write) {
             "read_write"
         } else if admitted().all(|(read, _)| read) {
@@ -150,7 +154,7 @@ impl PendingShare {
 
     /// At least one root admits this node as a reader.
     pub(crate) fn admitted_any(&self) -> bool {
-        self.collections.iter().any(|row| row.admitted.is_some_and(|(read, _)| read))
+        self.collections.iter().any(|row| row.admitted().is_some_and(|(read, _)| read))
     }
 }
 
@@ -241,28 +245,31 @@ impl NodeStore {
         let snapshot = self.pile.snapshot()?;
         // One row per granted root; proofs naming this node contribute the
         // edge that names it: its issuer and its definition's actions.
-        let mut rows: BTreeMap<CollectionHandle, GrantedCollection> = BTreeMap::new();
+        let mut rows = BTreeMap::new();
         for proof in snapshot.proofs()? {
             let proof = proof?;
             let root = CollectionHandle::new(proof.resource().into_bytes());
+            if !proof.delegated_keys().any(|key| key == me) {
+                continue;
+            }
+            let (row, proofs) = rows.entry(root).or_insert_with(|| (GrantedCollection {
+                root,
+                descriptor_resident: false,
+                name: None,
+                reason: None,
+                anchor: None,
+                role: None,
+                issuers: BTreeSet::new(),
+                claimed_read: false,
+                claimed_write: false,
+                claimed_delegate: false,
+                definitions_pending: 0,
+                admission: None,
+                routed_in: local_routes.get(&root).cloned().unwrap_or_default(),
+            }, Vec::new()));
             let mut issuer = proof.root_key();
             for (delegate, capability) in proof.delegated_keys().zip(proof.capabilities()) {
                 if delegate == me {
-                    let row = rows.entry(root).or_insert_with(|| GrantedCollection {
-                        root,
-                        descriptor_resident: false,
-                        name: None,
-                        reason: None,
-                        anchor: None,
-                        role: None,
-                        issuers: BTreeSet::new(),
-                        claimed_read: false,
-                        claimed_write: false,
-                        claimed_delegate: false,
-                        definitions_pending: 0,
-                        admitted: None,
-                        routed_in: local_routes.get(&root).cloned().unwrap_or_default(),
-                    });
                     row.issuers.insert(issuer.to_bytes());
                     // A definition that is not resident, or does not decode
                     // as facts, is unavailable for this edge: no claim is
@@ -289,12 +296,13 @@ impl NodeStore {
                 }
                 issuer = delegate;
             }
+            proofs.push(proof);
         }
         let mut skipped = 0;
         let known_roles: HashSet<Id> = crate::workspace::roles()
             .into_iter().map(|(role, _)| role).collect();
         let mut collections = Vec::with_capacity(rows.len());
-        for (root, mut row) in rows {
+        for (root, (mut row, proofs)) in rows {
             if !snapshot.contains_blob(root)? {
                 collections.push(row);
                 continue;
@@ -344,14 +352,10 @@ impl NodeStore {
                 [role] => Some(role),
                 _ => None,
             };
-            row.admitted = Collection::<blobencodings::SimpleArchive>::open(&snapshot, row.root)
-                .ok()
-                .and_then(|collection| {
-                    Some((
-                        collection.reader_is_admitted(&snapshot, me).ok()?,
-                        collection.writer_is_admitted(&snapshot, me).ok()?,
-                    ))
-                });
+            if Collection::<blobencodings::SimpleArchive>::open(&snapshot, root).is_ok() {
+                let admission = |action| action_admission(&snapshot, root, &facts, me, action, &proofs);
+                row.admission = Some((admission(ACTION_READ), admission(ACTION_WRITE)));
+            }
             collections.push(row);
         }
         Ok((collections, skipped))

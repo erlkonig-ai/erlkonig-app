@@ -47,7 +47,7 @@ Use `config_share_workspace` with the exact current workspace revision,
 recipient identity and the user's read-only or read/write choice. The native
 grant covers only the currently resolved roots and actions, not older or future
 workspace membership. A workspace edit does not expand or revoke an issued
-share. Grants are valid immediately, additive and non-expiring; removing a local workspace
+share. Grants are additive and non-expiring; removing a local workspace
 does not withdraw another node's authority. A narrower share does not
 remove permissions the recipient already holds.
 
@@ -58,8 +58,13 @@ Invocation alone never permits onward delegation. Also explain that disclosed
 or copied data cannot be made unread, whether or not delegation is enabled.
 Ask about the consequence in ordinary language, not capability jargon.
 
-The owner runs `config_share_workspace`;
-native grant exchange delivers proofs to the recipient's node when the nodes
+Each authorized signer uses `config_share_workspace` for the same recipient
+and collections. A `pending` response means some requested access still lacks
+a quorum in the local evidence. Report `have` of `threshold` distinct roots
+for the relevant collection, action and alternative. Keep independent policies
+separate. Repeating a share refreshes the result as evidence arrives. A grant
+issued with delegation can be passed on within its own originating root’s
+authority. Native grant exchange delivers proofs to the recipient's node when the nodes
 connect, and sync delivers descriptors. On the recipient's node, inspect
 `config_list_pending_shares` and `config_list_collections` (both read-only,
 no workspace needed). Keep proof claims (`claimed`, `claimed_access`)

@@ -68,8 +68,10 @@ uploaded by hand, so after moving the app prepare and upload it again.
 Node-scoped `config_*` tools share the same authenticated local endpoint and
 remain available with zero workspaces. They inspect the public identity and
 typed settings, discover local collection choices, and create/edit/remove
-bundles. `config_share_workspace` grants native access immediately to an exact
-current bundle, invoke-only by default; onward delegation requires explaining
+bundles. `config_share_workspace` contributes native grants to an exact current
+bundle. For quorum admission it reports pending and the number of distinct roots
+contributing to each policy until the requested actions are admitted. The default
+grant permits invocation only. Onward delegation requires explaining
 consequences and the user's opt-in. The recipient inspects
 `config_list_pending_shares` and `config_list_collections`, keeping claimed
 access separate from native admission. Descriptor names and declared
