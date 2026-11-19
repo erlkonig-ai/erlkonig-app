@@ -3,7 +3,7 @@ use GORBIE::{prelude::CardCtx, state::StateId};
 use erlkonig_core::{runtime::Runtime, faculties_browser::{ViewerInterest, ViewerNode, ViewerWorker}, workspace::Workspace};
 use faculties::widgets::storage::WorkspaceObservation;
 use faculties::viewer::{self, Host, HostAction, Target};
-use faculties::widgets::{FilesViewer, SourceKey, WidgetContext, WikiViewer};
+use faculties::widgets::{FilesViewer, GameWrite, SourceKey, WidgetContext, WikiViewer};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -219,8 +219,8 @@ fn observe(
     result
 }
 
-// Both file entry points use the same cancellation and exact-binding gate.
-fn admit_file_action(
+// Revalidate the selected workspace before opening a file or writing to Compass.
+fn admit_viewer_action(
     stop: &AtomicBool,
     desired: &AtomicU64,
     generation: u64,
@@ -229,11 +229,11 @@ fn admit_file_action(
     let cancelled =
         || stop.load(Ordering::Acquire) || generation != desired.load(Ordering::Acquire);
     if cancelled() {
-        return Err("The file request was cancelled.".into());
+        return Err("The viewer request was cancelled.".into());
     }
     revalidate()?;
     if cancelled() {
-        return Err("The file request was cancelled.".into());
+        return Err("The viewer request was cancelled.".into());
     }
     Ok(())
 }
@@ -318,10 +318,9 @@ fn work(
                 // the person, not the result of a later Refresh/selection.
                 let sources = files.loaded_context();
                 let mut binding_invalidated = false;
-                let wrote = matches!(action, HostAction::Prioritize { .. });
                 let result = (|| {
                     let mut before_export = || {
-                        admit_file_action(&stop, &desired, generation, || {
+                        admit_viewer_action(&stop, &desired, generation, || {
                             node.revalidate(&selected, || stop.load(Ordering::Acquire) || generation != desired.load(Ordering::Acquire))
                                 .map_err(|e| {
                                     binding_invalidated = true;
@@ -334,31 +333,46 @@ fn work(
                             .dataset(SourceKey::Files)
                             .ok_or_else(|| "Files are unavailable in this workspace.".to_owned())
                     };
-                    match action {
+                    let write = match action {
                         HostAction::WikiLink(selector) => {
-                            WikiViewer::open_file_with(files_view()?, &selector, &mut before_export)
+                            WikiViewer::open_file_with(files_view()?, &selector, &mut before_export)?;
+                            return Ok(None);
                         }
                         HostAction::Entity(entity) => {
-                            FilesViewer::open_entity_with(files_view()?, entity, &mut before_export)
+                            FilesViewer::open_entity_with(files_view()?, entity, &mut before_export)?;
+                            return Ok(None);
                         }
-                        // A priority answer is an ordinary Compass write into
-                        // the same exact, revalidated workspace binding.
-                        HostAction::Prioritize { higher, lower } => {
-                            before_export()?;
-                            let cancelled = || stop.load(Ordering::Acquire)
-                                || node.is_stopping() || generation != desired.load(Ordering::Acquire);
-                            node.with_workspace(&selected, cancelled, |pile, signer| {
-                                let route = selected.routes.get(&faculties::schemas::compass::DEFAULT_SCOPE_ID)
-                                    .ok_or_else(|| std::io::Error::other("Compass is unavailable in this workspace."))?;
-                                pollster::block_on(faculties::compass::operations::prioritize_in(
-                                    pile, signer, *route, higher, lower, || {
-                                        if cancelled() { return Err(std::io::Error::other("The priority request was cancelled.").into()); }
-                                        Ok(())
-                                    },
-                                )).map(drop)
-                            }).map_err(|e| format!("{e:#}"))
+                        HostAction::Prioritize { higher, lower } => GameWrite::Prioritize { higher, lower },
+                        HostAction::MarkGoalUnclear { goal } => GameWrite::Unclear(goal),
+                    };
+                    before_export()?;
+                    let cancelled = || stop.load(Ordering::Acquire)
+                        || node.is_stopping() || generation != desired.load(Ordering::Acquire);
+                    node.with_workspace(&selected, cancelled, |pile, signer| {
+                        use faculties::compass::operations;
+                        let route = selected.routes.get(&faculties::schemas::compass::DEFAULT_SCOPE_ID)
+                            .ok_or_else(|| std::io::Error::other("Compass is unavailable in this workspace."))?;
+                        let before_commit = || {
+                            if cancelled() {
+                                return Err(std::io::Error::other("The Compass request was cancelled.").into());
+                            }
+                            Ok(())
+                        };
+                        match write {
+                            GameWrite::Prioritize { higher, lower } => {
+                                pollster::block_on(operations::prioritize_in(
+                                    pile, signer, *route, higher, lower, before_commit,
+                                ))?;
+                                Ok(Some("Priority recorded."))
+                            }
+                            GameWrite::Unclear(goal) => {
+                                pollster::block_on(operations::mark_unclear_in(
+                                    pile, signer, *route, goal, None, before_commit,
+                                ))?;
+                                Ok(Some("Goal marked unclear."))
+                            }
                         }
-                    }
+                    }).map_err(|e| format!("{e:#}"))
                 })();
                 let output_handle = output.clone();
                 let mut output = output.lock().unwrap_or_else(|e| e.into_inner());
@@ -366,10 +380,9 @@ fn work(
                     && generation == desired.load(Ordering::Acquire)
                     && output.generation == generation
                 {
-                    let succeeded = result.is_ok();
+                    let confirmation = result.as_ref().ok().copied().flatten();
                     output.file_status = Some(match result {
-                        Ok(()) if wrote => "Priority recorded.".into(),
-                        Ok(()) => "Sent to the system viewer.".into(),
+                        Ok(message) => message.unwrap_or("Sent to the system viewer.").into(),
                         Err(error) => error,
                     });
                     if binding_invalidated {
@@ -377,8 +390,8 @@ fn work(
                         output.error = output.file_status.clone();
                         output.data = None;
                     }
-                    if wrote && succeeded && !binding_invalidated {
-                        // Observe again so the next frame reads the new edge.
+                    if let Some(message) = confirmation {
+                        // Refresh the visible Compass data after either kind of write.
                         drop(output);
                         serial = serial.wrapping_add(1);
                         let result = observe(&node, &stop, &desired, generation, Some(selected), &interest, serial);
@@ -389,7 +402,7 @@ fn work(
                             let mut output =
                                 output_handle.lock().unwrap_or_else(|e| e.into_inner());
                             if output.generation == generation {
-                                output.file_status = Some("Priority recorded.".into());
+                                output.file_status = Some(message.into());
                             }
                         }
                     }
@@ -463,6 +476,7 @@ impl Host for WorkspaceHost {
         let mut open = |action: HostAction| {
             let status = match action {
                 HostAction::Prioritize { .. } => "Recording priority…",
+                HostAction::MarkGoalUnclear { .. } => "Marking goal unclear…",
                 HostAction::WikiLink(_) | HostAction::Entity(_) => {
                     if !data.loaded_context().contains(SourceKey::Files) {
                         return Err("Files are unavailable in this workspace.".into());
@@ -478,7 +492,7 @@ impl Host for WorkspaceHost {
                     files: data.clone(),
                     action,
                 })
-                .map_err(|_| "The file reader is unavailable.".to_owned())
+                .map_err(|_| "The viewer worker is unavailable.".to_owned())
         };
         render(ctx, data.loaded_context(), generation, &mut open);
     }
@@ -617,9 +631,9 @@ mod tests {
     fn stale_file_action_never_revalidates_or_crosses_the_export_gate() {
         let stop = AtomicBool::new(false);
         let desired = AtomicU64::new(3);
-        assert!(admit_file_action(&stop, &desired, 1, || panic!("stale action")).is_err());
+        assert!(admit_viewer_action(&stop, &desired, 1, || panic!("stale action")).is_err());
         stop.store(true, Ordering::Release);
-        assert!(admit_file_action(&stop, &desired, 3, || panic!("stopped action")).is_err());
+        assert!(admit_viewer_action(&stop, &desired, 3, || panic!("stopped action")).is_err());
     }
 
     #[test]
@@ -627,14 +641,14 @@ mod tests {
         let stop = AtomicBool::new(false);
         let desired = AtomicU64::new(1);
         assert!(
-            admit_file_action(&stop, &desired, 1, || {
+            admit_viewer_action(&stop, &desired, 1, || {
                 desired.store(2, Ordering::Release);
                 Ok(())
             })
             .is_err()
         );
         assert!(
-            admit_file_action(&stop, &desired, 2, || {
+            admit_viewer_action(&stop, &desired, 2, || {
                 stop.store(true, Ordering::Release);
                 Ok(())
             })
