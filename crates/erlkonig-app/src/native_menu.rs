@@ -18,7 +18,7 @@ pub(crate) struct NativeMenu {
     claude: CheckMenuItem,
     cowork: MenuItem,
     refresh_plugins: MenuItem,
-    login: CheckMenuItem,
+    pub(crate) login: CheckMenuItem,
     pause_sync: MenuItem,
     retry_services: MenuItem,
     storage_folder: MenuItem,

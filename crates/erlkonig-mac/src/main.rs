@@ -9,6 +9,9 @@
 mod mac;
 
 #[cfg(target_os = "macos")]
+mod login_menu;
+
+#[cfg(target_os = "macos")]
 mod alert;
 
 #[cfg(target_os = "macos")]

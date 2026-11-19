@@ -47,3 +47,8 @@ anyhow.workspace = true
 hex.workspace = true
 objc2-quartz-core.workspace = true
 zeroize.workspace = true
+
+# AppKit menu construction and callbacks must run on the process main thread.
+[[test]]
+name = "login-menu"
+harness = false

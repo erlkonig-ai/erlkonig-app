@@ -2,6 +2,7 @@
 //! crown, around the shared application in `erlkonig_app::app`.
 
 use crate::crown_display::DisplayCrown;
+use crate::login_menu::LoginMenu;
 use erlkonig_app::app::{App, Login, Shell};
 use erlkonig_app::crown::WorkActivity;
 use erlkonig_core::paths::{self, Layout};
@@ -31,12 +32,21 @@ enum UserEvent {
 struct MacShell {
     mtm: MainThreadMarker,
     tray: Option<TrayIcon>,
+    login_menu: Option<objc2::rc::Retained<LoginMenu>>,
     crown: Option<DisplayCrown>,
     wake_proxy: EventLoopProxy<UserEvent>,
 }
 
 fn login() -> objc2::rc::Retained<SMAppService> {
     unsafe { SMAppService::mainAppService() }
+}
+
+fn login_status() -> Login {
+    match unsafe { login().status() } {
+        SMAppServiceStatus::Enabled => Login::On,
+        SMAppServiceStatus::RequiresApproval => Login::NeedsApproval,
+        _ => Login::Off,
+    }
 }
 
 /// Public LaunchServices lookup, not a running-process test. Reading bundle
@@ -124,11 +134,11 @@ impl Shell for MacShell {
     }
 
     fn login(&self) -> Login {
-        match unsafe { login().status() } {
-            SMAppServiceStatus::Enabled => Login::On,
-            SMAppServiceStatus::RequiresApproval => Login::NeedsApproval,
-            _ => Login::Off,
-        }
+        login_status()
+    }
+
+    fn displayed_login(&self) -> Login {
+        self.login_menu.as_ref().map_or(Login::Off, |menu| menu.status())
     }
 
     fn set_login(&self, on: bool) -> Result<(), String> {
@@ -304,8 +314,12 @@ struct Mac(App<MacShell>);
 impl ApplicationHandler<UserEvent> for Mac {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         if cause == StartCause::Init {
+            let menu = self.0.native_menu();
+            self.0.shell.login_menu = Some(LoginMenu::install(
+                &menu, self.0.native_login_item(), login_status, self.0.shell.mtm,
+            ));
             match TrayIconBuilder::new()
-                .with_menu(Box::new(self.0.native_menu()))
+                .with_menu(Box::new(menu))
                 .with_autosave_name("ai.erlkonig.app.status")
                 .build()
             {
@@ -371,6 +385,7 @@ pub fn main() {
     let shell = MacShell {
         mtm,
         tray: None,
+        login_menu: None,
         crown: None,
         wake_proxy,
     };

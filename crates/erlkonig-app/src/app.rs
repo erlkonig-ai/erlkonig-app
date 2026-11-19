@@ -48,6 +48,9 @@ pub trait Shell {
     /// Open `folder` in the file manager; the error is the person-facing text.
     fn show_folder(&self, folder: &Path) -> Result<(), &'static str>;
     fn login(&self) -> Login;
+    /// State for passive display. A platform with an expensive registration
+    /// lookup can supply the state it observed when its menu was presented.
+    fn displayed_login(&self) -> Login { self.login() }
     fn set_login(&self, on: bool) -> Result<(), String>;
     fn open_login_settings(&self);
     /// Installed desktop apps: the OpenAI app's path and display name, and
@@ -369,6 +372,12 @@ impl<S: Shell> App<S> {
             .get_or_insert_with(|| NativeMenu::new(items))
             .menu
             .clone()
+    }
+
+    /// The Mac menu delegate maintains this check while AppKit tracks the menu.
+    #[cfg(target_os = "macos")]
+    pub fn native_login_item(&mut self) -> tray_icon::menu::CheckMenuItem {
+        self.native.get_or_insert_with(|| NativeMenu::new(&self.items)).login.clone()
     }
 
     /// Bring the native menu, if there is one, in line with the model.
@@ -763,7 +772,7 @@ impl<S: Shell> App<S> {
         }
         .into();
         self.update_plugin_items();
-        self.items.login.checked = Some(self.shell.login() != Login::Off);
+        self.items.login.checked = Some(self.shell.displayed_login() != Login::Off);
         let now = self.origin.elapsed();
         crown::observe(
             &mut self.activity,
@@ -1406,6 +1415,7 @@ mod tests {
     struct Fake {
         modal: Option<usize>,
         login: Option<Login>,
+        login_reads: std::cell::Cell<usize>,
         log: Rc<RefCell<Vec<String>>>,
     }
 
@@ -1427,6 +1437,10 @@ mod tests {
             Ok(())
         }
         fn login(&self) -> Login {
+            self.login_reads.set(self.login_reads.get() + 1);
+            self.login.unwrap_or(Login::Off)
+        }
+        fn displayed_login(&self) -> Login {
             self.login.unwrap_or(Login::Off)
         }
         fn set_login(&self, on: bool) -> Result<(), String> {
@@ -1679,6 +1693,31 @@ mod tests {
             ("Shutting down…", false)
         );
         assert!(!view.login.enabled);
+    }
+
+    #[test]
+    fn viewer_wakes_use_displayed_login_and_activation_checks_the_service() {
+        let mut app = app(Fake::default());
+        for _ in 0..8 {
+            app.next_refresh = Instant::now();
+            assert!(!app.tick()); // due status refresh
+            assert!(!app.tick()); // earlier repaint wake
+        }
+        assert_eq!(app.shell.login_reads.get(), 0);
+        assert_eq!(app.view().login.checked, Some(false));
+
+        app.shell.login = Some(Login::On);
+        app.next_refresh = Instant::now();
+        assert!(!app.tick());
+        assert_eq!(app.view().login.checked, Some(true));
+        assert_eq!(app.shell.login_reads.get(), 0);
+
+        app.shell.login = Some(Login::NeedsApproval); // changed while open
+        app.on_menu(MenuEvent { id: app.view().login.id });
+        assert_eq!(app.shell.login_reads.get(), 1);
+        assert_eq!(app.view().prompt.unwrap().buttons, ["Open Settings", "Cancel"]);
+        app.answer(0);
+        assert!(app.shell.log.borrow().iter().any(|line| line == "settings"));
     }
 
     #[test]
