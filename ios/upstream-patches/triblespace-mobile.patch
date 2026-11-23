@@ -1,12 +1,14 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
  
  ## [Unreleased]
  
 +- A peer can hand out a passive health reader. Both it and `Peer::health()`
 +  return the current immutable observation without taking the producer lock.
++- Per-peer traffic rates average observed upload and download over ten seconds,
++  including disconnected time and traffic from separate connection lifetimes.
 +
  - The held-set driver is a semi-naive fixpoint instead of a job queue
    (heldset design, 2026-11-14). Each snapshot writes what arrived into a
@@ -14,12 +16,13 @@ diff --git a/CHANGELOG.md b/CHANGELOG.md
 diff --git a/trible/src/cli/pile/net.rs b/trible/src/cli/pile/net.rs
 --- a/trible/src/cli/pile/net.rs
 +++ b/trible/src/cli/pile/net.rs
-@@ -1108,12 +1108,13 @@ mod tests {
+@@ -1108,12 +1108,14 @@ mod tests {
              started_at: None,
              observed_at: None,
              store: Default::default(),
 -            collections: Vec::new(),
 +            connections: Default::default(),
++            traffic_rates: Default::default(),
 +            collections: Default::default(),
              publication: Default::default(),
              blob_serving: Default::default(),
@@ -32,7 +35,7 @@ diff --git a/trible/src/cli/pile/net.rs b/trible/src/cli/pile/net.rs
          };
          let resource = CollectionHandle::new([1; 32]);
          let quiet = CollectionHandle::new([2; 32]);
-@@ -1125,9 +1126,9 @@ mod tests {
+@@ -1125,9 +1127,9 @@ mod tests {
          };
          let mut seen = super::GrantsSeen::new();
          health.grants = vec![
@@ -45,7 +48,7 @@ diff --git a/trible/src/cli/pile/net.rs b/trible/src/cli/pile/net.rs
          let lines = super::grant_changes(&health, &mut seen);
          assert_eq!(
              lines,
-@@ -1138,7 +1139,9 @@ mod tests {
+@@ -1138,7 +1140,9 @@ mod tests {
              )]
          );
          assert!(super::grant_changes(&health, &mut seen).is_empty(), "unchanged");
@@ -59,12 +62,13 @@ diff --git a/trible/src/cli/pile/net.rs b/trible/src/cli/pile/net.rs
 diff --git a/trible/src/cli/pile/net/telemetry.rs b/trible/src/cli/pile/net/telemetry.rs
 --- a/trible/src/cli/pile/net/telemetry.rs
 +++ b/trible/src/cli/pile/net/telemetry.rs
-@@ -70,12 +70,13 @@ mod tests {
+@@ -70,12 +70,14 @@ mod tests {
              started_at: None,
              observed_at: None,
              store: Default::default(),
 -            collections: Vec::new(),
 +            connections: Default::default(),
++            traffic_rates: Default::default(),
 +            collections: Default::default(),
              publication: Default::default(),
              blob_serving: Default::default(),
@@ -2308,7 +2312,16 @@ diff --git a/triblespace-net/src/collection_delta.rs b/triblespace-net/src/colle
 diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.rs
 --- a/triblespace-net/src/connection.rs
 +++ b/triblespace-net/src/connection.rs
-@@ -527,6 +527,9 @@ impl<C: Conn> Conn for Connection<C> {
+@@ -272,6 +272,8 @@ struct Shared<T: Transport, S> {
+ }
+ 
+ struct Table<C> {
++    /// Passive host-local measurements. No connection handles are retained here.
++    traffic: crate::health::TrafficWindow,
+     /// Every live connection, by local id.
+     connections: HashMap<u64, Entry<C>>,
+     /// The connection each peer's streams are opened on.
+@@ -527,6 +529,9 @@ impl<C: Conn> Conn for Connection<C> {
          self.conn.remote_id()
      }
  
@@ -2318,7 +2331,15 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
      async fn open_bi(&self) -> anyhow::Result<(Self::SendHalf, Self::RecvHalf)> {
          let state = self.state();
          let permit = state
-@@ -689,6 +692,13 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
+@@ -665,6 +670,7 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
+                 sequence: AtomicU64::new(now.total_nanoseconds() as u64),
+                 next_id: AtomicU64::new(0),
+                 table: Mutex::new(Table {
++                    traffic: crate::health::TrafficWindow::new(crate::clock::mono_now()),
+                     connections: HashMap::new(),
+                     current: HashMap::new(),
+                     dials: HashMap::new(),
+@@ -689,6 +695,50 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
          self.shared.table.lock().unwrap().current(peer)
      }
  
@@ -2329,10 +2350,61 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
 +        observe_connections(entries)
 +    }
 +
++    /// Sample each authenticated transport once, including draining crossed dials.
++    /// Only the ranked live connection appears in the roster. Readers of the
++    /// published health observation never touch the table or the transport.
++    pub(crate) fn observe_traffic(&self) -> (
++        crate::clock::Mono,
++        Vec<crate::health::ConnectionHealth>,
++        crate::health::HealthRows<32, crate::health::PeerRate>,
++    ) {
++        let entries: Vec<_> = self.shared.table.lock().unwrap()
++            .connections.values().cloned().collect();
++        let samples: Vec<_> = entries.into_iter().map(|entry| {
++            let stats = entry.conn.traffic_stats();
++            let closed = entry.conn.is_closed();
++            (entry.state, stats, closed)
++        }).collect();
++        let mut table = self.shared.table.lock().unwrap();
++        let now = crate::clock::mono_now();
++        let mut ranked = Vec::new();
++        for (state, stats, closed) in samples {
++            // A removal may have delivered the final reading during sampling.
++            if !table.connections.contains_key(&state.id) {
++                continue;
++            }
++            table.traffic.sample(now, state.peer, state.id, stats);
++            if table.current.get(&state.peer) == Some(&state.id)
++                && !closed && !state.retired.load(Ordering::SeqCst)
++                && !state.closed.load(Ordering::SeqCst)
++            {
++                ranked.push(crate::health::ConnectionHealth {
++                    id: state.id, peer: state.peer, traffic: stats,
++                });
++            }
++        }
++        ranked.sort_by_key(|row| row.peer);
++        (now, ranked, table.traffic.rates(now))
++    }
++
      /// Whether `peer` has a connection streams can be opened on.
      pub(crate) fn is_connected(&self, peer: PeerId) -> bool {
          let table = self.shared.table.lock().unwrap();
-@@ -796,7 +806,25 @@ impl<T: Transport, S> Drop for DialWaiter<'_, T, S> {
+@@ -770,10 +820,9 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
+             return;
+         }
+         let removed = self.shared.table.lock().unwrap().remove(connection.state());
+-        if removed {
+-            connection
+-                .conn
+-                .close(CLOSE_NORMAL, b"connection invalidated");
++        if let Some(entry) = removed {
++            entry.conn.close(CLOSE_NORMAL, b"connection invalidated");
++            self.shared.finish_traffic(entry);
+         }
+     }
+ }
+@@ -796,7 +845,25 @@ impl<T: Transport, S> Drop for DialWaiter<'_, T, S> {
      }
  }
  
@@ -2358,7 +2430,96 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
      fn current(&self, peer: PeerId) -> Option<Connection<C>> {
          let entry = self.connections.get(self.current.get(&peer)?)?;
          Some(Connection::new(entry.conn.clone(), entry.state.clone()))
-@@ -1416,6 +1444,80 @@ mod tests {
+@@ -869,18 +936,18 @@ impl<C: Conn> Table<C> {
+         }
+     }
+ 
+-    /// Forget a connection. Returns whether it was still held.
+-    fn remove(&mut self, state: &State) -> bool {
++    /// Transfer the table's final measurement to exactly one remover.
++    fn remove(&mut self, state: &State) -> Option<Entry<C>> {
+         if self.current.get(&state.peer) == Some(&state.id) {
+             self.current.remove(&state.peer);
+         }
+-        self.connections.remove(&state.id).is_some()
++        self.connections.remove(&state.id)
+     }
+ 
+     /// Above the cap in `state`'s direction, pick the connection to close:
+     /// least recently used, preferring draining ones and ones nobody uses,
+     /// never a neighbour and never the newcomer itself.
+-    fn evict(&mut self, state: &State) -> Option<C> {
++    fn evict(&mut self, state: &State) -> Option<Entry<C>> {
+         let candidates = || {
+             self.connections.values().filter(|entry| {
+                 entry.state.dialled == state.dialled
+@@ -901,12 +968,20 @@ impl<C: Conn> Table<C> {
+                 )
+             })?
+             .clone();
+-        self.remove(&victim.state);
+-        Some(victim.conn)
++        self.remove(&victim.state)
+     }
+ }
+ 
+ impl<T: Transport, S: Service> Shared<T, S> {
++    /// The remover owns the last transport observation. Forced eviction and
++    /// invalidation sample after issuing close. Remote EOF and drained links
++    /// are sampled on accept-loop exit. A missing tail stays unknown.
++    fn finish_traffic(&self, entry: Entry<T::Conn>) {
++        let last = entry.conn.traffic_stats();
++        let mut table = self.table.lock().unwrap();
++        table.traffic.closed(crate::clock::mono_now(), entry.state.peer, entry.state.id, last);
++    }
++
+     fn state(&self, peer: PeerId, dialled: bool) -> Arc<State> {
+         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+         State::new(id, peer, self.transport.local_id(), dialled)
+@@ -958,8 +1033,12 @@ impl<T: Transport, S: Service> Shared<T, S> {
+ 
+     /// Hold a connection and start its accept loop.
+     fn register(self: &Arc<Self>, conn: T::Conn, state: Arc<State>) -> tokio::task::JoinHandle<()> {
++        let initial = conn.traffic_stats();
+         let evicted = {
+             let mut table = self.table.lock().unwrap();
++            let now = crate::clock::mono_now();
++            table.traffic.connected(now, state.peer, state.id);
++            table.traffic.sample(now, state.peer, state.id, initial);
+             table.connections.insert(
+                 state.id,
+                 Entry {
+@@ -974,7 +1053,8 @@ impl<T: Transport, S: Service> Shared<T, S> {
+         };
+         if let Some(evicted) = evicted {
+             debug!(target: "triblespace_net::handoff", "connection limit reached; evicting the least recently used");
+-            evicted.close(CLOSE_NORMAL, b"connection evicted");
++            evicted.conn.close(CLOSE_NORMAL, b"connection evicted");
++            self.finish_traffic(evicted);
+         }
+         let span = info_span!("connection", peer = %hex::encode(&state.peer[..4]));
+         tokio::spawn(accept_loop(Arc::downgrade(self), conn, state).instrument(span))
+@@ -1044,7 +1124,10 @@ async fn accept_loop<T: Transport, S: Service>(
+     }
+     state.closed.store(true, Ordering::SeqCst);
+     if let Some(table) = shared.upgrade() {
+-        table.table.lock().unwrap().remove(&state);
++        let removed = table.table.lock().unwrap().remove(&state);
++        if let Some(entry) = removed {
++            table.finish_traffic(entry);
++        }
+         if state.announced.load(Ordering::SeqCst) {
+             // The walks cancel this connection's exchanges, leaving a
+             // replacement's walks and peer state intact.
+@@ -1411,14 +1494,93 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
+         .map_err(|error| anyhow::anyhow!("send recon/1 frame: {error}"))
+ }
+ 
++#[cfg(all(test, feature = "sim"))]
++mod traffic_tests;
++
+ #[cfg(all(test, feature = "sim"))]
+ mod tests {
      use super::*;
      use crate::transport::sim::SimConn;
  
@@ -2386,6 +2547,7 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
 +    #[test]
 +    fn connection_observations_exclude_pending_undecided_draining_and_closed() {
 +        let mut table = Table::<ObservedConn> {
++            traffic: crate::health::TrafficWindow::new(crate::clock::mono_now()),
 +            connections: HashMap::new(), current: HashMap::new(), dials: HashMap::new(),
 +        };
 +        let peer = [1; 32];
@@ -2439,6 +2601,151 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
      #[test]
      fn a_cancelled_old_waiter_cannot_remove_a_replacement_dial() {
          let mut table = Table::<SimConn> {
++            traffic: crate::health::TrafficWindow::new(crate::clock::mono_now()),
+             connections: HashMap::new(),
+             current: HashMap::new(),
+             dials: HashMap::new(),
+diff --git a/triblespace-net/src/connection/traffic_tests.rs b/triblespace-net/src/connection/traffic_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/triblespace-net/src/connection/traffic_tests.rs
+@@ -0,0 +1,136 @@
++use super::*;
++use crate::transport::{Alpn, TrafficStats, sim::SimConn};
++use tokio::sync::watch;
++
++#[derive(Clone)]
++struct Metered {
++    peer: PeerId,
++    stats: Arc<Mutex<Option<TrafficStats>>>,
++    closed: watch::Sender<bool>,
++}
++
++fn counts(rx: u64, tx: u64) -> Option<TrafficStats> {
++    Some(TrafficStats {
++        received_bytes: rx,
++        sent_bytes: tx,
++        rtt: None,
++    })
++}
++
++impl Metered {
++    fn new(peer: PeerId, stats: Option<TrafficStats>) -> Self {
++        Self {
++            peer,
++            stats: Arc::new(Mutex::new(stats)),
++            closed: watch::channel(false).0,
++        }
++    }
++}
++
++impl Conn for Metered {
++    type SendHalf = <SimConn as Conn>::SendHalf;
++    type RecvHalf = <SimConn as Conn>::RecvHalf;
++    fn remote_id(&self) -> PeerId {
++        self.peer
++    }
++    fn is_closed(&self) -> bool {
++        *self.closed.borrow()
++    }
++    fn traffic_stats(&self) -> Option<TrafficStats> {
++        *self.stats.lock().unwrap()
++    }
++    async fn open_bi(&self) -> anyhow::Result<(Self::SendHalf, Self::RecvHalf)> {
++        panic!("passive measurements must not open streams")
++    }
++    async fn accept_bi(&self) -> Option<(Self::SendHalf, Self::RecvHalf)> {
++        self.closed
++            .subscribe()
++            .wait_for(|closed| *closed)
++            .await
++            .unwrap();
++        None
++    }
++    fn close(&self, _: u32, _: &[u8]) {
++        if !self.closed.send_replace(true) {
++            if let Some(stats) = self.stats.lock().unwrap().as_mut() {
++                stats.sent_bytes += 1;
++            }
++        }
++    }
++}
++
++#[derive(Clone)]
++struct Local;
++
++impl Transport for Local {
++    type Conn = Metered;
++    fn local_id(&self) -> PeerId {
++        [0; 32]
++    }
++    async fn dial(&self, _: PeerId, _: Alpn) -> anyhow::Result<Metered> {
++        panic!("reading traffic must not dial")
++    }
++    async fn shutdown(&self) {}
++}
++
++impl Service for Local {
++    async fn serve<W: SendStream, R: RecvStream>(
++        &self,
++        _: PeerId,
++        _: u8,
++        _: &mut W,
++        _: &mut R,
++    ) -> anyhow::Result<()> {
++        unreachable!()
++    }
++}
++
++#[tokio::test]
++async fn transport_accounting_includes_draining_traffic_and_one_final_read_per_connection() {
++    let table = ConnectionTable::new(Local, Local);
++    let peer = [7; 32];
++    let register = |conn: &Metered, sequence| {
++        let state = table.shared.state(peer, true);
++        state.sequence.set(sequence).unwrap();
++        table.shared.register(conn.clone(), state)
++    };
++    let old = Metered::new(peer, counts(1, 2));
++    let old_task = register(&old, 1);
++    let next = Metered::new(peer, counts(11, 13));
++    let next_task = register(&next, 2);
++    *old.stats.lock().unwrap() = counts(4, 6);
++    *next.stats.lock().unwrap() = counts(17, 19);
++
++    let (_, ranked, both) = table.observe_traffic();
++    assert_eq!(ranked.len(), 1);
++    assert_eq!(ranked[0].traffic, counts(17, 19));
++    let bytes = |rates: &crate::health::HealthRows<32, crate::health::PeerRate>| {
++        let row = rates.get(&peer).unwrap();
++        (row.received_bytes, row.sent_bytes)
++    };
++    assert_eq!(bytes(&both), (Some(21), Some(25)));
++
++    *old.stats.lock().unwrap() = counts(9, 11);
++    old.closed.send_replace(true);
++    old_task.await.unwrap();
++    *next.stats.lock().unwrap() = counts(23, 29);
++    let (_, _, retained) = table.observe_traffic();
++    assert_eq!(bytes(&retained), (Some(32), Some(40)));
++
++    // Forced removal reads after close reports its last outbound byte.
++    table.invalidate(&table.current(peer).unwrap());
++    next_task.await.unwrap();
++    let (_, ranked, all_closed) = table.observe_traffic();
++    assert!(ranked.is_empty());
++    assert_eq!(bytes(&all_closed), (Some(32), Some(41)));
++    assert_eq!(bytes(&both), (Some(21), Some(25)));
++
++    // No periodic tick saw this new incarnation. An unreadable terminal
++    // counter must not be turned into an exact zero-byte disconnect.
++    let brief = Metered::new(peer, counts(3, 4));
++    let brief_task = register(&brief, 3);
++    *brief.stats.lock().unwrap() = None;
++    brief.closed.send_replace(true);
++    brief_task.await.unwrap();
++    assert_eq!(bytes(&table.observe_traffic().2), (None, None));
++}
 diff --git a/triblespace-net/src/exchange.rs b/triblespace-net/src/exchange.rs
 --- a/triblespace-net/src/exchange.rs
 +++ b/triblespace-net/src/exchange.rs
@@ -2564,17 +2871,20 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
  use std::time::Duration;
  
  use iroh_base::EndpointId;
-@@ -22,6 +22,9 @@ use crate::patch_repair::PatchSummary;
+@@ -22,6 +22,12 @@ use crate::patch_repair::PatchSummary;
  use crate::transport::PeerId;
  use crate::walk::WalkKind;
  
 +mod rows;
 +pub use rows::{HealthRows, RowKey};
++mod traffic_window;
++pub use traffic_window::PeerRate;
++pub(crate) use traffic_window::TrafficWindow;
 +
  /// Hard per-active-collection bound on retained pairwise runtime evidence.
  pub const MAX_HEALTH_PEERS_PER_COLLECTION: usize = 128;
  
-@@ -194,7 +197,7 @@ pub struct CollectionHealth {
+@@ -194,7 +200,7 @@ pub struct CollectionHealth {
      pub local_frontier: Option<RepairFrontier>,
      pub last_local_change_at: Option<Mono>,
      /// Recent observations only, not a roster or a list of all holders.
@@ -2583,7 +2893,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
  }
  
  /// One collection's peering with one key, on one connection, as this side
-@@ -202,6 +205,8 @@ pub struct CollectionHealth {
+@@ -202,6 +208,8 @@ pub struct CollectionHealth {
  /// can appear twice.
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
  pub struct PeeringHealth {
@@ -2592,7 +2902,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
      pub collection: CollectionHandle,
      pub peer: PeerId,
      /// This side asked for the peering: the peer is one of its asked-for
-@@ -319,6 +324,15 @@ pub enum PairState {
+@@ -319,6 +327,15 @@ pub enum PairState {
      },
  }
  
@@ -2608,12 +2918,14 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
  /// An immutable copy of bounded evidence recorded at actual runtime events.
  /// Sampling this value cannot keep a dead host fresh.
  #[derive(Clone, Debug, Eq, PartialEq)]
-@@ -327,22 +341,24 @@ pub struct HealthSnapshot {
+@@ -327,22 +344,26 @@ pub struct HealthSnapshot {
      pub started_at: Option<Mono>,
      /// Written only by the host loop, never by a status reader or store refresh.
      pub observed_at: Option<Mono>,
 +    /// One ranked connection per authenticated peer, ordered by peer key.
 +    pub connections: HealthRows<32, ConnectionHealth>,
++    /// Current and recently disconnected peers' ten-second traffic observations.
++    pub traffic_rates: HealthRows<32, PeerRate>,
      pub store: StoreHealth,
      /// Exactly the locally active interest set, including unavailable views.
 -    pub collections: Vec<CollectionHealth>,
@@ -2637,7 +2949,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
  }
  
  /// What this side holds of the grants over one resource R, and what each
-@@ -352,7 +368,7 @@ pub struct GrantHealth {
+@@ -352,7 +373,7 @@ pub struct GrantHealth {
      pub resource: CollectionHandle,
      /// Root and count of R's grants in the grant index here.
      pub local: PatchSummary,
@@ -2646,7 +2958,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
  }
  
  /// One connected peer's statement about R's grants: its standing listing,
-@@ -380,6 +396,31 @@ fn fresh(at: Option<Mono>, now: Mono, max_age: Duration) -> bool {
+@@ -380,6 +401,31 @@ fn fresh(at: Option<Mono>, now: Mono, max_age: Duration) -> bool {
      at.is_some_and(|at| at <= now && now.duration_since(at) <= max_age)
  }
  
@@ -2678,7 +2990,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
  impl HealthSnapshot {
      pub fn is_fresh(&self, now: Mono, max_age: Duration) -> bool {
          fresh(self.observed_at, now, max_age)
-@@ -412,10 +453,7 @@ impl HealthSnapshot {
+@@ -412,10 +458,7 @@ impl HealthSnapshot {
          {
              return PairState::Unknown;
          }
@@ -2690,7 +3002,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          else {
              return PairState::Unknown;
          };
-@@ -430,10 +468,10 @@ impl HealthSnapshot {
+@@ -430,10 +473,10 @@ impl HealthSnapshot {
          if !fresh(pair.last_event_at(), now, max_age) {
              return PairState::Unknown;
          }
@@ -2703,7 +3015,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
              .and_then(|listing| listing.listed);
          let pushes = peering.sends
              && (listed.is_none()
-@@ -452,31 +490,94 @@ impl HealthSnapshot {
+@@ -452,31 +495,96 @@ impl HealthSnapshot {
      }
  }
  
@@ -2750,6 +3062,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
              started_at: None,
              observed_at: None,
 +            connections: Default::default(),
++            traffic_rates: Default::default(),
              store: StoreHealth::default(),
 -            collections: Vec::new(),
 +            collections: Default::default(),
@@ -2796,6 +3109,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
 +        // HealthRows equality is constant-time, so the remaining comparison
 +        // only examines the snapshot's scalar fields.
 +        if !next.connections.same_root(&current.connections)
++            || !next.traffic_rates.same_root(&current.traffic_rates)
 +            || !next.collections.same_root(&current.collections)
 +            || !next.peerings.same_root(&current.peerings)
 +            || !next.grants.same_root(&current.grants)
@@ -2807,7 +3121,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
      }
  
      pub(crate) fn begin_blob_serve(&self) -> BlobServeGuard {
-@@ -495,33 +596,29 @@ impl Health {
+@@ -495,33 +603,29 @@ impl Health {
          update: impl FnOnce(&mut PeerHealth),
      ) {
          self.update(|health| {
@@ -2862,7 +3176,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          });
      }
  }
-@@ -563,6 +660,9 @@ impl Drop for BlobServeGuard {
+@@ -563,6 +667,9 @@ impl Drop for BlobServeGuard {
      }
  }
  
@@ -2872,7 +3186,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
  #[cfg(test)]
  mod tests {
      use super::*;
-@@ -621,13 +721,14 @@ mod tests {
+@@ -621,13 +728,14 @@ mod tests {
              health.observed_at = Some(now);
              health.store.serving_snapshot = true;
              health.store.last_snapshot_observed_at = Some(now);
@@ -2890,7 +3204,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
                  collection,
                  peer,
                  asked: true,
-@@ -637,14 +738,14 @@ mod tests {
+@@ -637,14 +745,14 @@ mod tests {
                  refused_by_me: false,
                  refused_by_them: false,
              });
@@ -2907,7 +3221,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
              });
          });
          (health, collection, peer, now)
-@@ -680,8 +781,8 @@ mod tests {
+@@ -680,8 +788,8 @@ mod tests {
                      peer,
                      listed,
                      ..Default::default()
@@ -2918,7 +3232,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          });
      }
  
-@@ -748,7 +849,7 @@ mod tests {
+@@ -748,7 +856,7 @@ mod tests {
                  receives: true
              }
          );
@@ -2927,7 +3241,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          assert_eq!(
              health.snapshot().pair(collection, peer, now, AGE),
              PairState::Behind {
-@@ -756,7 +857,7 @@ mod tests {
+@@ -756,7 +864,7 @@ mod tests {
                  receives: false
              }
          );
@@ -2936,7 +3250,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          listing(&health, collection, peer, local, Some(local));
          assert_eq!(
              health.snapshot().pair(collection, peer, now, AGE),
-@@ -767,7 +868,7 @@ mod tests {
+@@ -767,7 +875,7 @@ mod tests {
      #[test]
      fn receive_only_completion_isolated_by_foundation_kind() {
          let (health, collection, peer, now) = fixture();
@@ -2945,7 +3259,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          let f = frontier(5, 1);
          health.with_peer(collection, peer, |pair| {
              pair.received(now, WalkKind::Derive, None, false);
-@@ -791,7 +892,7 @@ mod tests {
+@@ -791,7 +899,7 @@ mod tests {
      #[test]
      fn receive_completion_freshness_and_disconnect_do_not_reuse_old_roots() {
          let (health, collection, peer, now) = fixture();
@@ -2954,7 +3268,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          settle(&health, collection, peer, now);
          let later = now + AGE + Duration::from_secs(1);
          health.update(|sample| {
-@@ -807,13 +908,13 @@ mod tests {
+@@ -807,13 +915,13 @@ mod tests {
              pair.received(later, WalkKind::Derive, Some(frontier(6, 2).derives), true);
          });
          assert_eq!(health.snapshot().pair(collection, peer, later, AGE), PairState::Current);
@@ -2973,7 +3287,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          assert_eq!(health.snapshot().pair(collection, peer, later, AGE),
              PairState::Behind { pushes: false, receives: true });
      }
-@@ -856,7 +957,7 @@ mod tests {
+@@ -856,7 +964,7 @@ mod tests {
      fn a_direction_is_behind_until_its_last_end_settles_the_frontier() {
          let (health, collection, peer, now) = fixture();
          settle(&health, collection, peer, now);
@@ -2982,7 +3296,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          assert_eq!(
              health.snapshot().pair(collection, peer, now, AGE),
              PairState::Behind {
-@@ -883,7 +984,7 @@ mod tests {
+@@ -883,7 +991,7 @@ mod tests {
                  receives: true
              }
          );
@@ -2991,7 +3305,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          assert_eq!((pair.pushes.ok, pair.pushes.failed), (3, 1));
          assert_eq!((pair.receives.ok, pair.receives.failed), (2, 1));
          assert_eq!(pair.confirmed.commits, Some(frontier(6, 2).commits));
-@@ -892,14 +993,14 @@ mod tests {
+@@ -892,14 +1000,14 @@ mod tests {
  
          // A direction the peering does not have is never behind.
          health.update(|health| {
@@ -3009,7 +3323,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          assert_eq!(
              health.snapshot().pair(collection, peer, now, AGE),
              PairState::Unknown
-@@ -911,7 +1012,7 @@ mod tests {
+@@ -911,7 +1019,7 @@ mod tests {
          let (health, collection, peer, now) = fixture();
          settle(&health, collection, peer, now);
          health.update(|health| {
@@ -3018,7 +3332,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
              health.store.serving_snapshot = false;
          });
          let snapshot = health.snapshot();
-@@ -954,10 +1055,10 @@ mod tests {
+@@ -954,10 +1062,10 @@ mod tests {
              });
          }
          assert_eq!(
@@ -3477,14 +3791,435 @@ new file mode 100644
 +        }
 +    }
 +}
+diff --git a/triblespace-net/src/health/traffic_window.rs b/triblespace-net/src/health/traffic_window.rs
+new file mode 100644
+--- /dev/null
++++ b/triblespace-net/src/health/traffic_window.rs
+@@ -0,0 +1,415 @@
++use super::{HealthRows, PeerId, RowKey};
++use crate::{clock::Mono, transport::TrafficStats};
++use std::collections::VecDeque;
++use triblespace_core::patch::{Entry, IdentitySchema, PATCH};
++
++const WINDOW: u64 = 10_000_000_000;
++const BIN: u64 = 100_000_000;
++
++/// Bytes observed over the elapsed portion of a ten-second wall-time window.
++/// Once ten seconds are available, observations use the latest completed
++/// 100 ms boundary. A peer's disconnected time is included in the denominator.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct PeerRate {
++    pub peer: PeerId,
++    pub window_ns: u64,
++    pub received_bytes: Option<u128>,
++    pub sent_bytes: Option<u128>,
++}
++
++impl PeerRate {
++    pub fn receive_bytes_per_second(&self) -> Option<f64> {
++        self.per_second(self.received_bytes)
++    }
++
++    pub fn send_bytes_per_second(&self) -> Option<f64> {
++        self.per_second(self.sent_bytes)
++    }
++
++    fn per_second(&self, bytes: Option<u128>) -> Option<f64> {
++        let bytes = bytes?;
++        (self.window_ns > 0).then(|| bytes as f64 * 1e9 / self.window_ns as f64)
++    }
++}
++
++impl RowKey<32> for PeerRate {
++    fn row_key(&self) -> [u8; 32] {
++        self.peer
++    }
++}
++
++#[derive(Default)]
++struct Bytes {
++    amount: u128,
++    // A cumulative delta recovered after a long gap cannot be placed on
++    // either side of a window boundary falling inside that gap.
++    gap_start: Option<u64>,
++}
++
++struct Bucket {
++    end: u64,
++    bytes: [Bytes; 2],
++}
++
++struct Connection {
++    id: u64,
++    at: u64,
++    counts: [u64; 2],
++    available: bool,
++}
++
++struct Account {
++    peer: PeerId,
++    live: Vec<Connection>,
++    last_close: u64,
++    // At most 100 completed bins and one partial bin, even across rapid reconnects.
++    buckets: VecDeque<Bucket>,
++    // A missing final reading or counter reset makes that direction unknowable
++    // until the affected interval has left the trailing window.
++    unknown_at: [Option<u64>; 2],
++    reported: Option<(u64, bool)>,
++}
++
++impl Account {
++    fn trim(&mut self, at: u64) {
++        let lower = (at / BIN * BIN).saturating_sub(WINDOW);
++        while self.buckets.front().is_some_and(|b| b.end <= lower) {
++            self.buckets.pop_front();
++        }
++    }
++
++    fn sample(&mut self, at: u64, idx: usize, stats: Option<TrafficStats>) {
++        let conn = &mut self.live[idx];
++        let Some(stats) = stats else {
++            conn.available = false;
++            return;
++        };
++        let counts = [stats.received_bytes, stats.sent_bytes];
++        let since = conn.at;
++        let previous = conn.counts;
++        if !conn.available || (counts != previous && (at < WINDOW || at % BIN == 0)) {
++            self.reported = None;
++        }
++        conn.counts = counts;
++        conn.at = at;
++        conn.available = true;
++        self.trim(at);
++        for direction in 0..2 {
++            let Some(delta) = counts[direction].checked_sub(previous[direction]) else {
++                self.unknown_at[direction] = Some(at);
++                self.reported = None;
++                continue;
++            };
++            if delta == 0 {
++                continue;
++            }
++            // A measurement at an exact boundary belongs to the interval ending there.
++            let end = at.div_ceil(BIN).max(1).saturating_mul(BIN);
++            if self.buckets.back().is_none_or(|bucket| bucket.end != end) {
++                self.buckets.push_back(Bucket {
++                    end,
++                    bytes: Default::default(),
++                });
++            }
++            let bytes = &mut self.buckets.back_mut().unwrap().bytes[direction];
++            bytes.amount += u128::from(delta);
++            if at.saturating_sub(since) > BIN {
++                bytes.gap_start = Some(bytes.gap_start.map_or(since, |old| old.min(since)));
++            }
++        }
++    }
++
++    fn rate(&mut self, at: u64) -> Option<PeerRate> {
++        let end = if at < WINDOW { at } else { at / BIN * BIN };
++        let known = self
++            .live
++            .iter()
++            .all(|c| c.available && at.saturating_sub(c.at) <= BIN);
++        // Inside a completed 100 ms boundary, newer bytes belong to a future
++        // observation. Ordinary 10 ms host laps do not rescan the same bins.
++        if self.reported == Some((end, known)) {
++            return None;
++        }
++        self.reported = Some((end, known));
++        self.trim(at);
++        let lower = end.saturating_sub(WINDOW);
++        let mut sums = [Some(0_u128); 2];
++        for (i, sum) in sums.iter_mut().enumerate() {
++            if end == 0
++                || !known
++                || self.unknown_at[i].is_some_and(|t| t > lower || (t == 0 && end < WINDOW))
++            {
++                *sum = None;
++                continue;
++            }
++            for bucket in &self.buckets {
++                if at >= WINDOW && bucket.end > end {
++                    break;
++                }
++                let bytes = &bucket.bytes[i];
++                if bytes.gap_start.is_some_and(|start| start < lower) {
++                    *sum = None;
++                    break;
++                }
++                *sum = sum.map(|total| total + bytes.amount);
++            }
++        }
++        Some(PeerRate {
++            peer: self.peer,
++            window_ns: end - lower,
++            received_bytes: sums[0],
++            sent_bytes: sums[1],
++        })
++    }
++}
++
++/// One host's transport accounting, mutated under the existing connection-table
++/// lock in timestamp order. The PATCH identifies a peer's mutable accumulator
++/// slot; only immutable rate observations are shared with readers.
++pub(crate) struct TrafficWindow {
++    started: Mono,
++    slots: PATCH<32, IdentitySchema, usize>,
++    accounts: Vec<Account>,
++    published: HealthRows<32, PeerRate>,
++}
++
++impl TrafficWindow {
++    pub(crate) fn new(started: Mono) -> Self {
++        Self {
++            started,
++            slots: PATCH::new(),
++            accounts: Vec::new(),
++            published: Default::default(),
++        }
++    }
++
++    fn elapsed(&self, now: Mono) -> u64 {
++        now.as_nanos().saturating_sub(self.started.as_nanos())
++    }
++
++    pub(crate) fn connected(&mut self, now: Mono, peer: PeerId, id: u64) {
++        let at = self.elapsed(now);
++        let slot = self.slots.get(&peer).copied().unwrap_or_else(|| {
++            let slot = self.accounts.len();
++            self.accounts.push(Account {
++                peer,
++                live: Vec::new(),
++                last_close: 0,
++                buckets: VecDeque::new(),
++                unknown_at: [None; 2],
++                reported: None,
++            });
++            self.slots.insert(&Entry::with_value(&peer, slot));
++            slot
++        });
++        let account = &mut self.accounts[slot];
++        if !account.live.iter().any(|connection| connection.id == id) {
++            // This is a newly registered transport incarnation. Its lifetime
++            // counters have their own zero, independent of all preceding IDs.
++            account.live.push(Connection {
++                id,
++                at,
++                counts: [0; 2],
++                available: false,
++            });
++        }
++    }
++
++    pub(crate) fn sample(&mut self, now: Mono, peer: PeerId, id: u64, stats: Option<TrafficStats>) {
++        self.observe(now, peer, id, stats, false);
++    }
++
++    pub(crate) fn closed(&mut self, now: Mono, peer: PeerId, id: u64, stats: Option<TrafficStats>) {
++        self.observe(now, peer, id, stats, true);
++    }
++
++    fn observe(
++        &mut self,
++        now: Mono,
++        peer: PeerId,
++        id: u64,
++        stats: Option<TrafficStats>,
++        close: bool,
++    ) {
++        let at = self.elapsed(now);
++        let Some(&slot) = self.slots.get(&peer) else {
++            return;
++        };
++        let account = &mut self.accounts[slot];
++        let Some(idx) = account
++            .live
++            .iter()
++            .position(|connection| connection.id == id)
++        else {
++            return;
++        };
++        account.sample(at, idx, stats);
++        if close {
++            if stats.is_none() {
++                account.unknown_at = [Some(at); 2];
++            }
++            account.reported = None;
++            account.live.swap_remove(idx);
++            account.last_close = at;
++        }
++    }
++
++    pub(crate) fn rates(&mut self, now: Mono) -> HealthRows<32, PeerRate> {
++        let at = self.elapsed(now);
++        let mut slot = 0;
++        while slot < self.accounts.len() {
++            let account = &mut self.accounts[slot];
++            let peer = account.peer;
++            if account.live.is_empty() && at.saturating_sub(account.last_close) >= WINDOW {
++                self.published.remove(&peer);
++                self.slots.remove(&peer);
++                self.accounts.swap_remove(slot);
++                if let Some(moved) = self.accounts.get(slot) {
++                    self.slots.replace(&Entry::with_value(&moved.peer, slot));
++                }
++            } else {
++                if let Some(rate) = account.rate(at) {
++                    self.published.set(&peer, rate);
++                }
++                slot += 1;
++            }
++        }
++        self.published.clone()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::Duration;
++
++    const A: PeerId = [1; 32];
++    const B: PeerId = [2; 32];
++
++    fn bytes(rx: u64, tx: u64) -> Option<TrafficStats> {
++        Some(TrafficStats {
++            received_bytes: rx,
++            sent_bytes: tx,
++            rtt: None,
++        })
++    }
++
++    #[test]
++    fn the_window_includes_offline_time_and_keeps_reconnect_counters_separate() {
++        let origin = crate::clock::mono_now();
++        let t = |ms| origin + Duration::from_millis(ms);
++        let mut w = TrafficWindow::new(origin);
++        w.connected(t(0), A, 7);
++        assert_eq!(
++            w.rates(t(0)).get(&A).unwrap().receive_bytes_per_second(),
++            None
++        );
++        w.sample(t(1900), A, 7, bytes(0, 0));
++        w.closed(t(2000), A, 7, bytes(10_000_000, 5_000_000));
++        let before = w.rates(t(2000));
++        assert_eq!(
++            before.get(&A).unwrap().receive_bytes_per_second(),
++            Some(5_000_000.)
++        );
++        w.closed(t(2001), A, 7, bytes(10_000_000, 5_000_000)); // duplicate final event
++        w.connected(t(2200), B, 8);
++        w.closed(t(2300), B, 8, bytes(11, 7));
++        let ten = w.rates(t(10_000));
++        let a = ten.get(&A).unwrap();
++        assert_eq!(
++            (a.receive_bytes_per_second(), a.send_bytes_per_second()),
++            (Some(1_000_000.), Some(500_000.))
++        );
++        assert_eq!(ten.get(&B).unwrap().received_bytes, Some(11));
++
++        w.connected(t(10_001), A, 9);
++        w.sample(t(10_020), A, 9, bytes(30, 40));
++        w.connected(t(10_025), A, 10);
++        w.closed(t(10_030), A, 10, bytes(20_000_000, 15));
++        w.sample(t(10_040), A, 9, bytes(30, 40)); // repeated transport sample
++        w.closed(t(10_050), A, 9, bytes(31, 41));
++        let after = w.rates(t(10_100));
++        assert_eq!(
++            (
++                after.get(&A).unwrap().received_bytes,
++                after.get(&A).unwrap().sent_bytes
++            ),
++            (Some(30_000_031), Some(5_000_056))
++        );
++        assert_eq!(ten.get(&A).unwrap().received_bytes, Some(10_000_000));
++        assert_eq!(
++            w.rates(t(12_000)).get(&A).unwrap().received_bytes,
++            Some(20_000_031)
++        );
++        assert!(w.rates(t(12_300)).get(&B).is_none());
++        assert!(w.rates(t(20_050)).is_empty());
++        assert!(w.accounts.is_empty() && w.slots.is_empty());
++    }
++
++    #[test]
++    fn gaps_resets_and_unavailable_finals_do_not_manufacture_rates() {
++        let start = crate::clock::mono_now();
++        let t = |ms| start + Duration::from_millis(ms);
++        let mut w = TrafficWindow::new(start);
++        w.connected(t(0), A, 1);
++        w.sample(t(0), A, 1, bytes(0, 0));
++        w.sample(t(25), A, 1, bytes(100, 200));
++        let warm = w.rates(t(25));
++        assert_eq!(
++            (
++                warm.get(&A).unwrap().window_ns,
++                warm.get(&A).unwrap().receive_bytes_per_second()
++            ),
++            (25_000_000, Some(4000.))
++        );
++        w.sample(t(50), A, 1, None);
++        assert_eq!(w.rates(t(50)).get(&A).unwrap().received_bytes, None);
++        w.sample(t(75), A, 1, bytes(105, 220));
++        assert_eq!(w.rates(t(75)).get(&A).unwrap().received_bytes, Some(105));
++        w.sample(t(100), A, 1, bytes(1, 230));
++        let reset = w.rates(t(100));
++        assert_eq!(
++            (
++                reset.get(&A).unwrap().received_bytes,
++                reset.get(&A).unwrap().sent_bytes
++            ),
++            (None, Some(230))
++        );
++        assert_eq!(
++            w.rates(t(12_000)).get(&A).unwrap().sent_bytes,
++            None,
++            "no sample after a long pause"
++        );
++        w.sample(t(12_100), A, 1, bytes(1, 9_000_000));
++        let gap = w.rates(t(12_100));
++        assert_eq!(
++            (
++                gap.get(&A).unwrap().received_bytes,
++                gap.get(&A).unwrap().sent_bytes
++            ),
++            (Some(0), None)
++        );
++        w.sample(t(22_100), A, 1, bytes(1, 9_000_000));
++        let recovered = w.rates(t(22_100));
++        assert_eq!(recovered.get(&A).unwrap().send_bytes_per_second(), Some(0.));
++        w.closed(t(22_200), A, 1, None);
++        assert_eq!(w.rates(t(22_300)).get(&A).unwrap().received_bytes, None);
++        assert!(w.rates(t(32_200)).is_empty());
++    }
++
++    #[test]
++    fn sample_frequency_does_not_grow_history_or_republish_partial_mature_bins() {
++        let start = crate::clock::mono_now();
++        let t = |ms| start + Duration::from_millis(ms);
++        let mut w = TrafficWindow::new(start);
++        w.connected(t(0), A, 1);
++        for tick in 0..=20_000 {
++            w.sample(t(tick), A, 1, bytes(tick, tick * 2));
++        }
++        let at_boundary = w.rates(t(20_000));
++        assert_eq!(at_boundary.get(&A).unwrap().received_bytes, Some(10_000));
++        w.sample(t(20_010), A, 1, bytes(20_010, 40_020));
++        assert!(at_boundary.same_root(&w.rates(t(20_010))));
++        assert!(w.accounts[0].buckets.len() <= (WINDOW / BIN + 1) as usize);
++    }
++}
 diff --git a/triblespace-net/src/health_record.rs b/triblespace-net/src/health_record.rs
 --- a/triblespace-net/src/health_record.rs
 +++ b/triblespace-net/src/health_record.rs
-@@ -548,17 +548,18 @@ mod tests {
+@@ -548,17 +548,19 @@ mod tests {
              node: iroh_base::SecretKey::from_bytes(&[5; 32]).public().into(),
              started_at: Some(at),
              observed_at: Some(at),
 +            connections: Default::default(),
++            traffic_rates: Default::default(),
              store: crate::health::StoreHealth {
                  last_snapshot_observed_at: Some(at),
                  serving_snapshot: true,
@@ -3503,7 +4238,7 @@ diff --git a/triblespace-net/src/health_record.rs b/triblespace-net/src/health_r
          }
      }
  
-@@ -612,13 +613,14 @@ mod tests {
+@@ -612,13 +614,14 @@ mod tests {
              commits: PatchSummary::new(Some([5; 32]), 10).unwrap(),
              derives: PatchSummary::new(None, 0).unwrap(),
          };
@@ -3521,7 +4256,7 @@ diff --git a/triblespace-net/src/health_record.rs b/triblespace-net/src/health_r
              collection,
              peer: remote_key,
              asked: true,
-@@ -630,14 +632,14 @@ mod tests {
+@@ -630,14 +633,14 @@ mod tests {
          });
          // Both sides hold the same two grants over C.
          let agreed = PatchSummary::new(Some([6; 32]), 2).unwrap();
@@ -3538,7 +4273,7 @@ diff --git a/triblespace-net/src/health_record.rs b/triblespace-net/src/health_r
          });
          let health = Health::new(sample.node);
          health.update(|value| *value = sample);
-@@ -683,7 +685,7 @@ mod tests {
+@@ -683,7 +686,7 @@ mod tests {
              pair.received(at, WalkKind::Commit, None, true);
              pair.pushed(now, WalkKind::Commit, frontier.commits, false);
          });
@@ -3547,7 +4282,7 @@ diff --git a/triblespace-net/src/health_record.rs b/triblespace-net/src/health_r
          let condition = collection_condition(&health, now);
          assert_eq!(condition.state, State::Stalled);
          assert!(condition.alert);
-@@ -734,8 +736,8 @@ mod tests {
+@@ -734,8 +737,8 @@ mod tests {
              health.update(|sample| {
                  sample.observed_at = Some(now);
                  sample.store.last_snapshot_observed_at = Some(now);
@@ -3558,7 +4293,7 @@ diff --git a/triblespace-net/src/health_record.rs b/triblespace-net/src/health_r
              });
              // The push that ends now pinned the tree before this write.
              health.with_peer(collection, remote_key, |pair| {
-@@ -827,8 +829,8 @@ mod tests {
+@@ -827,8 +830,8 @@ mod tests {
                      peer: remote_key,
                      listed: Some(listed),
                      ..Default::default()
@@ -3674,16 +4409,19 @@ diff --git a/triblespace-net/src/host.rs b/triblespace-net/src/host.rs
      tokio::spawn(async move {
          while let Some(accepted) = incoming.recv().await {
              debug!(
-@@ -1490,7 +1488,9 @@ async fn host_loop<T: Transport, R>(
+@@ -1490,8 +1488,11 @@ async fn host_loop<T: Transport, R>(
          }
  
          let progress = publisher.progress();
-+        let connections = observed_connections.observations();
++        let (observed_at, connections, traffic_rates) = observed_connections.observe_traffic();
          wiring.health.update(|health| {
+-            health.observed_at = Some(crate::clock::mono_now());
 +            health.connections.reconcile(connections);
-             health.observed_at = Some(crate::clock::mono_now());
++            health.traffic_rates = traffic_rates;
++            health.observed_at = Some(observed_at);
              let publication = &mut health.publication;
              publication.resident = progress.resident;
+             publication.startup_pending = progress.startup_pending;
 diff --git a/triblespace-net/src/host/acquisition_tests/exact_h_diagnostics.rs b/triblespace-net/src/host/acquisition_tests/exact_h_diagnostics.rs
 --- a/triblespace-net/src/host/acquisition_tests/exact_h_diagnostics.rs
 +++ b/triblespace-net/src/host/acquisition_tests/exact_h_diagnostics.rs
