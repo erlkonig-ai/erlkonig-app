@@ -118,12 +118,8 @@ impl Model {
     }
     pub fn number_of_rows(&self, section: isize) -> isize {
         let count = if self.screen == Screen::Sync {
-            if section == 1 && self.acknowledged() && self.foreground && self.status.error.is_none()
-            {
-                self.status
-                    .network
-                    .as_ref()
-                    .map_or(0, |n| n.connections.len())
+            if section == 1 {
+                self.peer_observation().map_or(0, |n| n.connections.len())
             } else {
                 0
             }
@@ -155,24 +151,27 @@ impl Model {
                 .unwrap_or(Item::Loading);
         }
         if self.screen == Screen::Sync {
-            let Some(c) = self
-                .status
-                .network
-                .as_ref()
-                .and_then(|n| n.connections.get(index))
+            let Some(c) = self.peer_observation().and_then(|n| n.connections.get(index))
             else {
                 return Item::Loading;
             };
-            let fresh = self.fresh_network();
-            let rx = rate(c.receive_bytes_per_second.filter(|_| fresh));
-            let tx = rate(c.send_bytes_per_second.filter(|_| fresh));
+            let rx = rate(c.receive_bytes_per_second);
+            let tx = rate(c.send_bytes_per_second);
             let rtt = c
                 .rtt_ms
-                .filter(|_| fresh)
                 .map_or_else(String::new, |v| format!("\nRTT ≈ {v:.0} ms"));
+            let last = if !self.fresh_network()
+                && (c.receive_bytes_per_second.is_some()
+                    || c.send_bytes_per_second.is_some()
+                    || c.rtt_ms.is_some())
+            {
+                "Last measured\n"
+            } else {
+                ""
+            };
             return Item::Copy(
                 abbrev(&c.peer),
-                format!("↓ {rx}     ↑ {tx}{rtt}"),
+                format!("{last}↓ {rx}     ↑ {tx}{rtt}"),
                 c.peer.clone(),
             );
         }

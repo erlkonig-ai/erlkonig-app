@@ -667,7 +667,12 @@ impl Model {
                             != old.composition.as_ref().map(Arc::as_ptr)
                 }
                 Screen::Sync => {
-                    next.network.as_ref().map(Arc::as_ptr) != old.network.as_ref().map(Arc::as_ptr)
+                    next.activity_serial != old.activity_serial || match (&next.network, &old.network) {
+                        (Some(a), Some(b)) => !Arc::ptr_eq(a, b)
+                            && (a.host_epoch != b.host_epoch || a.connections != b.connections),
+                        (None, None) => false,
+                        _ => true,
+                    }
                 }
                 _ => false,
             };
@@ -765,15 +770,15 @@ impl Model {
             .filter(|p| p.unknown_roots == 0 && p.direct_present < p.records)
             .map(|p| (p.direct_present, p.records))
     }
+    pub fn peer_observation(&self) -> Option<&crate::network::Observation> {
+        if self.foreground && self.acknowledged() && self.status.error.is_none() {
+            self.status.network.as_deref()
+        } else {
+            None
+        }
+    }
     pub fn fresh_network(&self) -> bool {
-        self.foreground
-            && self.acknowledged()
-            && self.status.error.is_none()
-            && self
-                .status
-                .network
-                .as_ref()
-                .is_some_and(|n| n.age_ms() <= 5000)
+        self.peer_observation().is_some_and(|n| n.age_ms() <= 5000)
     }
     pub fn phase(&self) -> String {
         let s = &self.status;
@@ -810,16 +815,16 @@ impl Model {
             }
             return "Reading local data".into();
         }
-        if let Some(n) = &s.network {
-            if !self.fresh_network() {
-                return "Waiting for update".into();
-            }
-            return match n.connections.len() {
-                0 if s.listening => "Listening".into(),
-                0 => "No connected nodes".into(),
+        if let Some(n) = self.peer_observation() {
+            let fresh = self.fresh_network();
+            let count = match n.connections.len() {
+                0 if fresh && s.listening => return "Listening".into(),
+                0 if fresh => return "No connected nodes".into(),
+                0 => "no connected nodes".into(),
                 1 => "1 connected node".into(),
                 count => format!("{count} connected nodes"),
             };
+            return if fresh { count } else { format!("Last observed · {count}") };
         }
         if s.running && (s.listening || s.selected > 0) {
             "Starting network"

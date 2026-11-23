@@ -131,26 +131,30 @@ impl Fixture {
             status.network = Some(Arc::new(Observation {
                 host_epoch: 1,
                 sampled_at: triblespace_net::clock::mono_now().as_nanos(),
-                connections: vec![
-                    Connection {
-                        id: 1,
-                        peer: "2a".repeat(32),
-                        received_bytes: None,
-                        sent_bytes: None,
-                        receive_bytes_per_second: Some(1_250_000.),
-                        send_bytes_per_second: Some(32_000.),
-                        rtt_ms: Some(12.),
-                    },
-                    Connection {
-                        id: 2,
-                        peer: "3b".repeat(32),
-                        received_bytes: None,
-                        sent_bytes: None,
-                        receive_bytes_per_second: None,
-                        send_bytes_per_second: None,
-                        rtt_ms: None,
-                    },
-                ],
+                connections: if has("--sync-fixture-empty") {
+                    Vec::new()
+                } else {
+                    vec![
+                        Connection {
+                            id: 1,
+                            peer: "2a".repeat(32),
+                            received_bytes: None,
+                            sent_bytes: None,
+                            receive_bytes_per_second: Some(1_250_000.),
+                            send_bytes_per_second: Some(32_000.),
+                            rtt_ms: Some(12.),
+                        },
+                        Connection {
+                            id: 2,
+                            peer: "3b".repeat(32),
+                            received_bytes: None,
+                            sent_bytes: None,
+                            receive_bytes_per_second: None,
+                            send_bytes_per_second: None,
+                            rtt_ms: None,
+                        },
+                    ]
+                },
             }));
         }
         Self {
