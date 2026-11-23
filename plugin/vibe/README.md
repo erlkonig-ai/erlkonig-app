@@ -1,15 +1,26 @@
 # Erlkonig with Mistral Vibe CLI
 
-Use the running headless Erlkonig node from Vibe in the same Podman pod.
-The two containers share loopback. Only Erlkonig needs its data volume.
-See the [container setup](../../container/README.md) for starting the node
-and passing its bearer to the Vibe container as `ERLKONIG_MCP_TOKEN`.
+Use a headless Erlkonig node from your existing Vibe pod. The client needs
+its private service URL and its bearer in `ERLKONIG_MCP_TOKEN`. Only the
+owner mounts the node's data. Follow the [container setup](../../container/README.md)
+to start the owner, attach the two pods and pass the secret to Vibe.
 Use a persistent Vibe home if you want the setup to survive container replacement.
 
 ## Connect
 
-Run this once in the Vibe environment. Use the node's configured port if it
-differs from the default.
+For separate pods on the trusted same-host internal network, run this in
+the Vibe environment. If your client uses an HTTP proxy, include
+`erlkonig-mcp` in both `NO_PROXY` and `no_proxy` for the Vibe process.
+
+```sh
+vibe mcp add erlkonig --url http://erlkonig-mcp:41773/ \
+  --transport streamable-http --api-key-env ERLKONIG_MCP_TOKEN --allow-insecure-http
+```
+
+The last option permits plaintext to this service alias for this registration.
+Use TLS for links crossing hosts or untrusted networks. If Vibe and Erlkonig
+share one pod, use loopback instead. Adjust the port if the node uses a
+different one.
 
 ```sh
 vibe mcp add erlkonig --url http://127.0.0.1:41773/ \
