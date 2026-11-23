@@ -148,9 +148,10 @@ pub fn run(root: &Path) -> Result<serde_json::Value> {
             let snapshot = reader.snapshot()?;
             let has_record = snapshot.records()?.any(|value| value.is_ok_and(|value| value == record));
             observed_source |= health.snapshot().is_some_and(|h| {
-                h.observed_at.is_some()
-                    && h.connections.get(source_key.verifying_key().as_bytes())
-                        .and_then(|c| c.traffic).is_some_and(|t| t.received_bytes > 0)
+                let key = source_key.verifying_key();
+                h.observed_at.is_some() && h.connections.get(key.as_bytes()).is_some()
+                    && h.traffic_rates.get(key.as_bytes())
+                        .and_then(|row| row.receive_bytes_per_second()).is_some_and(|v| v > 0.)
             });
             if observed_source && has_record && snapshot.contains_blob(handle)? { break true; }
             if Instant::now() >= deadline { break false; }
@@ -162,7 +163,7 @@ pub fn run(root: &Path) -> Result<serde_json::Value> {
         source_endpoint.close().await; reader_endpoint.close().await;
         source.flush()?; reader.flush()?;
         source.close()?; reader.close()?;
-        ensure!(observed_source, "passive peer health did not observe the authenticated loopback source");
+        ensure!(observed_source, "no measured receive rate for the authenticated loopback source");
         ensure!(health.snapshot().is_none(), "closed reader still publishes health");
         if !transferred { bail!("Full replication did not land record and large referenced UTF-8 blob within 45 seconds"); }
         Ok::<_, anyhow::Error>(())
@@ -200,7 +201,7 @@ pub fn run(root: &Path) -> Result<serde_json::Value> {
     drop(restored);
     drop(snapshot);
     reopened.close()?;
-    let report = serde_json::json!({"source_off_read":true,"identity_reopened":true,"observed_source_peer":true,
+    let report = serde_json::json!({"source_off_read":true,"identity_reopened":true,"observed_source_rate":true,
         "explicit_read_grant":true,"selection_reopened":true,"payload_bytes":payload.len(),
         "reader_node_id":hex::encode(reader_id.as_bytes()),"collection":hex::encode(collection.raw),
         "payload":hex::encode(handle.raw)});

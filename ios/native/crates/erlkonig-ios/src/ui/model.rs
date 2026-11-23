@@ -811,7 +811,7 @@ impl Model {
         }
         if let Some(n) = self.peer_observation() {
             let fresh = self.fresh_network();
-            let count = match n.len() {
+            let count = match n.connected_count() {
                 0 if fresh && s.listening => return "Listening".into(),
                 0 => "No connected nodes".into(),
                 1 => "1 connected node".into(),

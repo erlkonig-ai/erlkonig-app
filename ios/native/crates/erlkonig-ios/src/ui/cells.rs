@@ -160,7 +160,8 @@ impl Model {
             let rtt = c
                 .rtt_ms
                 .map_or_else(String::new, |v| format!("\nRTT ≈ {v:.0} ms"));
-            let last = if !self.fresh_network()
+            let fresh = self.fresh_network();
+            let last = if !fresh
                 && (c.receive_bytes_per_second.is_some()
                     || c.send_bytes_per_second.is_some()
                     || c.rtt_ms.is_some())
@@ -169,9 +170,14 @@ impl Model {
             } else {
                 ""
             };
+            let disconnected = match (c.connected, fresh) {
+                (true, _) => "",
+                (false, true) => "No current connection\n",
+                (false, false) => "No connection at last observation\n",
+            };
             return Item::Copy(
                 abbrev(&c.peer),
-                format!("{last}↓ {rx}     ↑ {tx}{rtt}"),
+                format!("{disconnected}{last}10 s window · ↓ {rx}     ↑ {tx}{rtt}"),
                 c.peer,
             );
         }

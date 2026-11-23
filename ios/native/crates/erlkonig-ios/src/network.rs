@@ -5,8 +5,7 @@ use triblespace_net::{
     health::{HealthReader, HealthSnapshot},
 };
 
-/// The worker publishes this binding once when it acquires a peer. It carries
-/// no transport, store or authority to write health.
+/// The worker publishes this binding once when it acquires a peer.
 pub(crate) struct Session {
     pub serial: u64,
     pub reader: HealthReader,
@@ -14,21 +13,12 @@ pub(crate) struct Session {
 
 pub(crate) struct Observation {
     pub(crate) sampled_at: Mono,
-    rows: Rows,
+    current: Arc<HealthSnapshot>,
 }
 
-enum Rows {
-    Native {
-        current: Arc<HealthSnapshot>,
-        baseline: Option<Arc<HealthSnapshot>>,
-    },
-    #[cfg(feature = "synthetic-proof")]
-    Visual(Vec<Connection>),
-}
-
-#[derive(Clone)]
 pub(crate) struct Connection {
     pub peer: String,
+    pub connected: bool,
     pub receive_bytes_per_second: Option<f64>,
     pub send_bytes_per_second: Option<f64>,
     pub rtt_ms: Option<f64>,
@@ -39,104 +29,81 @@ impl Observation {
         mono_now().duration_since(self.sampled_at).as_millis() as u64
     }
 
+    pub fn connected_count(&self) -> usize {
+        self.current.connections.len()
+    }
+
     pub fn len(&self) -> usize {
-        match &self.rows {
-            Rows::Native { current, .. } => current.connections.len(),
-            #[cfg(feature = "synthetic-proof")]
-            Rows::Visual(rows) => rows.len(),
-        }
+        self.current.traffic_rates.len()
     }
 
     pub fn row(&self, index: usize) -> Option<Connection> {
-        match &self.rows {
-            Rows::Native { current, baseline } => {
-                let row = current.connections.iter().nth(index)?;
-                let rates = baseline.as_deref().and_then(|old| {
-                    let before = old.connections.get(&row.peer)?;
-                    if before.id != row.id {
-                        return None;
-                    }
-                    let (before, after) = (before.traffic?, row.traffic?);
-                    let seconds = self
-                        .sampled_at
-                        .duration_since(old.observed_at?)
-                        .as_secs_f64();
-                    if seconds == 0.0 {
-                        return None;
-                    }
-                    let rx = after.received_bytes.checked_sub(before.received_bytes)?;
-                    let tx = after.sent_bytes.checked_sub(before.sent_bytes)?;
-                    Some((rx as f64 / seconds, tx as f64 / seconds))
-                });
-                Some(Connection {
-                    peer: hex::encode(row.peer),
-                    receive_bytes_per_second: rates.map(|v| v.0),
-                    send_bytes_per_second: rates.map(|v| v.1),
-                    rtt_ms: row
-                        .traffic
-                        .and_then(|t| t.rtt)
-                        .map(|v| v.as_secs_f64() * 1000.),
-                })
-            }
-            #[cfg(feature = "synthetic-proof")]
-            Rows::Visual(rows) => rows.get(index).cloned(),
-        }
+        let rate = self.current.traffic_rates.iter().nth(index)?;
+        let connection = self.current.connections.get(&rate.peer);
+        Some(Connection {
+            peer: hex::encode(rate.peer),
+            connected: connection.is_some(),
+            receive_bytes_per_second: rate.receive_bytes_per_second(),
+            send_bytes_per_second: rate.send_bytes_per_second(),
+            rtt_ms: connection
+                .and_then(|c| c.traffic)
+                .and_then(|t| t.rtt)
+                .map(|rtt| rtt.as_secs_f64() * 1000.),
+        })
     }
 
-    /// Keep only two observed cuts. Calculating a rate or formatting a peer ID
-    /// is deferred until UIKit asks for that row. The return value invalidates
-    /// table content; age/freshness is tracked separately by its rendering key.
+    /// Keep one native cut. A newer heartbeat can update freshness without
+    /// invalidating the table. Formatting happens only for requested rows.
     pub(crate) fn update(view: &mut Option<Self>, snapshot: Option<Arc<HealthSnapshot>>) -> bool {
-        let Some((current, stamp)) = snapshot.and_then(|s| {
-            let stamp = s.started_at.and(s.observed_at)?;
-            Some((s, stamp))
+        let Some((current, sampled_at)) = snapshot.and_then(|s| {
+            let at = s.started_at.and(s.observed_at)?;
+            Some((s, at))
         }) else {
             return view.take().is_some();
         };
         let mut changed = true;
-        let mut baseline = None;
-        if let Some(Self {
-            sampled_at,
-            rows:
-                Rows::Native {
-                    current: old,
-                    baseline: previous,
-                },
-        }) = view.as_ref()
-        {
-            if Arc::ptr_eq(old, &current) {
+        if let Some(old) = view.as_ref() {
+            if Arc::ptr_eq(&old.current, &current) {
                 return false;
             }
-            if old.started_at == current.started_at {
-                let same_rows = old.connections.same_root(&current.connections);
-                if stamp < *sampled_at || (same_rows && *sampled_at == stamp) {
+            if old.current.started_at == current.started_at {
+                if sampled_at < old.sampled_at {
                     return false;
                 }
-                if stamp > *sampled_at {
-                    // The first equal counter pair can establish zero rates. Once
-                    // both ends already have the same rows, even that change is done.
-                    changed = !same_rows
-                        || (!old.connections.is_empty()
-                            && !previous
-                                .as_ref()
-                                .is_some_and(|p| p.connections.same_root(&old.connections)));
-                    baseline = Some(old.clone());
-                }
+                changed = !old.current.traffic_rates.same_root(&current.traffic_rates)
+                    || !old.current.connections.same_root(&current.connections);
             }
         }
         *view = Some(Self {
-            sampled_at: stamp,
-            rows: Rows::Native { current, baseline },
+            current,
+            sampled_at,
         });
         changed
     }
+}
 
-    #[cfg(feature = "synthetic-proof")]
-    pub(crate) fn visual(rows: Vec<Connection>) -> Self {
-        Self {
-            sampled_at: mono_now(),
-            rows: Rows::Visual(rows),
-        }
+#[cfg(any(test, feature = "synthetic-proof"))]
+pub(crate) fn synthetic_health() -> HealthSnapshot {
+    let now = mono_now();
+    HealthSnapshot {
+        node: hex::encode(
+            ed25519_dalek::SigningKey::from_bytes(&[41; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
+        .parse()
+        .unwrap(),
+        started_at: Some(now),
+        observed_at: Some(now),
+        connections: Default::default(),
+        traffic_rates: Default::default(),
+        store: Default::default(),
+        collections: Default::default(),
+        publication: Default::default(),
+        blob_serving: Default::default(),
+        peerings: Default::default(),
+        grants: Default::default(),
+        named_unselected: Default::default(),
     }
 }
 
@@ -144,162 +111,113 @@ impl Observation {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use triblespace_net::{health::ConnectionHealth, transport::TrafficStats};
+    use triblespace_net::{
+        health::{ConnectionHealth, PeerRate},
+        transport::TrafficStats,
+    };
 
-    fn health() -> HealthSnapshot {
-        let now = mono_now();
-        HealthSnapshot {
-            node: hex::encode(
-                ed25519_dalek::SigningKey::from_bytes(&[41; 32])
-                    .verifying_key()
-                    .as_bytes(),
-            )
-            .parse()
-            .unwrap(),
-            started_at: Some(now),
-            observed_at: Some(now),
-            connections: Default::default(),
-            store: Default::default(),
-            collections: Default::default(),
-            publication: Default::default(),
-            blob_serving: Default::default(),
-            peerings: Default::default(),
-            grants: Default::default(),
-            named_unselected: Default::default(),
+    fn rate(peer: u8, received_bytes: Option<u128>, sent_bytes: Option<u128>) -> PeerRate {
+        PeerRate {
+            peer: [peer; 32],
+            received_bytes,
+            sent_bytes,
+            window_ns: 10_000_000_000,
         }
     }
-    fn row(id: u64, rx: u64, tx: u64) -> ConnectionHealth {
+    fn socket(id: u64) -> ConnectionHealth {
         ConnectionHealth {
-            id,
             peer: [42; 32],
+            id,
             traffic: Some(TrafficStats {
-                received_bytes: rx,
-                sent_bytes: tx,
+                received_bytes: id * 1000,
+                sent_bytes: id * 1000,
                 rtt: Some(Duration::from_millis(12)),
             }),
         }
     }
-    #[test]
-    fn rates_follow_only_matching_advancing_observations() {
-        let mut h = health();
-        let mut frame = None;
-        let first = |frame: &Option<Observation>| frame.as_ref().unwrap().row(0).unwrap();
-        h.connections = [row(7, 100, 200)].into_iter().collect();
-        Observation::update(&mut frame, Some(Arc::new(h.clone())));
-        assert!(first(&frame).receive_bytes_per_second.is_none());
-        h.observed_at = h.observed_at.map(|t| t + Duration::from_secs(2));
-        h.connections = [row(7, 1100, 700)].into_iter().collect();
-        Observation::update(&mut frame, Some(Arc::new(h.clone())));
-        assert_eq!(first(&frame).receive_bytes_per_second, Some(500.));
-        assert_eq!(first(&frame).send_bytes_per_second, Some(250.));
-        assert!(!Observation::update(&mut frame, Some(Arc::new(h.clone()))));
-        assert_eq!(first(&frame).receive_bytes_per_second, Some(500.));
-        h.connections = [row(7, 1101, 700)].into_iter().collect();
-        Observation::update(&mut frame, Some(Arc::new(h.clone())));
-        assert!(first(&frame).receive_bytes_per_second.is_none());
-        h.observed_at = h.observed_at.map(|t| t + Duration::from_secs(1));
-        h.connections = [row(8, 1200, 710)].into_iter().collect();
-        Observation::update(&mut frame, Some(Arc::new(h.clone())));
-        assert!(first(&frame).receive_bytes_per_second.is_none());
-        h.started_at = h.started_at.map(|t| t + Duration::from_nanos(1));
-        h.observed_at = h.observed_at.map(|t| t + Duration::from_secs(1));
-        Observation::update(&mut frame, Some(Arc::new(h)));
-        assert!(first(&frame).receive_bytes_per_second.is_none());
-    }
 
     #[test]
-    fn reconnect_keeps_one_row_for_the_peer_without_carrying_its_rate() {
-        let mut health = health();
-        let mut frame = None;
-        let stable = |rx, tx| ConnectionHealth {
-            peer: [1; 32],
-            ..row(90, rx, tx)
-        };
-        health.connections = [row(7, 20, 25), stable(100, 80)].into_iter().collect();
-        Observation::update(&mut frame, Some(Arc::new(health.clone())));
-        health.observed_at = health.observed_at.map(|at| at + Duration::from_secs(1));
-        // The new connection already has larger counters than its predecessor.
-        health.connections = [row(8, 400, 300), stable(150, 90)].into_iter().collect();
-        Observation::update(&mut frame, Some(Arc::new(health.clone())));
-        let view = frame.as_ref().unwrap();
-        assert_eq!(view.len(), 2);
-        let other = view.row(0).unwrap();
-        assert_eq!(other.peer, "01".repeat(32)); // Peer order, independent of local ids.
-        assert_eq!(other.receive_bytes_per_second, Some(50.));
-        assert_eq!(other.send_bytes_per_second, Some(10.));
-        let reconnected = view.row(1).unwrap();
-        assert_eq!(reconnected.peer, "2a".repeat(32));
-        assert!(reconnected.receive_bytes_per_second.is_none());
-        assert!(reconnected.send_bytes_per_second.is_none());
-        assert_eq!(reconnected.rtt_ms, Some(12.));
-        health.observed_at = health.observed_at.map(|at| at + Duration::from_secs(2));
-        health.connections = [row(8, 500, 330), stable(250, 110)].into_iter().collect();
-        Observation::update(&mut frame, Some(Arc::new(health)));
-        let reconnected = frame.as_ref().unwrap().row(1).unwrap();
-        assert_eq!(reconnected.receive_bytes_per_second, Some(50.));
-        assert_eq!(reconnected.send_bytes_per_second, Some(15.));
-    }
-
-    #[test]
-    fn counter_reset_and_closed_rows_do_not_become_traffic() {
-        let mut h = health();
-        let mut frame = None;
-        h.connections = [row(7, 100, 200)].into_iter().collect();
-        Observation::update(&mut frame, Some(Arc::new(h.clone())));
-        h.observed_at = h.observed_at.map(|t| t + Duration::from_secs(1));
-        h.connections = [row(7, 0, 210)].into_iter().collect();
-        Observation::update(&mut frame, Some(Arc::new(h.clone())));
-        let reset = frame.as_ref().unwrap().row(0).unwrap();
-        assert!(reset.receive_bytes_per_second.is_none() && reset.send_bytes_per_second.is_none());
-        h.connections = Default::default();
-        Observation::update(&mut frame, Some(Arc::new(h.clone())));
-        assert_eq!(frame.as_ref().unwrap().len(), 0);
-        h.started_at = None;
-        Observation::update(&mut frame, Some(Arc::new(h)));
-        assert!(frame.is_none());
-    }
-    #[test]
-    fn new_evidence_outside_the_connection_rows_keeps_identical_rendering() {
-        let mut h = health();
-        h.connections = [row(1, 12, 34)].into_iter().collect();
+    fn first_screen_read_shows_the_full_native_window_in_peer_order() {
+        let mut h = synthetic_health();
+        h.connections = [socket(7)].into_iter().collect();
+        h.traffic_rates = [rate(42, Some(50_000), Some(0)), rate(1, None, Some(500))]
+            .into_iter()
+            .collect();
         let mut view = None;
-        assert!(Observation::update(&mut view, Some(Arc::new(h.clone()))));
-        h.observed_at = h.observed_at.map(|t| t + Duration::from_secs(1));
-        assert!(Observation::update(&mut view, Some(Arc::new(h.clone())))); // Missing → measured zero.
-        assert_eq!(
-            view.as_ref()
-                .unwrap()
-                .row(0)
-                .unwrap()
-                .receive_bytes_per_second,
-            Some(0.)
-        );
-        h.store.serving_snapshot = true;
-        assert!(!Observation::update(&mut view, Some(Arc::new(h.clone()))));
-        h.observed_at = h.observed_at.map(|t| t + Duration::from_secs(1));
-        assert!(!Observation::update(&mut view, Some(Arc::new(h.clone()))));
-        let latest = view.as_ref().unwrap().sampled_at;
-        h.observed_at = h.started_at;
-        assert!(!Observation::update(&mut view, Some(Arc::new(h))));
-        assert_eq!(view.unwrap().sampled_at, latest);
+        assert!(Observation::update(&mut view, Some(Arc::new(h))));
+        let view = view.unwrap();
+        assert_eq!(view.connected_count(), 1);
+        assert_eq!(view.len(), 2);
+        let recent = view.row(0).unwrap();
+        assert_eq!(recent.peer, "01".repeat(32));
+        assert!(!recent.connected);
+        assert_eq!(recent.rtt_ms, None);
+        assert_eq!(recent.receive_bytes_per_second, None);
+        assert_eq!(recent.send_bytes_per_second, Some(50.));
+        let active = view.row(1).unwrap();
+        assert!(active.connected);
+        assert_eq!(active.receive_bytes_per_second, Some(5000.));
+        assert_eq!(active.send_bytes_per_second, Some(0.));
+        assert_eq!(active.rtt_ms, Some(12.));
     }
 
     #[test]
-    fn a_pinned_rate_and_rtt_outlive_replacement_without_refreshing_the_clock() {
-        let mut h = health();
-        let mut frame = None;
-        h.connections = [row(7, 100, 200)].into_iter().collect();
-        Observation::update(&mut frame, Some(Arc::new(h.clone())));
-        h.observed_at = h.observed_at.map(|t| t + Duration::from_secs(1));
-        h.connections = [row(7, 4196, 200)].into_iter().collect();
+    fn disconnect_and_reconnect_read_the_published_peer_window_without_a_local_baseline() {
+        let mut h = synthetic_health();
+        h.connections = [socket(1)].into_iter().collect();
+        h.traffic_rates = [rate(42, Some(40_000), Some(100))].into_iter().collect();
         let pinned = Arc::new(h.clone());
-        Observation::update(&mut frame, Some(pinned.clone()));
-        let net = frame.unwrap();
-        let at = net.sampled_at;
+        let mut view = None;
+        Observation::update(&mut view, Some(pinned.clone()));
         h.connections = Default::default();
-        assert_eq!(pinned.connections.len(), 1);
-        assert_eq!(net.row(0).unwrap().receive_bytes_per_second, Some(4096.));
-        assert_eq!(net.row(0).unwrap().rtt_ms, Some(12.));
-        assert_eq!(net.sampled_at, at);
+        h.observed_at = h.observed_at.map(|at| at + Duration::from_secs(2));
+        assert!(Observation::update(&mut view, Some(Arc::new(h.clone()))));
+        let recent = view.as_ref().unwrap();
+        assert_eq!(recent.connected_count(), 0);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent.row(0).unwrap().receive_bytes_per_second, Some(4000.));
+        assert_eq!(recent.row(0).unwrap().rtt_ms, None);
+        h.observed_at = h.observed_at.map(|at| at + Duration::from_secs(1));
+        h.connections = [socket(99)].into_iter().collect();
+        h.traffic_rates = [rate(42, Some(30_000), None)].into_iter().collect();
+        let new = Arc::new(h);
+        assert!(Observation::update(&mut view, Some(new.clone())));
+        assert_eq!(view.as_ref().unwrap().connected_count(), 1);
+        let row = view.as_ref().unwrap().row(0).unwrap();
+        assert_eq!(row.receive_bytes_per_second, Some(3000.));
+        assert_eq!(row.send_bytes_per_second, None);
+        assert_eq!(row.rtt_ms, Some(12.));
+        assert!(!Observation::update(&mut view, Some(new)));
+        assert_eq!(pinned.connections.get(&[42; 32]).unwrap().id, 1);
+        assert_eq!(
+            pinned
+                .traffic_rates
+                .get(&[42; 32])
+                .unwrap()
+                .receive_bytes_per_second(),
+            Some(4000.)
+        );
+    }
+
+    #[test]
+    fn only_displayed_roots_invalidate_the_table_and_only_host_time_advances_freshness() {
+        let mut h = synthetic_health();
+        let mut view = None;
+        h.traffic_rates = [rate(42, Some(100), Some(0))].into_iter().collect();
+        assert!(Observation::update(&mut view, Some(Arc::new(h.clone()))));
+        h.store.serving_snapshot = true;
+        h.observed_at = h.observed_at.map(|at| at + Duration::from_secs(1));
+        assert!(!Observation::update(&mut view, Some(Arc::new(h.clone()))));
+        let at = view.as_ref().unwrap().sampled_at;
+        h.observed_at = h.started_at;
+        assert!(!Observation::update(&mut view, Some(Arc::new(h.clone()))));
+        assert_eq!(view.as_ref().unwrap().sampled_at, at);
+        h.observed_at = Some(at + Duration::from_secs(10));
+        h.traffic_rates = Default::default();
+        assert!(Observation::update(&mut view, Some(Arc::new(h.clone()))));
+        assert_eq!(view.as_ref().unwrap().len(), 0);
+        h.observed_at = None;
+        assert!(Observation::update(&mut view, Some(Arc::new(h))));
+        assert!(view.is_none());
     }
 }

@@ -2,7 +2,7 @@
 use crate::{
     ReplayProgress, Status, SyncProgress,
     collections::{PAGE_SIZE, Page, Row},
-    network::{Connection, Observation},
+    network::Observation,
     storage::{self, Counts},
 };
 use std::sync::Arc;
@@ -129,24 +129,54 @@ impl Fixture {
             });
         }
         let peer_observation = has("--sync-fixture").then(|| {
-            Observation::visual(if has("--sync-fixture-empty") {
-                Vec::new()
-            } else {
-                vec![
-                    Connection {
-                        peer: "2a".repeat(32),
-                        receive_bytes_per_second: Some(1_250_000.),
-                        send_bytes_per_second: Some(32_000.),
-                        rtt_ms: Some(12.),
+            use triblespace_net::health::{ConnectionHealth, PeerRate};
+            use triblespace_net::transport::TrafficStats;
+            let mut snapshot = crate::network::synthetic_health();
+            if !has("--sync-fixture-empty") {
+                snapshot.connections = [
+                    ConnectionHealth {
+                        peer: [42; 32],
+                        id: 2,
+                        traffic: Some(TrafficStats {
+                            received_bytes: 100,
+                            sent_bytes: 50,
+                            rtt: Some(std::time::Duration::from_millis(12)),
+                        }),
                     },
-                    Connection {
-                        peer: "3b".repeat(32),
-                        receive_bytes_per_second: None,
-                        send_bytes_per_second: None,
-                        rtt_ms: None,
+                    ConnectionHealth {
+                        peer: [59; 32],
+                        id: 1,
+                        traffic: None,
                     },
                 ]
-            })
+                .into_iter()
+                .collect();
+                snapshot.traffic_rates = [
+                    PeerRate {
+                        peer: [42; 32],
+                        received_bytes: Some(12_500_000),
+                        sent_bytes: Some(320_000),
+                        window_ns: 10_000_000_000,
+                    },
+                    PeerRate {
+                        peer: [59; 32],
+                        received_bytes: None,
+                        sent_bytes: None,
+                        window_ns: 10_000_000_000,
+                    },
+                    PeerRate {
+                        peer: [76; 32],
+                        received_bytes: Some(2_560),
+                        sent_bytes: Some(0),
+                        window_ns: 10_000_000_000,
+                    },
+                ]
+                .into_iter()
+                .collect();
+            }
+            let mut sampled = None;
+            Observation::update(&mut sampled, Some(Arc::new(snapshot)));
+            sampled.expect("fixture has a host timestamp")
         });
         Self {
             rows,
