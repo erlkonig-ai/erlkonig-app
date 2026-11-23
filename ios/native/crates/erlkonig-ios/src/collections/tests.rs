@@ -127,10 +127,19 @@ fn prefix_choices_distinguish_unseen_config_missing_payload_and_resident_corrupt
         let mut reader = Pile::open_as(&path, phone.verifying_key())?;
         let mut states = Vec::new();
         let mut failed = false;
+        let mut cached = None;
         loop {
             let (snapshot, complete) = reader.snapshot_step(1)?;
             let page = if complete { project(&snapshot, phone.verifying_key(), 0, PAGE_SIZE) }
                 else { project_prefix(&snapshot, phone.verifying_key(), 0, PAGE_SIZE) };
+            if !complete {
+                let reused = PrefixPage::observe(&mut cached, &snapshot, phone.verifying_key(), 0);
+                match (&page, reused) {
+                    (Ok(expected), Ok(actual)) => assert_eq!(serde_json::to_value(expected)?, serde_json::to_value(actual)?),
+                    (Err(_), Err(_)) => {}
+                    _ => panic!("cached catalog disagreed with independent projection at byte {}", snapshot.prefix_len()),
+                }
+            }
             match page {
                 Ok(page) => {
                     if let Some(row) = page.rows.iter().find(|row| row.root == hex::encode(root.handle().raw)) {
@@ -169,4 +178,29 @@ fn native_count_failure_is_local_and_prefix_zero_is_a_known_count() {
     assert_eq!(failed.1.as_deref(), Some("synthetic root failure"));
     assert_eq!(ready, (Some(crate::storage::Counts { records: 0, direct_present: 0 }), None, Some(false)));
     assert_eq!(count_fields(RecordCountStatus::Untracked { replay_complete: true }), (None, None, None));
+}
+#[test]
+fn unchanged_catalog_reuses_metadata_but_a_new_root_or_reader_requires_projection() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (signer, mut pile) = crate::open_local(dir.path())?;
+    let reader = signer.verifying_key();
+    let first = pile.collection("first", private_policy(reader))?;
+    pile.commit(first, &signer, entity! { metadata::name: "first row" })?;
+    let mut observed = None;
+    let before = pile.snapshot()?;
+    let page = PrefixPage::observe(&mut observed, &before, reader, 0)?;
+    assert_eq!(page.rows.len(), 1);
+    pile.put::<blobencodings::UTF8String, _>("unrelated payload")?;
+    let unrelated = pile.snapshot()?;
+    let state = observed.as_ref().unwrap();
+    assert!(state.metadata_current(&unrelated, reader, 0)?);
+    assert!(!state.metadata_current(&unrelated, reader, 32)?);
+    assert!(!state.metadata_current(&unrelated, SigningKey::from_bytes(&[74; 32]).verifying_key(), 0)?);
+    let second = pile.collection("second", private_policy(reader))?;
+    pile.commit(second, &signer, entity! { metadata::name: "another row" })?;
+    let added = pile.snapshot()?;
+    assert!(!state.metadata_current(&added, reader, 0)?);
+    assert_eq!(PrefixPage::observe(&mut observed, &added, reader, 0)?.total, 2);
+    pile.close()?;
+    Ok(())
 }

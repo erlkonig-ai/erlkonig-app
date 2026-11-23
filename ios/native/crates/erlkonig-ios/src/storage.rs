@@ -12,7 +12,8 @@ use triblespace_core::{
     collection::{self, CollectionHandle,
         descriptor, selection::{self, Selection}},
     prelude::*,
-    repo::{CapabilityProofRead, pile::PileSnapshot},
+    repo::{CapabilityProofRead, StoreDependencies, StoreRead, pile::PileSnapshot},
+    collection::observed_store::ObservedStore,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -38,6 +39,7 @@ pub struct ByteObservation {
     pub root: String,
     pub resident_bytes: Option<u64>,
     pub resident_error: Option<String>,
+    pub pending: bool,
 }
 
 /// One root from one immutable local snapshot. Native record routes are bags;
@@ -58,12 +60,11 @@ fn measure(snapshot: &PileSnapshot, root: CollectionHandle) -> Result<Counts> {
     Ok(Counts { records: records.len(), direct_present })
 }
 
-fn eligible(snapshot: &PileSnapshot, reader: VerifyingKey, root: CollectionHandle) -> Result<()> {
+fn eligible(snapshot: &impl StoreRead, reader: VerifyingKey, root: CollectionHandle,
+    facts: &TribleSet, proofs: &[triblespace_core::capability::CapabilityProof]) -> Result<()> {
         ensure!(root != selection::config_handle(reader), "Private node configuration");
-        let facts = selection::config_facts(snapshot, reader)?;
-        let state = selection::sync_selection(&facts, root);
-        let proofs = snapshot.proofs()?.collect::<Result<Vec<_>, _>>()?;
-        let admitted = matches!(collection::collection_reader_is_admitted_by(snapshot, root, reader, &proofs), Ok(QuorumOutcome::Met));
+        let state = selection::sync_selection(facts, root);
+        let admitted = matches!(collection::collection_reader_is_admitted_by(snapshot, root, reader, proofs), Ok(QuorumOutcome::Met));
         ensure!(admitted || matches!(state, Selection::Selected | Selection::Conflicted(_)), "Collection access unavailable");
         let descriptor: TribleSet = snapshot.get(root)?;
         ensure!(descriptor::parents(&descriptor)?.is_empty(), "Inspect the parent collection");
@@ -72,7 +73,10 @@ fn eligible(snapshot: &PileSnapshot, reader: VerifyingKey, root: CollectionHandl
 
 #[cfg(test)]
 pub fn observe(snapshot: &PileSnapshot, reader: VerifyingKey, root: CollectionHandle) -> Observation {
-    let result = eligible(snapshot, reader, root).and_then(|()| measure(snapshot, root));
+    let result = (|| {
+        eligible(snapshot, reader, root, &selection::config_facts(snapshot, reader)?, &snapshot.proofs()?.collect::<Result<Vec<_>, _>>()?)?;
+        measure(snapshot, root)
+    })();
     match result {
         Ok(counts) => Observation { root: hex::encode(root.raw), counts: Some(counts), error: None,
             resident_bytes: None, resident_error: None },
@@ -84,6 +88,7 @@ pub fn observe(snapshot: &PileSnapshot, reader: VerifyingKey, root: CollectionHa
 pub type Statistics = StorageSnapshot<PileSnapshot>;
 
 pub struct IncrementalSample {
+    pub authority: (PileSnapshot, StoreDependencies),
     rows: Vec<ByteObservation>,
     roots: Vec<CollectionHandle>,
     sample: Option<StorageSample<PileSnapshot>>,
@@ -91,12 +96,19 @@ pub struct IncrementalSample {
 impl IncrementalSample {
     pub fn new(snapshot: PileSnapshot, reader: VerifyingKey, roots: &[CollectionHandle], previous: Option<&Statistics>) -> Self {
         let mut accepted = Vec::new();
+        let tracked = ObservedStore::new(snapshot.clone());
+        let authority: Result<_> = (|| Ok((selection::config_facts(&tracked, reader)?,
+            tracked.proofs()?.collect::<Result<Vec<_>, _>>()?)))();
         let rows = roots.iter().map(|root| {
-            let resident_error = eligible(&snapshot, reader, *root).err().map(|e| format!("{e:#}"));
+            let resident_error = match &authority {
+                Ok((facts, proofs)) => eligible(&tracked, reader, *root, facts, proofs).err().map(|e| format!("{e:#}")),
+                Err(error) => Some(format!("{error:#}")),
+            };
             if resident_error.is_none() { accepted.push(*root); }
-            ByteObservation { root: hex::encode(root.raw), resident_bytes: None, resident_error }
+            ByteObservation { root: hex::encode(root.raw), resident_bytes: None, pending: resident_error.is_none(), resident_error }
         }).collect();
-        let mut job = Self { rows, roots: roots.to_vec(), sample: None };
+        let mut job = Self { rows, roots: roots.to_vec(), sample: None,
+            authority: (snapshot.clone(), tracked.dependencies()) };
         // Native snapshot rows already own counts, including replay prefixes.
         // Never trigger Statistics' generic Untracked record fallback here.
         match Statistics::begin(snapshot, &[], &accepted, previous) {
@@ -105,9 +117,20 @@ impl IncrementalSample {
         }
         job
     }
+    #[cfg(test)]
     pub fn observations(&self) -> &[ByteObservation] { &self.rows }
+    pub fn pending_rows(&self, previous: &[ByteObservation]) -> Vec<ByteObservation> {
+        let measured: std::collections::HashMap<_, _> = previous.iter()
+            .filter_map(|r| Some((r.root.as_str(), r.resident_bytes?))).collect();
+        let mut rows = self.rows.clone();
+        for row in &mut rows {
+            if row.pending { row.resident_bytes = measured.get(row.root.as_str()).copied(); }
+        }
+        rows
+    }
     fn fail(&mut self, error: String) {
         for row in &mut self.rows {
+            row.pending = false;
             if row.resident_error.is_none() { row.resident_error = Some(error.clone()); }
         }
         self.sample = None;
@@ -119,6 +142,7 @@ impl IncrementalSample {
             Err(error) => { self.fail(error); Some((self.rows.clone(), None)) }
             Ok(Some(summary)) => {
                 for (row, root) in self.rows.iter_mut().zip(&self.roots) {
+                    row.pending = false;
                     if row.resident_error.is_none() { row.resident_bytes = summary.resident_bytes(*root); }
                 }
                 Some((self.rows.clone(), Some(summary)))

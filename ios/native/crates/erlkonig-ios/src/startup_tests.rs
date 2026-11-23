@@ -64,6 +64,19 @@ fn local_replay_rate_has_a_monotonic_window_and_expires() {
     assert_eq!(meter.observe(at(1550), 100), Some(measured));
     assert_eq!(meter.observe(at(3000), 100).unwrap().records_per_second, 0);
     assert_eq!(serde_json::to_value(measured).unwrap(), serde_json::Value::Null);
+    let mut progress = ReplayProgress { prefix_bytes: 200, observed_bytes: 500, activity_serial: 1,
+        records_per_second: Some(measured) };
+    let stale = serde_json::to_value(progress).unwrap();
+    assert!(stale["records_per_second"].is_null());
+    assert_eq!(stale["last_records_per_second"], 40);
+    assert!(stale["rate_age_ms"].as_u64().unwrap() >= 5_000);
+    progress.records_per_second = Some(ReplayRate { records_per_second: 0, measured_at: Instant::now() });
+    let idle = serde_json::to_value(progress).unwrap();
+    assert_eq!(idle["records_per_second"], 0);
+    assert_eq!(idle["last_records_per_second"], 0);
+    progress.records_per_second = None;
+    let reset = serde_json::to_value(progress).unwrap();
+    assert!(reset["last_records_per_second"].is_null() && reset["rate_age_ms"].is_null());
     assert!(meter.observe(at(3100), 2).is_none());
     assert!(ReplayMeter::default().observe(at(9900), 200).is_none());
 }

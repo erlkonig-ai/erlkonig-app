@@ -95,12 +95,26 @@ fn selected_in(snapshot: &PileSnapshot, key: &SigningKey) -> Result<Vec<Collecti
     Ok(roots)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReplayProgress {
     prefix_bytes: u64,
     observed_bytes: u64,
     activity_serial: u64,
     records_per_second: Option<ReplayRate>,
+}
+impl Serialize for ReplayProgress {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut fields = serializer.serialize_struct("ReplayProgress", 6)?;
+        fields.serialize_field("prefix_bytes", &self.prefix_bytes)?;
+        fields.serialize_field("observed_bytes", &self.observed_bytes)?;
+        fields.serialize_field("activity_serial", &self.activity_serial)?;
+        // Keep the original fresh-only field for existing clients.
+        fields.serialize_field("records_per_second", &self.records_per_second)?;
+        fields.serialize_field("last_records_per_second", &self.records_per_second.map(|rate| rate.records_per_second))?;
+        fields.serialize_field("rate_age_ms", &self.records_per_second.map(|rate| rate.measured_at.elapsed().as_millis() as u64))?;
+        fields.end()
+    }
 }
 impl ReplayProgress {
     fn observe(snapshot: &PileSnapshot, observed_bytes: u64, activity_serial: u64) -> Self {
@@ -364,6 +378,7 @@ fn worker_with_cleanup(
         let mut opening_page_requested = true;
         let mut opening_published = Instant::now();
         let mut replay_meter = ReplayMeter::default();
+        let mut prefix_page = None;
         let mut peer = None;
         let mut previous = None;
         let mut roots = Vec::new();
@@ -378,6 +393,7 @@ fn worker_with_cleanup(
         let mut storage_changed = false;
         let mut storage_sampled = Instant::now();
         let mut storage_sample = None;
+        let mut storage_authority = None;
         let mut storage_statistics = None;
         let mut storage_generation = None;
         let mut chart_active = false;
@@ -448,9 +464,11 @@ fn worker_with_cleanup(
                 Ok(Command::Storage(requested)) => {
                     if !update_storage_request(&mut storage_roots, requested, &mut storage_sample) { continue; }
                     storage_requested = true;
+                    let visible: std::collections::HashSet<_> = storage_roots.iter().map(|root| hex::encode(root.raw)).collect();
+                    publish(&status, |s| s.storage.retain(|row| visible.contains(&row.root)));
                     if storage_roots.is_empty() {
                         storage_changed = false;
-                        publish(&status, |s| s.storage.clear());
+                        storage_authority = None;
                     }
                 }
                 Ok(Command::StorageActive(next)) => {
@@ -511,7 +529,7 @@ fn worker_with_cleanup(
                     previous = None;
                 }
                 Ok(Command::Active(next, serial)) => {
-                    replay_meter = ReplayMeter::default();
+                    if next != active { replay_meter = ReplayMeter::default(); }
                     requested_activity = serial;
                     if next == active && (next || paused) {
                         // Repeated lifecycle events still need their own ack.
@@ -566,10 +584,25 @@ fn worker_with_cleanup(
                 let progress = (|| -> Result<bool> {
                     let (snapshot, complete) = opening.as_mut().unwrap().snapshot_step(replay_budget)?;
                     if complete || opening_page_requested || opening_published.elapsed() >= Duration::from_millis(250) {
+                        let pile = opening.as_ref().unwrap();
+                        let mut progress = ReplayProgress::observe(&snapshot, pile.observed_length()?, requested_activity);
+                        if !complete {
+                            progress.records_per_second = replay_meter.observe(Instant::now(), pile.replayed_records());
+                            // Publish the cursor first. The catalog snapshot can take longer to derive.
+                            publish(&status, |s| {
+                                s.replay_complete = false;
+                                s.replay_progress = Some(progress);
+                                s.sync_progress = None;
+                                s.storage.clear();
+                                s.composition = None;
+                            });
+                        }
                         let page = if complete {
+                            prefix_page = None;
+                            replay_meter = ReplayMeter::default();
                             collections::project(&snapshot, key.verifying_key(), page_offset, collections::PAGE_SIZE)?
                         } else {
-                            collections::project_prefix(&snapshot, key.verifying_key(), page_offset, collections::PAGE_SIZE)?
+                            collections::PrefixPage::observe(&mut prefix_page, &snapshot, key.verifying_key(), page_offset)?
                         };
                         let (selected, sync) = if complete {
                             let selected = selected_in(&snapshot, &key)?;
@@ -578,15 +611,6 @@ fn worker_with_cleanup(
                             (0, None)
                         };
                         let listening = complete && collections::listening_in(&snapshot, key.verifying_key())?;
-                        // Backing extent is a current observation, not snapshot state. An
-                        // append after the replay step can make this denominator grow.
-                        let pile = opening.as_ref().unwrap();
-                        let mut progress = ReplayProgress::observe(&snapshot, pile.observed_length()?, requested_activity);
-                        if complete {
-                            replay_meter = ReplayMeter::default();
-                        } else {
-                            progress.records_per_second = replay_meter.observe(Instant::now(), pile.replayed_records());
-                        }
                         publish(&status, |s| {
                             if s.replay_progress.map(|old| old.prefix_bytes)
                                 != Some(progress.prefix_bytes) { s.storage.clear(); }
@@ -664,12 +688,17 @@ fn worker_with_cleanup(
                     });
                     // Only visible roots; arrivals coalesce into a five-second sample.
                     // No periodic scan while Storage is hidden (empty request set).
+                    if storage_authority.as_ref().is_some_and(|(old, reads)|
+                        !snapshot.changes_for(old, reads).is_empty()) {
+                        storage_sample = None;
+                        storage_requested = true;
+                    }
+                    let mut started_bytes = false;
                     if storage_sample.is_none() && !storage_roots.is_empty() && (storage_requested ||
                         (storage_changed && storage_sampled.elapsed() >= Duration::from_secs(5))) {
                         let sample = storage::IncrementalSample::new(snapshot.clone(), key.verifying_key(), &storage_roots, storage_statistics.as_ref());
-                        // Counts are already in the independently published page;
-                        // this pinned batch publishes only optional byte quantities.
-                        publish(&status, |s| s.storage = sample.observations().to_vec());
+                        storage_authority = Some(sample.authority.clone());
+                        started_bytes = true;
                         storage_sample = Some(sample);
                         storage_requested = false;
                         storage_changed = false;
@@ -678,8 +707,13 @@ fn worker_with_cleanup(
                     if let Some(sample) = storage_sample.as_mut() {
                         if let Some((observations, summary)) = sample.step(4096) {
                             if summary.is_some() { storage_statistics = summary; }
-                            publish(&status, |s| s.storage = observations);
+                            if !storage_requested {
+                                publish(&status, |s| s.storage = observations);
+                            }
                             storage_sample = None;
+                        } else if started_bytes {
+                            // An already complete sample never needs a pending publication.
+                            publish(&status, |s| s.storage = sample.pending_rows(&s.storage));
                         }
                     }
                     // Chart roots come from the complete native row projection,
@@ -1323,10 +1357,9 @@ mod tests {
         completed.expect("scripted storage worker did not settle");
         let samples: Vec<_> = observed.try_iter().collect();
         assert_eq!(samples.len(), 4);
-        for (rows, _, network_started, error, _) in &samples {
+        for (_, _, network_started, error, _) in &samples {
             assert!(!network_started);
             assert!(error.is_none(), "{error:?}");
-            assert_eq!(rows.len(), 1);
         }
         // Actual shared page counts are already ready while the byte batch is unfinished.
         assert_eq!(samples[0].4.len(), 2);
@@ -1335,10 +1368,9 @@ mod tests {
         assert_eq!(samples[0].0[0].root, hex::encode(roots[0].raw));
         assert!(samples[0].1);
         assert!(samples[0].0[0].resident_bytes.is_none());
-        // Changing scope completed A instead of throwing it away for B.
-        assert_eq!(samples[1].0[0].root, hex::encode(roots[0].raw));
+        // Changing scope finishes A for reuse, but no longer publishes it for B.
+        assert!(samples[1].0.is_empty());
         assert!(!samples[1].1);
-        assert!(samples[1].0[0].resident_bytes.is_some());
         // Actual worker scheduling then publishes B while removing A's large
         // inventory, and only publishes B's bytes after that batch completes.
         assert_eq!(samples[2].0[0].root, hex::encode(roots[1].raw));

@@ -7,7 +7,8 @@ use triblespace_core::{
     collection::{self, CollectionHandle, CollectionRead, CollectionStoreExt, descriptor,
         record_counts::RecordCountStatus, private_policy,
         selection::{self, CONFIG_COLLECTION_NAME, Selection}},
-    metadata, prelude::*, repo::{CapabilityProofRead, pile::PileSnapshot},
+    metadata, prelude::*, repo::{CapabilityProofRead, StoreChanges, StoreDependencies, StoreRead, StoreSnapshot, pile::PileSnapshot},
+    collection::observed_store::ObservedStore,
     query::register::{ObservationOrder, maximal},
 };
 
@@ -64,6 +65,8 @@ pub fn state_token(state: &Selection) -> String {
 
 #[derive(Clone, Serialize)]
 pub struct Row {
+    #[serde(skip)]
+    handle: CollectionHandle,
     pub root: String,
     pub name: String,
     pub state: String,
@@ -74,13 +77,14 @@ pub struct Row {
     pub count_error: Option<String>,
     pub counts_replay_complete: Option<bool>,
 }
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct Page {
     pub rows: Vec<Row>,
     pub offset: usize,
     pub total: usize,
     pub has_more: bool,
     pub pending: usize,
+    pub prefix_bytes: u64,
 }
 
 /// One disposable metadata projection, bounded at the FFI boundary. Collection
@@ -94,16 +98,52 @@ pub fn page(pile: &mut Pile, key: &SigningKey, offset: usize) -> Result<Page> {
 /// The same ephemeral row projection for a page or a whole chart observation.
 /// A chart supplies its immutable snapshot and does not select or track roots.
 pub(crate) fn project(snapshot: &PileSnapshot, reader: VerifyingKey, offset: usize, limit: usize) -> Result<Page> {
-    project_observation(snapshot, reader, offset, limit, true)
+    project_observation(snapshot, snapshot, reader, offset, limit, true)
 }
 
 /// The current immutable replay prefix, including readable observed choices.
 /// Unknown config bytes are distinct from an observed Unset choice.
+#[cfg(test)]
 pub(crate) fn project_prefix(snapshot: &PileSnapshot, reader: VerifyingKey, offset: usize, limit: usize) -> Result<Page> {
-    project_observation(snapshot, reader, offset, limit, false)
+    project_observation(snapshot, snapshot, reader, offset, limit, false)
 }
 
-fn project_observation(snapshot: &PileSnapshot, reader: VerifyingKey, offset: usize, limit: usize, complete: bool) -> Result<Page> {
+pub(crate) struct PrefixPage {
+    snapshot: PileSnapshot,
+    dependencies: StoreDependencies,
+    reader: VerifyingKey,
+    page: Page,
+}
+
+impl PrefixPage {
+    fn metadata_current(&self, snapshot: &PileSnapshot, reader: VerifyingKey, offset: usize) -> Result<bool> {
+        Ok(self.reader == reader && self.page.offset == offset
+            && snapshot.changes_for(&self.snapshot, &self.dependencies).is_empty()
+            && (!snapshot.changes_since(&self.snapshot).contains(StoreChanges::COLLECTION_RECORDS)
+                || snapshot.collections()? == self.snapshot.collections()?))
+    }
+
+    pub fn observe(previous: &mut Option<Self>, snapshot: &PileSnapshot, reader: VerifyingKey, offset: usize) -> Result<Page> {
+        if let Some(old) = previous {
+            if old.metadata_current(snapshot, reader, offset)? {
+                for row in &mut old.page.rows {
+                    (row.counts, row.count_error, row.counts_replay_complete) = count_fields(snapshot.record_count_status(row.handle));
+                }
+                old.page.prefix_bytes = snapshot.prefix_len() as u64;
+                old.snapshot = snapshot.clone();
+                return Ok(old.page.clone());
+            }
+        }
+        // Metadata reads include missing descriptor/name blobs, config and grants.
+        // Candidate roots and per-row counts have separate indexed checks above.
+        let tracked = ObservedStore::new(snapshot.clone());
+        let page = project_observation(snapshot, &tracked, reader, offset, PAGE_SIZE, false)?;
+        *previous = Some(Self { snapshot: snapshot.clone(), dependencies: tracked.dependencies(), reader, page: page.clone() });
+        Ok(page)
+    }
+}
+
+fn project_observation(source: &PileSnapshot, snapshot: &impl StoreRead, reader: VerifyingKey, offset: usize, limit: usize, complete: bool) -> Result<Page> {
     let facts = if !complete && !snapshot.contains_blob(selection::config_handle(reader))? {
         None
     } else {
@@ -118,14 +158,14 @@ fn project_observation(snapshot: &PileSnapshot, reader: VerifyingKey, offset: us
         }
     };
     let proofs = snapshot.proofs()?.collect::<Result<Vec<_>, _>>()?;
-    let mut candidates = snapshot.collections()?;
+    let mut candidates = source.collections()?;
     candidates.extend(proofs.iter().map(|p| CollectionHandle::new(p.resource().into_bytes())));
     if let Some(facts) = &facts {
         candidates.extend(find!(root: CollectionHandle,
             pattern!(facts, [{ _?state @ selection::sync_collection: ?root }])));
     }
     candidates.sort_unstable(); candidates.dedup();
-    let mut page = Page { offset, ..Page::default() };
+    let mut page = Page { offset, prefix_bytes: source.prefix_len() as u64, ..Page::default() };
     for root in candidates {
         if root == selection::config_handle(reader) { continue; }
         let state = facts.as_ref().map(|facts| selection::sync_selection(facts, root));
@@ -154,8 +194,9 @@ fn project_observation(snapshot: &PileSnapshot, reader: VerifyingKey, offset: us
                 }
             }
         }
-        let (counts, count_error, counts_replay_complete) = count_fields(snapshot.record_count_status(root));
+        let (counts, count_error, counts_replay_complete) = count_fields(source.record_count_status(root));
         page.rows.push(Row {
+            handle: root,
             root: hex::encode(root.raw),
             name: if names.is_empty() {
                 if complete { "Unnamed collection".into() } else { hex::encode(root.raw) }

@@ -19,6 +19,7 @@ private struct CollectionPage: Decodable {
     var total = 0
     var has_more = false
     var pending = 0
+    var prefix_bytes: UInt64?
 }
 
 private struct DirectCounts: Decodable {
@@ -29,6 +30,7 @@ private struct StorageObservation: Decodable {
     var root: String
     var resident_bytes: UInt64?
     var resident_error: String?
+    var pending: Bool?
 }
 private struct VolumeCapacity: Sendable {
     var total: Int64
@@ -71,6 +73,8 @@ private struct ReplayProgress: Decodable, Equatable {
     var observed_bytes: UInt64
     var activity_serial: UInt64
     var records_per_second: UInt64?
+    var last_records_per_second: UInt64?
+    var rate_age_ms: UInt64?
     var fraction: Double {
         guard observed_bytes > 0 else { return 0 }
         return min(1, Double(prefix_bytes) / Double(observed_bytes))
@@ -370,6 +374,9 @@ private final class ReplicaModel: ObservableObject {
     }
 
     private func open(_ path: String) {
+        status = ReplicaStatus()
+        collectionPages.removeAll(); recentPages.removeAll(); queuedPages.removeAll()
+        requestedPage = nil; choices.discard()
         native = path.withCString { erl_ios_open($0) }.map(NativeReplica.init)
         guard let handle else { status.error = "Could not start replica worker"; return }
         if foreground && proofOnly { pendingActivity = erl_ios_local_active(handle) }
@@ -398,8 +405,12 @@ private final class ReplicaModel: ObservableObject {
         let sample = await Task.detached(priority: .utility) { native.readStatus() }.value
         guard let (status, readAt) = sample, native === self.native else { return }
         var next = status
+        let delay = UInt64((ProcessInfo.processInfo.systemUptime - readAt) * 1000)
+        if let age = next.replay_progress?.rate_age_ms {
+            let sum = age.addingReportingOverflow(delay)
+            next.replay_progress?.rate_age_ms = sum.overflow ? UInt64.max : sum.partialValue
+        }
         if let age = next.network?.age_ms {
-            let delay = UInt64((ProcessInfo.processInfo.systemUptime - readAt) * 1000)
             let sum = age.addingReportingOverflow(delay)
             next.network?.age_ms = sum.overflow ? UInt64.max : sum.partialValue
         }
@@ -419,7 +430,9 @@ private final class ReplicaModel: ObservableObject {
             if start != began { began = start }
             if end != ended { ended = end }
         }
-        let prefixChanged = next.replay_progress?.prefix_bytes != status.replay_progress?.prefix_bytes
+        // Rows and the replay cursor can arrive independently.
+        let prefixChanged = (next.collections.prefix_bytes ?? next.replay_progress?.prefix_bytes)
+            != (status.collections.prefix_bytes ?? status.replay_progress?.prefix_bytes)
         if next.collections.total != status.collections.total || next.replay_complete != status.replay_complete || prefixChanged {
             collectionPages.removeAll(); recentPages.removeAll(); queuedPages.removeAll()
         }
@@ -436,15 +449,8 @@ private final class ReplicaModel: ObservableObject {
                 if !queuedPages.contains(page) { queuedPages.insert(page, at: 0) }
             }
         }
-        // Keep last completed byte observations across visibility/batch changes,
-        // bounded by the same three cached pages plus currently visible roots.
-        let retainedRoots = Set(collectionPages.values.flatMap { $0.rows.map(\.root) }).union(visibleStorageRoots)
-        var observations = Dictionary(uniqueKeysWithValues: status.storage.filter { retainedRoots.contains($0.root) }.map { ($0.root, $0) })
-        for row in next.storage where retainedRoots.contains(row.root) { observations[row.root] = row }
-        next.storage = observations.values.sorted { $0.root < $1.root }
         if !next.replay_complete {
-            // Byte accounting waits for complete replay; counts live in the rows.
-            next.storage = next.replay_progress == nil ? [] : incoming.storage
+            next.storage = []
             next.composition = nil
         }
         if next.error != nil { choices.discard() } // Fatal worker errors have no future ack.
@@ -455,7 +461,7 @@ private final class ReplicaModel: ObservableObject {
     }
 
     func setForeground(_ value: Bool) {
-        guard !crownFixture else { return }
+        guard !crownFixture, value != foreground else { return }
         foreground = value
         status.network = nil
         if !value && background == .invalid {
@@ -489,7 +495,10 @@ private final class ReplicaModel: ObservableObject {
         }
         if !status.ready || !status.replay_complete {
             if let replay = status.replay_progress, replay.activity_serial == pendingActivity,
-               let rate = replay.records_per_second {
+               let rate = replay.last_records_per_second ?? replay.records_per_second {
+                if let age = replay.rate_age_ms, age > 5_000 {
+                    return "Reading local data · last \(rate.formatted()) local pile records/s · waiting for an update"
+                }
                 return "Reading local data · \(rate.formatted()) local pile records/s"
             }
             return "Reading local data"
@@ -990,9 +999,12 @@ private struct StorageView: View {
     private func storageMetrics(_ row: CollectionRow) -> some View {
         let sample = replica.status.storage.first(where: { $0.root == row.root })
         HStack {
-            Text(sample?.resident_bytes.map(bytes) ?? "—")
+            Text(sample?.resident_bytes.map(bytes) ?? (sample?.pending == true ? "Measuring…" : "—"))
                 .accessibilityLabel(sample?.resident_bytes.map { "\(bytes($0)) known resident content" } ?? "Resident size unavailable")
-                .accessibilityHint(sample?.resident_error ?? "Shared content can count in other collections too")
+                .accessibilityHint(sample?.resident_error ?? (sample?.pending == true ? "Updating the resident size" : "Shared content can count in other collections too"))
+            if sample?.pending == true, sample?.resident_bytes != nil {
+                Text("Updating").font(.caption2).foregroundStyle(.secondary)
+            }
             Spacer()
             if let counts = row.counts {
                 Text("\(counts.direct_present)/\(counts.records) records")

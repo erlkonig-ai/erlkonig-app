@@ -5,6 +5,37 @@ use triblespace_core::{
 };
 
 #[test]
+fn sparse_size_updates_keep_only_the_latest_authorized_measurement() -> Result<()> {
+    let first = tempfile::tempdir()?;
+    let (reader, mut pile) = crate::open_local(first.path())?;
+    let root = pile.collection("known size", private_policy(reader.verifying_key()))?.handle();
+    let snapshot = pile.snapshot()?;
+    let previous = |bytes| ByteObservation { root: hex::encode(root.raw), resident_bytes: Some(bytes),
+        resident_error: None, pending: false };
+    let mut batch = IncrementalSample::new(snapshot, reader.verifying_key(), &[root], None);
+    for value in [12_000_000_000, 0] {
+        let pending = batch.pending_rows(&[previous(value)]);
+        assert!(pending[0].pending);
+        assert_eq!(pending[0].resident_bytes, Some(value));
+    }
+    let completed = batch.step(4096).unwrap().0;
+    assert!(!completed[0].pending);
+    assert!(completed[0].resident_bytes.is_none(), "an unknown held inventory supersedes the old measure");
+    batch.fail("inventory unavailable".into());
+    let failed = batch.pending_rows(&[previous(12_000_000_000)]);
+    assert!(!failed[0].pending && failed[0].resident_bytes.is_none() && failed[0].resident_error.is_some());
+    // An identical requested collection ID in a different replica carries no prior size or authority.
+    let second = tempfile::tempdir()?;
+    let (other, mut other_pile) = crate::open_local(second.path())?;
+    let denied = IncrementalSample::new(other_pile.snapshot()?, other.verifying_key(), &[root], None)
+        .pending_rows(&[previous(12_000_000_000)]);
+    assert!(denied[0].resident_error.is_some() && denied[0].resident_bytes.is_none() && !denied[0].pending);
+    pile.close()?;
+    other_pile.close()?;
+    Ok(())
+}
+
+#[test]
 fn byte_failure_preserves_ready_records_without_publishing_a_byte_total() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let (key, mut pile) = crate::open_local(dir.path())?;
