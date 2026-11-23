@@ -8,93 +8,104 @@ use triblespace_core::{
 };
 
 #[test]
-fn sync_shows_the_last_observed_membership_until_its_host_is_retired() {
-    use crate::network::Observation;
-    use std::sync::Mutex;
-    use triblespace_net::clock::mono_now;
+fn sync_reads_the_peer_while_the_status_writer_and_first_durable_turn_are_blocked() {
+    let dir = tempfile::tempdir().unwrap();
+    let (key, mut pile) = open_local(dir.path()).unwrap();
+    crate::collections::start_discovery(&mut pile, &key).unwrap();
+    pile.close().unwrap();
 
-    let (command, _commands) = mpsc::channel();
-    let shared = Arc::new(Mutex::new(Status {
-        revision: 1, running: true, ready: true, replay_complete: true,
-        listening: true, activity_serial: 1, ..Status::default()
-    }));
+    let (command, commands) = mpsc::channel();
+    let (entered, waiting) = mpsc::channel();
+    let (release, blocked) = mpsc::channel();
+    let shared = Arc::new(std::sync::Mutex::new(Status::default()));
+    let sessions = Arc::new(arc_swap::ArcSwapOption::empty());
+    let replica = Replica { command, activity_serial: 0.into(), status: shared.clone(), peer: sessions.clone() };
+    replica.command.send(crate::Command::BeforeFirstPeerTurn(Box::new(move |status| {
+        let _busy = status.lock().unwrap();
+        entered.send(()).unwrap();
+        let _ = blocked.recv_timeout(Duration::from_secs(20));
+    }))).unwrap();
+    let serial = replica.set_active(true);
+    let root = dir.path().to_owned();
+    let worker = std::thread::Builder::new().stack_size(crate::WORKER_STACK_BYTES)
+        .spawn(move || crate::worker(root, commands, shared, sessions)).unwrap();
     let mut model = Model::new(ModelSource::Error(String::new()));
-    model.replica = Some(Replica {
-        command, activity_serial: 1.into(), status: shared.clone(),
-    });
-    model.activity_serial = 1;
+    model.status = Status::default();
+    model.activity_serial = serial;
+    model.replica = Some(replica);
+    waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    model.tick(); // Crown does not sample the peer.
+    assert!(model.peer_reader.is_none() && model.peer_view.is_none());
+    model.set_screen(Screen::Sync);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while model.peer_observation().is_none() {
+        assert!(Instant::now() < deadline, "actual empty host sample unavailable");
+        model.tick();
+        std::thread::yield_now();
+    }
+    assert_eq!(model.phase(), "No connected nodes");
+    assert!(!model.status.ready, "the worker status could not be acquired");
+    let reader = model.peer_reader.clone().unwrap();
+    let pinned = reader.snapshot().unwrap();
+    let stamp = pinned.observed_at.unwrap();
+    let epoch = model.table_epoch;
+
+    while model.peer_observation().unwrap().sampled_at <= stamp {
+        assert!(Instant::now() < deadline, "host evidence waited for a disk/worker turn");
+        model.tick();
+        std::thread::yield_now();
+    }
+    assert_eq!(pinned.observed_at, Some(stamp));
+    assert_eq!(pinned.connections.len(), 0);
+    assert_eq!(model.table_epoch, epoch, "empty heartbeat did not change table content");
+    let start = Instant::now();
+    for _ in 0..10_000 { model.tick(); }
+    let visible = start.elapsed();
+    assert_eq!(model.table_epoch, epoch);
+    model.set_screen(Screen::Crown);
+    let start = Instant::now();
+    for _ in 0..10_000 { model.tick(); }
+    eprintln!("10k empty peer frame polls with worker lock held: visible {visible:?}, hidden {:?}", start.elapsed());
+    assert!(model.peer_reader.is_none() && model.peer_view.is_none());
     model.set_screen(Screen::Sync);
     model.tick();
-    assert_eq!(model.phase(), "Starting network");
-    assert!(model.peer_observation().is_none());
 
-    let first = Arc::new(Observation {
-        host_epoch: 1, sampled_at: mono_now().as_nanos(), connections: vec![],
-    });
-    {
-        let mut s = shared.lock().unwrap();
-        s.revision += 1;
-        s.network = Some(first.clone());
-    }
-    model.tick();
-    assert_eq!(model.phase(), "Listening");
-    let first_epoch = model.table_epoch;
+    // A pinned screen does not become fresh merely because the host keeps running.
     std::thread::sleep(Duration::from_millis(5100));
-    {
-        let _busy_writer = shared.lock().unwrap();
-        model.tick();
-        assert_eq!(model.phase(), "No connected nodes · observed over 5 s ago");
-        assert!(Arc::ptr_eq(model.status.network.as_ref().unwrap(), &first));
-    }
+    assert_eq!(model.phase(), "No connected nodes · observed over 5 s ago");
     model.tick();
-    assert_eq!(model.table_epoch, first_epoch);
-    assert!(!model.fresh_network());
-    {
-        let mut s = shared.lock().unwrap();
-        s.revision += 1;
-        s.network = Some(Arc::new(Observation {
-            sampled_at: mono_now().as_nanos(), ..(*first).clone()
-        }));
-    }
+    assert_eq!(model.phase(), "No connected nodes");
+    model.set_screen(Screen::Crown);
+    assert!(model.peer_reader.is_none() && model.peer_view.is_none());
+    model.set_screen(Screen::Sync);
     model.tick();
-    assert!(model.fresh_network());
-    assert_eq!(model.phase(), "Listening");
-    assert_eq!(model.table_epoch, first_epoch, "only the freshness key changes");
+    assert!(model.peer_observation().is_some());
 
     model.set_active(false);
     assert_eq!(model.phase(), "Paused");
     assert!(model.peer_observation().is_none());
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while reader.snapshot().is_some() {
+        assert!(Instant::now() < deadline, "paused peer retained live evidence");
+        std::thread::yield_now();
+    }
+    assert_eq!(pinned.observed_at, Some(stamp));
     model.set_active(true);
-    assert_eq!(model.phase(), "Resuming");
-    assert!(model.peer_observation().is_none());
-    {
-        let mut s = shared.lock().unwrap();
-        s.revision += 1;
-        s.activity_serial = model.activity_serial;
-        s.network = None;
+    assert_eq!(model.phase(), "Reading local data");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while model.phase() != "Listening" {
+        assert!(Instant::now() < deadline, "new listener did not establish a current zero");
+        model.tick();
+        std::thread::yield_now();
     }
-    model.tick();
-    assert_eq!(model.phase(), "Starting network");
-    assert!(model.peer_observation().is_none());
-    {
-        let mut s = shared.lock().unwrap();
-        s.revision += 1;
-        s.listening = false;
-        s.network = Some(Arc::new(Observation {
-            host_epoch: 2, sampled_at: mono_now().as_nanos(), connections: vec![],
-        }));
-    }
-    model.tick();
-    assert_eq!(model.peer_observation().unwrap().host_epoch, 2);
-    assert_eq!(model.phase(), "No connected nodes");
-    {
-        let mut s = shared.lock().unwrap();
-        s.error = Some("host failed".into());
-        s.revision += 1;
-    }
-    model.tick();
+    assert!(model.peer_reader.as_ref().is_some_and(|new| new != &reader));
+    model.status.error = Some("host failed".into());
     assert_eq!(model.phase(), "Needs attention");
     assert!(model.peer_observation().is_none());
+    drop(model);
+    worker.join().unwrap();
 }
 
 #[test]

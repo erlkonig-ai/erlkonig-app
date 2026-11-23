@@ -26,7 +26,7 @@ fn fixture() -> (tempfile::TempDir, SigningKey, [CollectionHandle; 2], usize) {
 fn run_script(root: PathBuf, commands: mpsc::Receiver<Command>, status: Arc<Mutex<Status>>) {
     let (finished, completion) = mpsc::channel();
     let worker = std::thread::Builder::new().stack_size(WORKER_STACK_BYTES).spawn(move || {
-        worker_with_cleanup(root, commands, status, pause);
+        worker_with_cleanup(root, commands, status, Default::default(), pause);
         let _ = finished.send(());
     }).unwrap();
     // Every caller queued Stop already; all result assertions happen after
@@ -291,7 +291,7 @@ fn activity_serial_acknowledges_only_completed_cleanup_even_when_not_running() {
     sender.send(Command::Active(false, 2)).unwrap();
     sender.send(Command::Stop).unwrap(); drop(sender);
     let mut before_cleanup = Vec::new();
-    worker_with_cleanup(dir.path().to_owned(), receiver, status.clone(), |peer, local| {
+    worker_with_cleanup(dir.path().to_owned(), receiver, status.clone(), Default::default(), |peer, local| {
         let value = status.lock().unwrap();
         before_cleanup.push((value.activity_serial, value.ready, value.running, value.replay_complete));
         drop(value);
@@ -626,7 +626,7 @@ fn failed_pause_is_not_acknowledged_and_final_cleanup_releases_retained_owner() 
     sender.send(Command::LocalActive(3)).unwrap();
     drop(sender);
     let mut witness = None;
-    worker_with_cleanup(dir.path().to_owned(), receiver, status.clone(), |peer, local| {
+    worker_with_cleanup(dir.path().to_owned(), receiver, status.clone(), Default::default(), |peer, local| {
         pause(peer, local)?;
         witness = local.as_mut().unwrap().drive_held();
         Err(CleanupFailure { shutdown: None, flush: Some("injected checkpoint failure".into()), close: None }.into())
@@ -635,7 +635,7 @@ fn failed_pause_is_not_acknowledged_and_final_cleanup_releases_retained_owner() 
     let status = status.lock().unwrap();
     assert_eq!(status.activity_serial, 1, "failed pause or queued activation was acknowledged");
     assert!(status.error.as_ref().unwrap().contains("injected checkpoint failure"));
-    assert!(!status.running && status.network.is_none());
+    assert!(!status.running && !status.network_started);
     assert!(!status.replay_complete && status.test_page().rows.is_empty(), "fatal owner close left live local readiness");
 }
 
@@ -644,7 +644,7 @@ fn hidden_replica_performs_no_list_projections_and_reader_pins_its_cut_after_sto
     let (dir, _, _, _) = fixture();
     let (command, receiver) = mpsc::channel();
     let status = Arc::new(Mutex::new(Status::default()));
-    let replica = Replica { command: command.clone(), status: status.clone(), activity_serial: AtomicU64::new(0) };
+    let replica = Replica { command: command.clone(), status: status.clone(), peer: Default::default(), activity_serial: AtomicU64::new(0) };
     let (tx, rx) = mpsc::channel();
     command.send(Command::Active(true, 1)).unwrap();
     command.send(Command::StorageCheckpoint(Box::new(move |_, _, status| {

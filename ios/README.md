@@ -2,6 +2,8 @@
 
 The foreground replica runs a native TribleSpace store inside the app sandbox. It displays collections, storage and passive connection statistics. The user selects which readable collections to replicate. Rust creates the UIKit scene, native controls and collection views. Xcode links the Rust static library through the process entry point in `app/main.c`.
 
+While Sync is visible, it reads the current peer's immutable health snapshot directly. Rows are ordered by authenticated peer ID. Rates use the host's observation timestamps and require two samples from the same connection. After a reconnect, RTT can appear before the first rate.
+
 ## Build the simulator app
 
 Use an Apple silicon Mac, Xcode with the iOS Simulator SDK, Python 3.12 or later, Git and rustup. The native workspace pins Rust 1.98.0. From the repository root, run
@@ -26,7 +28,7 @@ cargo test --locked --workspace
 
 | Source patch | Purpose | Upstream license |
 | --- | --- | --- |
-| `triblespace-mobile.patch` | Maintains assertion counts during replay, computes storage snapshots from local observations, and exposes traffic and RTT from existing connections. | MIT or Apache-2.0 |
+| `triblespace-mobile.patch` | Maintains assertion counts during replay, computes storage snapshots from local observations, and publishes passive peer health with traffic and RTT from existing connections. | MIT or Apache-2.0 |
 | `netdev-ios.patch` | Enumerates interface addresses and flags through the public iOS SDK. Gateway details and per-address IPv6 flags are unavailable. | MIT |
 | `netwatch-ios.patch` | Samples interface state every five seconds while the app is active. Route-only changes and changes during suspension may go unobserved. | MIT or Apache-2.0 |
 

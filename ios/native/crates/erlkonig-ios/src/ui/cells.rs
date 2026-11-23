@@ -119,7 +119,7 @@ impl Model {
     pub fn number_of_rows(&self, section: isize) -> isize {
         let count = if self.screen == Screen::Sync {
             if section == 1 {
-                self.peer_observation().map_or(0, |n| n.connections.len())
+                self.peer_observation().map_or(0, |n| n.len())
             } else {
                 0
             }
@@ -151,7 +151,7 @@ impl Model {
                 .unwrap_or(Item::Loading);
         }
         if self.screen == Screen::Sync {
-            let Some(c) = self.peer_observation().and_then(|n| n.connections.get(index))
+            let Some(c) = self.peer_observation().and_then(|n| n.row(index))
             else {
                 return Item::Loading;
             };
@@ -172,7 +172,7 @@ impl Model {
             return Item::Copy(
                 abbrev(&c.peer),
                 format!("{last}↓ {rx}     ↑ {tx}{rtt}"),
-                c.peer.clone(),
+                c.peer,
             );
         }
         let Some(row) = self.row(index) else {

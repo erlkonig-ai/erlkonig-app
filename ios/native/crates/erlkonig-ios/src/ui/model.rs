@@ -52,6 +52,8 @@ struct PageRead {
 pub(super) struct Model {
     pub status: Status,
     replica: Option<Replica>,
+    peer_reader: Option<triblespace_net::health::HealthReader>,
+    peer_view: Option<crate::network::Observation>,
     local_only: bool,
     seen_revision: Option<u64>,
     pub foreground: bool,
@@ -96,6 +98,8 @@ impl Model {
         let mut model = Self {
             status: Status::default(),
             replica: None,
+            peer_reader: None,
+            peer_view: None,
             local_only: false,
             seen_revision: None,
             foreground: true,
@@ -152,6 +156,8 @@ impl Model {
     fn open(&mut self, root: PathBuf) {
         self.invalidate_window();
         self.seen_revision = None;
+        self.peer_reader = None;
+        self.peer_view = None;
         self.pending.clear();
         self.flight = None;
         match Replica::open(&root) {
@@ -237,6 +243,8 @@ impl Model {
         }
         self.foreground = active;
         if !active {
+            self.peer_reader = None;
+            self.peer_view = None;
             self.invalidate_window();
         }
         if let Some(r) = &self.replica {
@@ -252,6 +260,10 @@ impl Model {
     pub fn set_screen(&mut self, screen: Screen) {
         if self.screen.list() && !screen.list() {
             self.invalidate_window();
+        }
+        if screen != Screen::Sync {
+            self.peer_reader = None;
+            self.peer_view = None;
         }
         self.screen = screen;
         self.visible_pages = vec![0];
@@ -666,14 +678,7 @@ impl Model {
                         || next.composition.as_ref().map(Arc::as_ptr)
                             != old.composition.as_ref().map(Arc::as_ptr)
                 }
-                Screen::Sync => {
-                    next.activity_serial != old.activity_serial || match (&next.network, &old.network) {
-                        (Some(a), Some(b)) => !Arc::ptr_eq(a, b)
-                            && (a.host_epoch != b.host_epoch || a.connections != b.connections),
-                        (None, None) => false,
-                        _ => true,
-                    }
-                }
+                Screen::Sync => next.activity_serial != old.activity_serial,
                 _ => false,
             };
             if dirty
@@ -699,6 +704,23 @@ impl Model {
                 {
                     self.invalidate_window();
                 }
+            }
+        }
+        if self.screen == Screen::Sync && self.foreground && !self.visual() {
+            let mut root = self.peer_reader.as_ref().and_then(|r| r.snapshot());
+            let mut changed = false;
+            if root.is_none() {
+                // On the steady path the screen holds the Peer reader already.
+                // Consult the lifecycle slot only to bind or replace a retired peer.
+                let reader = self.replica.as_ref().and_then(|r| r.peer_health(self.activity_serial));
+                if self.peer_reader != reader {
+                    changed = self.peer_view.take().is_some();
+                    root = reader.as_ref().and_then(|r| r.snapshot());
+                    self.peer_reader = reader;
+                }
+            }
+            if crate::network::Observation::update(&mut self.peer_view, root) || changed {
+                self.table_epoch += 1;
             }
         }
         self.acknowledge();
@@ -771,11 +793,10 @@ impl Model {
             .map(|p| (p.direct_present, p.records))
     }
     pub fn peer_observation(&self) -> Option<&crate::network::Observation> {
-        if self.foreground && self.acknowledged() && self.status.error.is_none() {
-            self.status.network.as_deref()
-        } else {
-            None
-        }
+        if !self.foreground || self.status.error.is_some() { return None; }
+        #[cfg(feature = "synthetic-proof")]
+        if let Some(fixture) = &self.fixture { return fixture.peer_observation.as_ref(); }
+        self.peer_view.as_ref()
     }
     pub fn fresh_network(&self) -> bool {
         self.peer_observation().is_some_and(|n| n.age_ms() <= 5000)
@@ -787,6 +808,20 @@ impl Model {
         }
         if !self.foreground {
             return "Paused".into();
+        }
+        if let Some(n) = self.peer_observation() {
+            let fresh = self.fresh_network();
+            let count = match n.len() {
+                0 if fresh && s.listening => return "Listening".into(),
+                0 => "No connected nodes".into(),
+                1 => "1 connected node".into(),
+                count => format!("{count} connected nodes"),
+            };
+            return if fresh {
+                count
+            } else {
+                format!("{count} · observed over 5 s ago")
+            };
         }
         let replay = s
             .replay_progress
@@ -814,20 +849,6 @@ impl Model {
                 };
             }
             return "Reading local data".into();
-        }
-        if let Some(n) = self.peer_observation() {
-            let fresh = self.fresh_network();
-            let count = match n.connections.len() {
-                0 if fresh && s.listening => return "Listening".into(),
-                0 => "No connected nodes".into(),
-                1 => "1 connected node".into(),
-                count => format!("{count} connected nodes"),
-            };
-            return if fresh {
-                count
-            } else {
-                format!("{count} · observed over 5 s ago")
-            };
         }
         if s.running && (s.listening || s.selected > 0) {
             "Starting network"

@@ -9,6 +9,7 @@ use std::sync::Arc;
 pub(super) struct Fixture {
     pub rows: Vec<Row>,
     pub reduced: bool,
+    pub peer_observation: Option<Observation>,
     prefix: bool,
 }
 impl Fixture {
@@ -127,39 +128,30 @@ impl Fixture {
                 unknown_roots: 0,
             });
         }
-        if has("--sync-fixture") {
-            status.network = Some(Arc::new(Observation {
-                host_epoch: 1,
-                sampled_at: triblespace_net::clock::mono_now().as_nanos(),
-                connections: if has("--sync-fixture-empty") {
-                    Vec::new()
-                } else {
-                    vec![
-                        Connection {
-                            id: 1,
-                            peer: "2a".repeat(32),
-                            received_bytes: None,
-                            sent_bytes: None,
-                            receive_bytes_per_second: Some(1_250_000.),
-                            send_bytes_per_second: Some(32_000.),
-                            rtt_ms: Some(12.),
-                        },
-                        Connection {
-                            id: 2,
-                            peer: "3b".repeat(32),
-                            received_bytes: None,
-                            sent_bytes: None,
-                            receive_bytes_per_second: None,
-                            send_bytes_per_second: None,
-                            rtt_ms: None,
-                        },
-                    ]
-                },
-            }));
-        }
+        let peer_observation = has("--sync-fixture").then(|| {
+            Observation::visual(if has("--sync-fixture-empty") {
+                Vec::new()
+            } else {
+                vec![
+                    Connection {
+                        peer: "2a".repeat(32),
+                        receive_bytes_per_second: Some(1_250_000.),
+                        send_bytes_per_second: Some(32_000.),
+                        rtt_ms: Some(12.),
+                    },
+                    Connection {
+                        peer: "3b".repeat(32),
+                        receive_bytes_per_second: None,
+                        send_bytes_per_second: None,
+                        rtt_ms: None,
+                    },
+                ]
+            })
+        });
         Self {
             rows,
             reduced: mode == "reduced",
+            peer_observation,
             prefix,
         }
     }

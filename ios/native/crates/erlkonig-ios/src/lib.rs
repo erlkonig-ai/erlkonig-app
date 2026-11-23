@@ -230,7 +230,6 @@ pub struct Status {
     pub action_serial: u64,
     pub last_cleanup_error: Option<String>,
     pub network_started: bool,
-    pub network: Option<Arc<network::Observation>>,
     pub bound_sockets: usize,
     pub message: String,
     pub error: Option<String>,
@@ -250,11 +249,14 @@ enum Command {
     OpeningCheckpoint(Box<dyn FnOnce(Option<&Pile>, bool, &Arc<Mutex<Status>>, &mut u64) + Send>),
     #[cfg(test)]
     BeforeForeground(Box<dyn FnOnce(&Pile, &Arc<Mutex<Status>>) + Send>),
+    #[cfg(test)]
+    BeforeFirstPeerTurn(Box<dyn FnOnce(&Arc<Mutex<Status>>) + Send>),
     Stop,
 }
 pub struct Replica {
     command: mpsc::Sender<Command>,
     activity_serial: AtomicU64,
+    peer: Arc<arc_swap::ArcSwapOption<network::Session>>,
     status: Arc<Mutex<Status>>,
 }
 
@@ -394,8 +396,9 @@ fn worker(
     root: PathBuf,
     commands: mpsc::Receiver<Command>,
     status: Arc<Mutex<Status>>,
+    peer: Arc<arc_swap::ArcSwapOption<network::Session>>,
 ) {
-    worker_with_cleanup(root, commands, status, pause);
+    worker_with_cleanup(root, commands, status, peer, pause);
 }
 
 /// Coalesce visibility into the next sample without discarding a bounded,
@@ -418,6 +421,7 @@ fn worker_with_cleanup(
     root: PathBuf,
     commands: mpsc::Receiver<Command>,
     status: Arc<Mutex<Status>>,
+    sessions: Arc<arc_swap::ArcSwapOption<network::Session>>,
     mut cleanup: impl FnMut(&mut Option<Peer<Pile>>, &mut Option<Pile>) -> Result<()>,
 ) {
     let result = (|| -> Result<()> {
@@ -442,6 +446,8 @@ fn worker_with_cleanup(
         let mut replay_budget = replay_budget;
         #[cfg(test)]
         let mut before_foreground: Option<Box<dyn FnOnce(&Pile, &Arc<Mutex<Status>>) + Send>> = None;
+        #[cfg(test)]
+        let mut before_peer_turn: Option<Box<dyn FnOnce(&Arc<Mutex<Status>>) + Send>> = None;
         let mut snapshot_requested = true;
         let mut opening_published = Instant::now();
         let mut replay_meter = ReplayMeter::default();
@@ -504,6 +510,7 @@ fn worker_with_cleanup(
                     }
                     // Discovery changes saved native intent through the same store.
                     // A dormant peer needs an eager host afterward, but not a reopen.
+                    sessions.store(None);
                     cleanup(&mut peer, &mut opening)?;
                     collections::start_discovery(opening.as_mut().expect("local owner"), &key)?;
                     snapshot_requested = true;
@@ -512,6 +519,11 @@ fn worker_with_cleanup(
                 #[cfg(test)]
                 Ok(Command::OpeningCheckpoint(checkpoint)) => {
                     checkpoint(opening.as_ref(), peer.is_some(), &status, &mut replay_budget);
+                    continue;
+                }
+                #[cfg(test)]
+                Ok(Command::BeforeFirstPeerTurn(checkpoint)) => {
+                    before_peer_turn = Some(checkpoint);
                     continue;
                 }
                 #[cfg(test)]
@@ -600,6 +612,9 @@ fn worker_with_cleanup(
                         // Repeated lifecycle events still need their own ack.
                         // An in-progress replay acknowledges only at EOF below.
                         if !next || replay_complete {
+                            if let Some(current) = &peer {
+                                sessions.store(Some(Arc::new(network::Session { serial, reader: current.health_reader() })));
+                            }
                             publish(&status, |s| s.activity_serial = serial);
                         }
                         continue;
@@ -610,6 +625,7 @@ fn worker_with_cleanup(
                         chart_sample = None;
                         chart_requested = chart_active;
                         storage_requested = !storage_roots.is_empty();
+                        sessions.store(None);
                         let stopped = cleanup(&mut peer, &mut opening);
                         active = false;
                         let warning = match stopped {
@@ -623,7 +639,6 @@ fn worker_with_cleanup(
                             if warning.is_some() { s.last_cleanup_error = warning; }
                             s.running = false;
                             s.network_started = false;
-                            s.network = None;
                             s.bound_sockets = 0;
                             s.message = "Replica paused".into();
                             s.activity_serial = serial;
@@ -639,7 +654,6 @@ fn worker_with_cleanup(
                     active = true;
                     publish(&status, |s| {
                         s.running = false;
-                        s.network = None;
                         s.message = if replay_complete { "Local collections ready" } else { "Loading local collections…" }.into();
                     });
                 }
@@ -693,7 +707,11 @@ fn worker_with_cleanup(
                     // startup and serving indexes cannot delay that publication.
                     #[cfg(test)]
                     if let Some(checkpoint) = before_foreground.take() { checkpoint(&pile, &status); }
-                    peer = Some(foreground_pile(pile, key.clone())?);
+                    let current = foreground_pile(pile, key.clone())?;
+                    sessions.store(Some(Arc::new(network::Session { serial: requested_activity, reader: current.health_reader() })));
+                    peer = Some(current);
+                    #[cfg(test)]
+                    if let Some(checkpoint) = before_peer_turn.take() { checkpoint(&status); }
                     publish(&status, |s| s.running = true);
                 }
             }
@@ -812,7 +830,6 @@ fn worker_with_cleanup(
                             s.action_serial = s.action_serial.wrapping_add(1);
                         }
                         s.network_started = health.started_at.is_some();
-                        s.network = network::Observation::observe(&health, s.network.as_deref()).map(Arc::new);
                         s.bound_sockets = current.bound_sockets().len();
                         s.message = if roots.is_empty() {
                             if listening {
@@ -843,6 +860,7 @@ fn worker_with_cleanup(
         drop(previous.take());
         drop(storage_sample.take());
         drop(chart_sample.take());
+        sessions.store(None);
         let peer_close = finish(&mut peer);
         let local_close = opening.take().map(Pile::close).transpose();
         match (operation, peer_close, local_close) {
@@ -863,7 +881,6 @@ fn worker_with_cleanup(
             s.composition = None;
             s.network_started = false;
             s.bound_sockets = 0;
-            s.network = None;
             s.message = "Replica needs attention".into();
             s.error = Some(format!("{error:#}"));
         });
@@ -881,13 +898,21 @@ impl Replica {
         let (command, receiver) = mpsc::channel();
         let status = Arc::new(Mutex::new(Status::default()));
         let worker_status = status.clone();
+        let peer = Arc::new(arc_swap::ArcSwapOption::empty());
+        let worker_peer = peer.clone();
         std::thread::Builder::new().name("ios-replica".into()).stack_size(WORKER_STACK_BYTES)
-            .spawn(move || worker(root, receiver, worker_status))?;
-        Ok(Self { command, status, activity_serial: AtomicU64::new(0) })
+            .spawn(move || worker(root, receiver, worker_status, worker_peer))?;
+        Ok(Self { command, status, peer, activity_serial: AtomicU64::new(0) })
+    }
+
+    /// Bind only to the peer owned by this foreground request. The slot changes
+    /// at lifecycle boundaries, independently of the pile/status publisher.
+    pub fn peer_health(&self, serial: u64) -> Option<triblespace_net::health::HealthReader> {
+        self.peer.load().as_ref().filter(|s| serial != 0 && s.serial == serial).map(|s| s.reader.clone())
     }
 
     /// A frame with no change or a busy writer can keep its current immutable view.
-    /// Capture does not query the pile or copy the storage and network observations.
+    /// Capture does not query the pile or copy retained storage observations.
     pub fn read_after(&self, previous: Option<u64>) -> Option<Status> {
         let status = self.status.try_lock().ok()?;
         (previous != Some(status.revision)).then(|| status.clone())
@@ -955,7 +980,7 @@ impl Status {
             "storage": &*self.storage, "composition": self.composition.as_deref(),
             "action_error": self.action_error, "action_serial": self.action_serial,
             "last_cleanup_error": self.last_cleanup_error, "network_started": self.network_started,
-            "network": self.network.as_deref(), "bound_sockets": self.bound_sockets,
+            "bound_sockets": self.bound_sockets,
             "message": self.message, "error": self.error
         })
     }
@@ -1178,10 +1203,10 @@ mod tests {
         pile.close().unwrap();
         let (sender, receiver) = mpsc::channel();
         let status = Arc::new(Mutex::new(Status::default()));
-        let replica = Replica { command: sender.clone(), status: status.clone(), activity_serial: AtomicU64::new(0) };
+        let replica = Replica { command: sender.clone(), status: status.clone(), peer: Default::default(), activity_serial: AtomicU64::new(0) };
         let path = dir.path().to_owned();
         let thread = std::thread::Builder::new().stack_size(WORKER_STACK_BYTES).spawn(move || {
-            worker_with_cleanup(path, receiver, status, |peer, local| {
+            worker_with_cleanup(path, receiver, status, Default::default(), |peer, local| {
                 let was_open = peer.is_some();
                 pause(peer, local)?;
                 if was_open {
@@ -1278,7 +1303,7 @@ mod tests {
         let path = dir.path().to_owned();
         let (finished, completion) = mpsc::channel();
         let thread = std::thread::Builder::new().stack_size(WORKER_STACK_BYTES).spawn(move || {
-            worker_with_cleanup(path, receiver, status, pause);
+            worker_with_cleanup(path, receiver, status, Default::default(), pause);
             let _ = finished.send(());
         }).unwrap();
         // Stop is already queued even if a later assertion fails. Bound the

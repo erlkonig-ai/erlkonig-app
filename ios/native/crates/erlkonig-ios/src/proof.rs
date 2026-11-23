@@ -133,6 +133,8 @@ pub fn run(root: &Path) -> Result<serde_json::Value> {
                 source_endpoint.bound_sockets().into_iter().map(iroh_base::TransportAddr::Ip)))]));
         let (mut source, source_owner) = peer(source_endpoint.clone(), source).await;
         let (mut reader, reader_owner) = peer(reader_endpoint.clone(), reader).await;
+        let health = reader.health_reader();
+        let mut observed_source = false;
         for peer in [&mut source, &mut reader] {
             peer.set_replication(ReplicationMode::Full, [collection]);
             peer.activate_collection(collection);
@@ -145,7 +147,12 @@ pub fn run(root: &Path) -> Result<serde_json::Value> {
             let _ = tokio::time::timeout(Duration::from_millis(100), reader.reconcile()).await;
             let snapshot = reader.snapshot()?;
             let has_record = snapshot.records()?.any(|value| value.is_ok_and(|value| value == record));
-            if has_record && snapshot.contains_blob(handle)? { break true; }
+            observed_source |= health.snapshot().is_some_and(|h| {
+                h.observed_at.is_some()
+                    && h.connections.get(source_key.verifying_key().as_bytes())
+                        .and_then(|c| c.traffic).is_some_and(|t| t.received_bytes > 0)
+            });
+            if observed_source && has_record && snapshot.contains_blob(handle)? { break true; }
             if Instant::now() >= deadline { break false; }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
@@ -155,6 +162,8 @@ pub fn run(root: &Path) -> Result<serde_json::Value> {
         source_endpoint.close().await; reader_endpoint.close().await;
         source.flush()?; reader.flush()?;
         source.close()?; reader.close()?;
+        ensure!(observed_source, "passive peer health did not observe the authenticated loopback source");
+        ensure!(health.snapshot().is_none(), "closed reader still publishes health");
         if !transferred { bail!("Full replication did not land record and large referenced UTF-8 blob within 45 seconds"); }
         Ok::<_, anyhow::Error>(())
     })?;
@@ -191,7 +200,7 @@ pub fn run(root: &Path) -> Result<serde_json::Value> {
     drop(restored);
     drop(snapshot);
     reopened.close()?;
-    let report = serde_json::json!({"source_off_read":true,"identity_reopened":true,
+    let report = serde_json::json!({"source_off_read":true,"identity_reopened":true,"observed_source_peer":true,
         "explicit_read_grant":true,"selection_reopened":true,"payload_bytes":payload.len(),
         "reader_node_id":hex::encode(reader_id.as_bytes()),"collection":hex::encode(collection.raw),
         "payload":hex::encode(handle.raw)});

@@ -9,6 +9,7 @@ publish.workspace = true
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+arc-swap = "1.9"
 erlkonig-crown = { path = "../erlkonig-crown" }
 triblespace-core.workspace = true
 triblespace-net.workspace = true
