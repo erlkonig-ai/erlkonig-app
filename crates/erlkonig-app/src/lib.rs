@@ -10,7 +10,7 @@ pub mod app;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod native_menu;
 
-pub mod crown;
+pub use erlkonig_crown as crown;
 pub mod faculties_browser;
 
 /// The command-line verbs: the node CLI and the `mcp-stdio` transport. Each

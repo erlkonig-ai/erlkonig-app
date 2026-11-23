@@ -1,10 +1,9 @@
 //! Erlkonig's wavelet crown, still at rest and gently moving during app-owned work.
 //!
-//! The canonical website's Gabor/Morlet crown fixes the outer geometry and
-//! reference band. Rest and motion share a softer, smooth-centred inner wave;
-//! walls, tips and base stay put. Attention adds steady, sharper inner crests,
-//! independently of work or Reduce Motion. No clock, timer, worker or network
-//! lives here.
+//! The normal crown uses the canonical Gabor/Morlet contour. One phase drives
+//! its travelling inner wave. Walls, tips and base stay fixed. Attention uses
+//! steady sharper inner crests independently of work or Reduce Motion. The
+//! caller supplies monotonic time and activity; this crate owns no timer.
 //!
 //! The caller owns a monotonic origin and samples actual app-owned work, not
 //! enabled services or payload throughput. Retain `began_at` throughout a burst
@@ -23,8 +22,6 @@ const ATTACK: f64 = 0.160;
 const WAVE_STEPS: usize = 140;
 const SCALE: f64 = 0.060; // 400 canonical units → 24 points, with 1 pt side padding
 const WAVE_PERIOD: Duration = Duration::from_millis(3600);
-// Normal rest and motion share one gain against the ORIGINAL canonical band.
-const RIPPLE_AMPLITUDE: f64 = 0.75;
 const CENTRE_RADIUS: f64 = 0.2;
 const ATTENTION_AMPLITUDE: f64 = 0.95;
 const ATTENTION_STATIC_WEIGHT: f64 = 0.70;
@@ -179,20 +176,6 @@ fn canonical_points() -> Vec<Point> {
     points
 }
 
-/// Pure monotonic time + observed activity + attention → vector frame.
-///
-/// Normal rest is the same softened wave at phase zero. Attention changes only
-/// the shape, never the activity envelope. For either shape, reduced motion,
-/// idle, invalid and fully settled inputs produce bit-identical resting points.
-pub fn frame(
-    now: Duration,
-    activity: Option<WorkActivity>,
-    reduced_motion: bool,
-    needs_attention: bool,
-) -> Frame {
-    frame_with_amplitude(now, activity, reduced_motion, needs_attention, RIPPLE_AMPLITUDE)
-}
-
 // One fixed, even spatial carrier: a smooth travelling direction near the
 // centre, ordinary radial travel outside it. Its temporal amplitude is <= 1.
 // At phase zero it is exactly the canonical cosine, without a separate outline.
@@ -218,13 +201,13 @@ fn parametric_points(phase: f64) -> Vec<Point> {
     points
 }
 
-/// iOS's single phase-driven crown. Idle, reduced motion and completed cycles
+/// Shared phase-driven crown. Idle, reduced motion and completed cycles
 /// evaluate the same equation at phase zero. Work ends at the next cycle boundary
 /// (at most 3.6 seconds); the shared observer preserves phase on earlier resume.
 /// Attention delegates to the unchanged desktop bristles and motion behavior.
-pub fn parametric_frame(now: Duration, activity: Option<WorkActivity>,
+pub fn frame(now: Duration, activity: Option<WorkActivity>,
     reduced_motion: bool, needs_attention: bool) -> Frame {
-    if needs_attention { return frame(now, activity, reduced_motion, true); }
+    if needs_attention { return attention_frame(now, activity, reduced_motion); }
     let activity = activity.filter(|a| !reduced_motion && a.began_at <= now
         && a.ended_at.is_none_or(|end| a.began_at <= end && end <= now)
         && !landed(now, *a));
@@ -234,8 +217,7 @@ pub fn parametric_frame(now: Duration, activity: Option<WorkActivity>,
     Frame { points: parametric_points(phase), animating: activity.is_some() }
 }
 
-fn frame_with_amplitude(now: Duration, activity: Option<WorkActivity>,
-    reduced_motion: bool, needs_attention: bool, ripple_amplitude: f64) -> Frame {
+fn attention_frame(now: Duration, activity: Option<WorkActivity>, reduced_motion: bool) -> Frame {
     let (amount, animating) = envelope(now, activity, reduced_motion);
     let mut points = canonical_points();
     let (ceiling, floor) = wave_bounds(&points);
@@ -263,22 +245,10 @@ fn frame_with_amplitude(now: Duration, activity: Option<WorkActivity>,
         let radius = ((point.x - WIDTH / 2.0) / (225.0 * SCALE * 0.25)).abs();
         let rest = radial_carrier(radius, 0.0);
         let carrier = rest + amount * (radial_carrier(radius, phase) - rest);
-        let (amplitude, carrier) = if needs_attention {
-            // A convex mix keeps the canonical bounds without clipping. The
-            // steady bristles remain readable while actual work can ripple
-            // underneath; neither fault onset nor persistence starts motion.
-            (
-                ATTENTION_AMPLITUDE,
-                ATTENTION_STATIC_WEIGHT * attention_carrier(radius)
-                    + (1.0 - ATTENTION_STATIC_WEIGHT) * carrier,
-            )
-        } else {
-            (ripple_amplitude, carrier)
-        };
-        let target = middle
-            - amplitude * half * (-0.32 * radius * radius).exp() * carrier;
-        // One endpoint/tangent taper, one canonical reference. Neither the
-        // softened rest nor motion is scaled twice; no clipping or blur.
+        let bristles = ATTENTION_STATIC_WEIGHT * attention_carrier(radius)
+            + (1.0 - ATTENTION_STATIC_WEIGHT) * carrier;
+        let target = middle - ATTENTION_AMPLITUDE * half * (-0.32 * radius * radius).exp() * bristles;
+        // Keep the tangent joins fixed as the attention bristles move.
         point.y += taper * (target - point.y);
     }
     Frame { points, animating }
@@ -399,11 +369,11 @@ mod tests {
     fn parametric_phase_zero_is_whole_original_outline_and_cycle_is_periodic() {
         assert_eq!(parametric_points(0.0), canonical_points());
         let active = Some(WorkActivity { began_at: ms(0), ended_at: None });
-        let idle = super::parametric_frame(ms(0), None, false, false);
+        let idle = super::frame(ms(0), None, false, false);
         for time in (0..3600).step_by(7) {
-            let current = super::parametric_frame(ms(time), active, false, false);
-            assert_eq!(current, super::parametric_frame(ms(time + 3600), active, false, false));
-            assert_eq!(idle, super::parametric_frame(ms(time), active, true, false));
+            let current = super::frame(ms(time), active, false, false);
+            assert_eq!(current, super::frame(ms(time + 3600), active, false, false));
+            assert_eq!(idle, super::frame(ms(time), active, true, false));
             for (i, point) in current.points[2..WAVE_STEPS + 3].iter().enumerate() {
                 assert!((4.055 - 1e-12..=12.425 + 1e-12).contains(&point.y));
                 assert!((point.y - current.points[2 + WAVE_STEPS - i].y).abs() < 1e-12);
@@ -412,9 +382,9 @@ mod tests {
                 assert_eq!(current.points[i], idle.points[i]);
             }
         }
-        assert_eq!(super::parametric_frame(ms(3600), active, false, false).points, idle.points);
+        assert_eq!(super::frame(ms(3600), active, false, false).points, idle.points);
         for boundary in [ms(0), ms(3600)] {
-            let near = super::parametric_frame(boundary + Duration::from_nanos(1), active, false, false);
+            let near = super::frame(boundary + Duration::from_nanos(1), active, false, false);
             assert!(near.points.iter().zip(&idle.points).all(|(a,b)| (a.y-b.y).abs() < 1e-7));
         }
     }
@@ -437,42 +407,42 @@ mod tests {
 
     #[test]
     fn parametric_stop_and_resume_share_one_phase_and_settle_within_one_cycle() {
-        let idle = super::parametric_frame(ms(0), None, false, false);
+        let idle = super::frame(ms(0), None, false, false);
         for stop in (0..3600).step_by(31) {
             let active = Some(WorkActivity { began_at: ms(0), ended_at: None });
             let stopped = burst(0, stop);
-            assert_eq!(super::parametric_frame(ms(stop), active, false, false).points,
-                super::parametric_frame(ms(stop), stopped, false, false).points);
-            assert_eq!(idle, super::parametric_frame(ms(stop + 3600), stopped, false, false));
+            assert_eq!(super::frame(ms(stop), active, false, false).points,
+                super::frame(ms(stop), stopped, false, false).points);
+            assert_eq!(idle, super::frame(ms(stop + 3600), stopped, false, false));
         }
         for resume in [1400, 3599, 3600, 4000] {
             let mut activity = None;
             observe(&mut activity, true, ms(0));
             observe(&mut activity, false, ms(1000));
-            let before = super::parametric_frame(ms(resume), activity, false, false);
+            let before = super::frame(ms(resume), activity, false, false);
             observe(&mut activity, true, ms(resume));
-            assert_eq!(before.points, super::parametric_frame(ms(resume), activity, false, false).points);
+            assert_eq!(before.points, super::frame(ms(resume), activity, false, false).points);
             assert_eq!(activity.unwrap().began_at, if resume < 3600 { ms(0) } else { ms(resume) });
         }
         for time in 500..1000 {
-            assert_eq!(idle, super::parametric_frame(ms(time), burst(500, 500), false, false));
+            assert_eq!(idle, super::frame(ms(time), burst(500, 500), false, false));
         }
-        let before = super::parametric_frame(ms(3600) - Duration::from_nanos(1), burst(0, 1000), false, false);
+        let before = super::frame(ms(3600) - Duration::from_nanos(1), burst(0, 1000), false, false);
         assert!(before.points.iter().zip(&idle.points).all(|(a,b)| (a.y-b.y).abs() < 1e-7));
-        assert_eq!(idle, super::parametric_frame(ms(100), burst(500, 600), false, false));
+        assert_eq!(idle, super::frame(ms(100), burst(500, 600), false, false));
     }
 
     #[test]
-    fn parametric_presentation_preserves_attention_exactly() {
-        for reduced in [false, true] {
-            for time in (0..7200).step_by(17) {
-                for activity in [None, burst(0, time.min(1300)), Some(WorkActivity {
-                    began_at: ms(0), ended_at: None,
-                })] {
-                    assert_eq!(super::parametric_frame(ms(time), activity, reduced, true),
-                        super::frame(ms(time), activity, reduced, true));
-                }
-            }
+    fn attention_matches_previous_menu_and_phone_samples() {
+        let active = Some(WorkActivity { began_at: ms(0), ended_at: None });
+        for (time, centre, shoulder) in [
+            (0, 4.256310850295030, 10.479515143260972),
+            (900, 5.403782696976700, 9.132010824919931),
+            (1800, 6.551254543658369, 9.830652301820693),
+        ] {
+            let actual = attention_frame(ms(time), active, false);
+            assert!((actual.points[72].y - centre).abs() < 1e-12);
+            assert!((actual.points[84].y - shoulder).abs() < 1e-12);
         }
     }
 
@@ -496,31 +466,21 @@ mod tests {
     }
 
     #[test]
-    fn normal_shape_remains_the_original_softened_wave_at_every_phase() {
-        let activity = Some(WorkActivity { began_at: ms(0), ended_at: None });
-        for tick in 0..720 {
-            let now = ms(tick * 5);
-            let actual = frame(now, activity, false);
-            let mut original = canonical_points();
-            let (ceiling, floor) = wave_bounds(&original);
-            let middle = (ceiling + floor) * 0.5;
-            let half = (floor - ceiling) * 0.5;
-            let (amount, animating) = envelope(now, activity, false);
-            let phase = TAU * (now.as_nanos() % WAVE_PERIOD.as_nanos()) as f64
-                / WAVE_PERIOD.as_nanos() as f64;
-            for (i, point) in original[2..WAVE_STEPS + 3].iter_mut().enumerate() {
-                let u = i as f64 / WAVE_STEPS as f64;
-                let pinned = 1.0 / WAVE_STEPS as f64;
-                let taper = smooth((u.min(1.0 - u) - pinned) / (0.10 - pinned));
-                let radius = ((point.x - WIDTH / 2.0) / (225.0 * SCALE * 0.25)).abs();
-                let rest = radial_carrier(radius, 0.0);
-                let carrier = rest + amount * (radial_carrier(radius, phase) - rest);
-                let target = middle
-                    - RIPPLE_AMPLITUDE * half * (-0.32 * radius * radius).exp() * carrier;
-                point.y += taper * (target - point.y);
-            }
-            assert_eq!(actual, Frame { points: original, animating });
+    fn production_frame_matches_shipped_phone_crest_and_travelling_wave() {
+        // Sampled from the pre-UIKit bridge and renderer at 62aa707.
+        let active = Some(WorkActivity { began_at: ms(0), ended_at: None });
+        for (time, centre, shoulder) in [
+            (0, 4.055, 12.012604837608356),
+            (900, 8.240, 7.217312747003249),
+            (1800, 12.425, 4.467395162391645),
+            (2700, 8.240, 9.262687252996749),
+        ] {
+            let actual = frame(ms(time), active, false);
+            assert!((actual.points[1].y - 6.049243103189411).abs() < 1e-12);
+            assert!((actual.points[72].y - centre).abs() < 1e-12);
+            assert!((actual.points[84].y - shoulder).abs() < 1e-12);
         }
+        assert_eq!(frame(ms(0), None, false).points, canonical_points());
     }
 
     #[test]
@@ -546,10 +506,10 @@ mod tests {
         let idle = frame(ms(0), None, false);
         let attention = attention_frame(ms(0), None, false);
         let centre = 2 + WAVE_STEPS / 2;
-        assert!(idle.points[centre].y - attention.points[centre].y > 0.75);
+        assert!(attention.points[centre].y > idle.points[centre].y);
         let normal_rise = idle.points[centre + 1].y - idle.points[centre].y;
         let sharp_rise = attention.points[centre + 1].y - attention.points[centre].y;
-        assert!(sharp_rise > 0.35 && sharp_rise > 10.0 * normal_rise);
+        assert!(sharp_rise > 0.35 && sharp_rise > 3.0 * normal_rise);
         assert!(idle.points.iter().zip(&attention.points)
             .filter(|(a, b)| (a.y - b.y).abs() > 0.5).count() > 30);
         for radius in [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5] {
@@ -560,7 +520,8 @@ mod tests {
     #[test]
     fn attention_keeps_finite_bounds_symmetry_and_pinned_endpoints_during_work() {
         let canonical = canonical_points();
-        let (ceiling, floor) = wave_bounds(&canonical);
+        let ceiling = canonical[2 + WAVE_STEPS / 2].y;
+        let floor = 12.425;
         for tick in 0..1200 {
             let now = ms(tick * 10);
             let active = Some(WorkActivity { began_at: ms(0), ended_at: None });
@@ -672,7 +633,8 @@ mod tests {
     fn coordinates_are_finite_bounded_and_outer_silhouette_does_not_move() {
         let idle = frame(ms(0), None, false);
         let canonical = canonical_points();
-        let (ceiling, floor) = wave_bounds(&canonical);
+        let ceiling = template_point(250.0, 186.0 - 155.0 * 0.45).y;
+        let floor = template_point(250.0, 186.0 + 155.0 * 0.45).y;
         for tick in 0..1200 {
             let now = ms(tick * 10);
             let f = frame(
@@ -725,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn native_geometry_has_softened_rest_and_pinned_outer_outline() {
+    fn resting_geometry_has_canonical_crest_and_pinned_outer_outline() {
         let idle = frame(ms(0), None, false);
         let min_x = idle.points.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
         let max_x = idle.points.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
@@ -736,8 +698,7 @@ mod tests {
         let (ceiling, floor) = wave_bounds(&canonical_points());
         assert!((ceiling - 4.055).abs() < 1e-12);
         assert!((floor - 12.107434011801187).abs() < 1e-12);
-        assert!((min_y - ((ceiling + floor) * 0.5 - RIPPLE_AMPLITUDE * (floor - ceiling) * 0.5)).abs() < 1e-12);
-        assert!(min_y > ceiling);
+        assert_eq!(min_y, ceiling);
     }
 
     #[test]
@@ -763,43 +724,6 @@ mod tests {
                 ((radial_carrier(1e-7, phase) - radial_carrier(0.0, phase)) / 1e-7).abs() < 0.00001
             );
         }
-    }
-
-    #[test]
-    fn active_ripple_uses_a_softer_centred_band_without_deepening() {
-        let idle = frame(ms(0), None, false);
-        let (ceiling, floor) = wave_bounds(&canonical_points());
-        let crest = frame(ms(3600), burst(0, 3600), false);
-        let quarter = frame(ms(900), burst(0, 900), false);
-        let valley = frame(ms(1800), burst(0, 1800), false);
-        let centre = 2 + WAVE_STEPS / 2;
-        let middle = (ceiling + floor) * 0.5;
-        let amplitude = (floor - ceiling) * 0.5 * RIPPLE_AMPLITUDE;
-        assert!((crest.points[centre].y - (middle - amplitude)).abs() < 1e-12);
-        assert!((quarter.points[centre].y - middle).abs() < 1e-12);
-        assert!((valley.points[centre].y - (middle + amplitude)).abs() < 1e-12);
-        assert!(crest.points[centre].y > ceiling && valley.points[centre].y < floor);
-        assert_eq!(crest.points, idle.points); // rest is the SAME phase-zero wave
-        assert_eq!(quarter, frame(ms(4500), burst(0, 4500), false));
-        // Phase is relative to each burst, not an arbitrary app uptime origin.
-        assert_eq!(valley, frame(ms(11_800), burst(10_000, 11_800), false));
-    }
-
-    #[test]
-    fn central_inversion_has_a_broader_opening_between_crests() {
-        let f = frame(ms(1800), burst(0, 1800), false);
-        let centre = 2 + WAVE_STEPS / 2;
-        let mut peak = centre + 1;
-        while f.points[peak + 1].y < f.points[peak].y { peak += 1; }
-        assert!(2.0 * (f.points[peak].x - WIDTH / 2.0) > 4.0);
-        let level = (f.points[centre].y + f.points[peak].y) * 0.5;
-        let mut right = centre + 1;
-        while f.points[right].y > level { right += 1; }
-        let (a, b) = (f.points[right - 1], f.points[right]);
-        let crossing = a.x + (level - a.y) * (b.x - a.x) / (b.y - a.y);
-        // v9's half-depth opening was only 1.543 pt; this is not just a
-        // shallower copy of that hairline valley or a raster blur.
-        assert!(2.0 * (crossing - WIDTH / 2.0) > 2.0);
     }
 
     #[test]
@@ -855,9 +779,8 @@ mod tests {
         let u = (index - 2) as f64 / WAVE_STEPS as f64;
         let radius = ((base[index].x - WIDTH / 2.0) / (225.0 * SCALE * 0.25)).abs();
         let taper = smooth((u.min(1.0 - u) - 1.0 / 140.0) / (0.10 - 1.0 / 140.0));
-        let (ceiling, floor) = wave_bounds(&base);
-        let expected = (floor - ceiling) * RIPPLE_AMPLITUDE
-            * (-0.32 * radius * radius).exp() * taper;
+        let travel = 2.0 * 155.0 * 0.45 * SCALE;
+        let expected = travel * (-0.32 * radius * radius).exp() * taper;
         assert!((high - low - expected).abs() < 0.003); // 120 sampled phases
         assert!(high - low > 1.0); // At least two native Retina pixels of travel.
     }
@@ -999,7 +922,12 @@ mod tests {
             touched += 1;
             // Straight alpha: the colour is never premultiplied by coverage.
             assert_eq!(a[..3], [10, 200, 30]);
-            assert_eq!(b[..3], [10, 200, 30]);
+            if b[3] == 0 {
+                assert_eq!(a[3], 1);
+                assert_eq!(b, [0, 0, 0, 0]);
+            } else {
+                assert_eq!(b[..3], [10, 200, 30]);
+            }
             assert!(b[3] <= 128);
             assert!((f64::from(b[3]) - f64::from(a[3]) * 128.0 / 255.0).abs() <= 1.0);
         }

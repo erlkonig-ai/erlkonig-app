@@ -386,8 +386,8 @@ same pile. There is no parallel mutable workspace database, and raw credentials
 are never stored as facts.
 
 `erlkonig-core` owns configuration, credentials, lifecycle and client setup.
-`erlkonig-app` owns the platform-neutral menu state, crown geometry and
-command-line dispatch. `erlkonig-mac` (the macOS menu and AppKit crown) and
+`erlkonig-app` owns the platform-neutral menu state and command-line dispatch.
+It re-exports the `erlkonig-crown` geometry shared with iOS. `erlkonig-mac` (the macOS menu and AppKit crown) and
 `erlkonig-linux` (the Linux tray and status window) are the platform binaries;
 both are installed as the `erlkonig` command. `faculties`, `trible` and
 `triblespace-net` are linked libraries, not launched commands. The node's

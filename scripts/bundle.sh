@@ -84,7 +84,7 @@ fi
     fi
     printf 'cargo-lock-sha256 %s\n' "$(shasum -a 256 "$repo/Cargo.lock" | cut -d' ' -f1)"
     printf 'app-icon-sha256 %s\n' "$(shasum -a 256 "$tmp/Contents/Resources/Erlkonig.icns" | cut -d' ' -f1)"
-    printf 'app-icon-crown-source-sha256 %s\n' "$(shasum -a 256 "$repo/crates/erlkonig-app/src/crown.rs" | cut -d' ' -f1)"
+    printf 'app-icon-crown-source-sha256 %s\n' "$(shasum -a 256 "$repo/ios/native/crates/erlkonig-crown/src/lib.rs" | cut -d' ' -f1)"
     printf 'app-icon-geometry exact production crown::frame(Duration::ZERO, None, false, false)\n'
     printf 'sha256-before-signing %s erlkonig\n' "$(shasum -a 256 "$tmp/Contents/MacOS/erlkonig" | cut -d' ' -f1)"
     printf 'lifecycle one resident app owner; same-executable connection-scoped stdio; no second backend or LaunchAgent\n'

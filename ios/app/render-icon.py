@@ -14,7 +14,7 @@ with tempfile.TemporaryDirectory(prefix='erlkonig-icon-') as directory:
     work = Path(directory)
     rust = '#[allow(dead_code)]\n#[path = ' + json.dumps(str(source)) + '] mod crown;\n' + r'''
 fn main() {
-    let frame = crown::parametric_frame(std::time::Duration::ZERO, None, false, false);
+    let frame = crown::frame(std::time::Duration::ZERO, None, false, false);
     assert!(!frame.animating);
     print!("[");
     for (i, point) in frame.points.iter().enumerate() {
@@ -74,7 +74,7 @@ print("1024x1024 opaque RGB; exact off-white interior, black perimeter; no baked
     subprocess.run(['/usr/bin/swift', str(work/'render.swift'), str(work/'points.json'), str(output)], check=True, timeout=90)
     receipt = {'geometry_source': 'native/crates/erlkonig-crown/src/lib.rs',
         'geometry_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
-        'entry_point': 'parametric_frame(Duration::ZERO, None, false, false)',
+        'entry_point': 'frame(Duration::ZERO, None, false, false)',
         'points_sha256': hashlib.sha256(points).hexdigest(), 'points': len(json.loads(points)),
         'width': 1024, 'height': 1024, 'opaque_rgb': True, 'crown_srgb': '#f7f9ef',
         'background_srgb': '#000000', 'crown_width_fraction': 0.64, 'baked_corner_mask': False,

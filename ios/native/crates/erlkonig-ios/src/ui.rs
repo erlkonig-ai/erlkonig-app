@@ -725,7 +725,7 @@ impl Phone {
         }
         let body = rect(x, y, w, bottom - y);
         u.table.setFrame(body);
-        u.crown.setFrame(body);
+        u.crown.setFrame(rect(i.left, y, bounds.size.width - i.left - i.right, bottom - y));
         u.progress.setFrame(bounds);
     }
 }

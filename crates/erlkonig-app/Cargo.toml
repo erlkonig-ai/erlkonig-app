@@ -12,6 +12,7 @@ name = "linux-icons"
 path = "../../scripts/linux/render-icons.rs"
 
 [dependencies]
+erlkonig-crown = { path = "../../ios/native/crates/erlkonig-crown" }
 erlkonig-core.workspace = true
 faculties-erp.workspace = true
 faculties = { workspace = true, features = ["widgets"] }
