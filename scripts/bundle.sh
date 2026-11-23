@@ -80,7 +80,7 @@ fi
         printf 'binary-build-provenance binary-provenance.txt\n'
         printf 'binary-provenance-sha256 %s\n' "$(shasum -a 256 "$tmp/Contents/Resources/binary-provenance.txt" | cut -d' ' -f1)"
     else
-        printf 'composition public Faculty catalog; no private adapters\n'
+        printf 'composition Faculty catalog with workspace-scoped ERP and Revolver importer\n'
     fi
     printf 'cargo-lock-sha256 %s\n' "$(shasum -a 256 "$repo/Cargo.lock" | cut -d' ' -f1)"
     printf 'app-icon-sha256 %s\n' "$(shasum -a 256 "$tmp/Contents/Resources/Erlkonig.icns" | cut -d' ' -f1)"

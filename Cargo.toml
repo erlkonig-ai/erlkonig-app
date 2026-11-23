@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/erlkonig-cli", "crates/erlkonig-core", "crates/erlkonig-app", "crates/erlkonig-linux", "crates/erlkonig-mac"]
+members = ["crates/faculties-erp", "crates/erlkonig-cli", "crates/erlkonig-core", "crates/erlkonig-app", "crates/erlkonig-linux", "crates/erlkonig-mac"]
 
 [workspace.package]
 version = "0.1.2"
@@ -10,6 +10,8 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+anybytes = { path = "../anybytes" }
+faculties-erp = { path = "crates/faculties-erp" }
 erlkonig-core = { path = "crates/erlkonig-core" }
 erlkonig-app = { path = "crates/erlkonig-app" }
 serde = { version = "1", features = ["derive"] }
@@ -27,7 +29,7 @@ tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros", "io-
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
-faculties = { path = "../faculties-view-data", default-features = false }
+faculties = { path = "../faculties", default-features = false }
 triblespace = { path = "../triblespace-rs", default-features = false }
 triblespace-net = { path = "../triblespace-rs/triblespace-net" }
 trible = { path = "../triblespace-rs/trible", default-features = false }

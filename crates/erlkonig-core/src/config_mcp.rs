@@ -49,6 +49,11 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"workspace":{"type":"string"},"label":{"type":"string"},"routes":{"type":"array","minItems":1,"items":{"type":"object","properties":{"role":{"type":"string"},"root":{"type":"string"}},"required":["role","root"],"additionalProperties":false}}},"required":["observation","workspace"],"additionalProperties":false}"#,
     },
     Tool {
+        name: "config_enable_workspace_erp",
+        description: "Enable bookkeeping on one exact current workspace. Creates one owner-private ERP collection tagged for this workspace and publishes its new revision with every existing route. The operation grants no recipient access. Inspect the new workspace revision before further calls. A workspace with an ERP route is refused.",
+        input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"workspace":{"type":"string"}},"required":["observation","workspace"],"additionalProperties":false}"#,
+    },
+    Tool {
         name: "config_remove_workspace",
         description: "Withdraw exactly one current workspace revision, including an unavailable or conflicted revision shown by config_inspect. Other concurrent revisions remain visible; no winner is guessed. Collections, data, sharing authority, native sync selections, identity and services remain unchanged. Requires the latest observation from config_inspect.",
         input_schema: r#"{"type":"object","properties":{"observation":{"type":"string"},"workspace":{"type":"string"}},"required":["observation","workspace"],"additionalProperties":false}"#,
@@ -141,7 +146,7 @@ struct Edit {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Remove {
+struct WorkspaceRevision {
     observation: String,
     workspace: String,
 }
@@ -439,8 +444,14 @@ impl ConfigMcp {
                 let id = node.put_workspace(&view, &value)?;
                 json!({"workspace":format!("{id:X}")})
             }
+            "config_enable_workspace_erp" => {
+                let args: WorkspaceRevision = mcp::decode_arguments(arguments)?;
+                current(&view, &args.observation)?;
+                let id = node.enable_workspace_erp(&view, revision(&args.workspace)?)?;
+                json!({"workspace":format!("{id:X}")})
+            }
             "config_remove_workspace" => {
-                let args: Remove = mcp::decode_arguments(arguments)?;
+                let args: WorkspaceRevision = mcp::decode_arguments(arguments)?;
                 current(&view, &args.observation)?;
                 let id = node.remove_workspace_revision(&view, revision(&args.workspace)?)?;
                 json!({"withdrawal":format!("{id:X}"), "data_retained":true})

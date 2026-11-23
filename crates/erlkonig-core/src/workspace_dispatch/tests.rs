@@ -55,6 +55,15 @@ impl Fixture {
         node.config().unwrap().workspace(revision).unwrap().unwrap()
     }
 
+    fn workspace_with_erp(&self, label: &str) -> Workspace {
+        let original = self.workspace(label);
+        let mut guard = self.node.lock().unwrap();
+        let node = guard.as_mut().unwrap();
+        let view = node.config().unwrap();
+        let revision = node.enable_workspace_erp(&view, original.id).unwrap();
+        node.config().unwrap().workspace(revision).unwrap().unwrap()
+    }
+
     fn call(&self, name: &str, arguments: Value) -> Result<String> {
         self.raw(name, &serde_json::to_string(&arguments).unwrap())
     }
@@ -916,7 +925,24 @@ fn schema_registration_does_not_open_a_pile_key_or_configuration() {
     )
     .unwrap();
     assert!(dispatch.tools().len() > 100);
-    assert!(!dispatch.tools().iter().any(|tool| tool.name.starts_with("erp_")));
+    let erp_tools: BTreeSet<_> = dispatch
+        .tools()
+        .iter()
+        .filter(|tool| tool.name.starts_with("erp_"))
+        .map(|tool| tool.name)
+        .collect();
+    assert_eq!(
+        erp_tools,
+        BTreeSet::from([
+            "erp_account_add",
+            "erp_amex_import",
+            "erp_amex_migrate",
+            "erp_invoice_add",
+            "erp_review",
+            "erp_classify",
+            "erp_match",
+        ])
+    );
     let mut server = session(&dispatch);
     let response = server
         .dispatch(Bytes::from(
@@ -925,23 +951,298 @@ fn schema_registration_does_not_open_a_pile_key_or_configuration() {
         .unwrap()
         .unwrap();
     let response: Value = serde_json::from_str(&response).unwrap();
-    assert!(!response["result"]["tools"]
+    let listed_erp: BTreeSet<_> = response["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|tool| tool["name"].as_str().unwrap().starts_with("erp_")));
-    for name in [
-        "erp_account_add", "erp_amex_import", "erp_amex_migrate",
-        "erp_invoice_add", "erp_review", "erp_classify", "erp_match",
-    ] {
-        assert!(!dispatch.tools().iter().any(|tool| tool.name == name));
-        assert!(rpc_call(&mut server, name, json!({}))["error"].is_object());
-    }
+        .filter(|tool| tool["name"].as_str().unwrap().starts_with("erp_"))
+        .map(|tool| {
+            assert!(
+                tool["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("workspace"))
+            );
+            tool["name"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(listed_erp, erp_tools);
+    assert_eq!(
+        rpc_call(&mut server, "erp_review", json!({"month":"2026-09"}))["error"]["code"],
+        -32602
+    );
     assert!(dispatch.owners.borrow().is_empty());
     dispatch.close().unwrap();
     assert!(!pile.exists());
     assert!(!key.exists());
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+// Synthetic statement only; no live files, credentials, piles or imports.
+const ERP_CSV: &str = "Datum,Beschreibung,Betrag,Weitere Details,Erscheint auf Ihrer Abrechnung als,Adresse,Stadt,PLZ,Land,Betreff,Kategorie\n01/09/2026,Synthetic shop,\"7,05\",Original FX USD 8.19 / rate 1.162,,,,,,synthetic-ref,\n";
+
+#[test]
+fn erp_tools_and_files_stay_in_the_exact_request_workspace() {
+    let f = Fixture::new();
+    let original = f.dir.path().join("synthetic-statement.csv");
+    fs::write(&original, ERP_CSV).unwrap();
+    let a = f.workspace_with_erp("Same label");
+    let b = f.workspace_with_erp("Same label");
+    let actor = format!("{:X}", genid().id);
+    let account: Value = serde_json::from_str(
+        &f.call(
+            "erp_account_add",
+            json!({
+                "workspace": format!("{:X}", a.id), "label": "Synthetic account", "actor": actor,
+            }),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let import = json!({
+        "workspace": format!("{:X}", a.id), "path": original,
+        "name": "synthetic-statement.csv", "account": account["account"],
+        "currency": "EUR", "month": "2026-09", "actor": actor,
+    });
+    let imported: Value =
+        serde_json::from_str(&f.call("erp_amex_import", import.clone()).unwrap()).unwrap();
+    assert_eq!(imported["rows"], 1);
+    assert_eq!(imported["activities"].as_array().unwrap().len(), 1);
+    let mut by_reference = import.clone();
+    by_reference.as_object_mut().unwrap().remove("path");
+    by_reference["file_id"] = imported["file"].clone();
+    let repeated: Value = serde_json::from_str(&f.call("erp_amex_import", by_reference.clone()).unwrap()).unwrap();
+    assert_eq!(repeated["activities"], imported["activities"]);
+    let b_account: Value = serde_json::from_str(&f.call("erp_account_add", json!({
+        "workspace":format!("{:X}", b.id), "label":"Synthetic B account", "actor":actor,
+    })).unwrap()).unwrap();
+    by_reference["workspace"] = json!(format!("{:X}", b.id));
+    by_reference["account"] = b_account["account"].clone();
+    let a_files = faculties::files::operations::Files::with_storage(
+        f.dispatch.owners.borrow().get(&a.id).unwrap().storage.clone(),
+    );
+    let file_id = imported["file"].as_str().unwrap();
+    let original_before = a_files.get(file_id).unwrap().bytes;
+    assert_eq!(original_before.as_ref(), ERP_CSV.as_bytes());
+
+    // Read the selected native roots directly: this does not attach either
+    // Files view, so B's foreign-reference attempt below remains cold.
+    // Files imports and file entities share the Files root. Its facts and
+    // publication frontier matter; descriptor blobs alone publish neither.
+    let selected_state = || {
+        let mut guard = f.node.lock().unwrap();
+        let node = guard.as_mut().unwrap();
+        let snapshot = node.pile.snapshot().unwrap();
+        [&a, &b].map(|workspace| {
+            [
+                faculties::schemas::files::DEFAULT_SCOPE_ID,
+                faculties_erp::bookkeeping::DEFAULT_SCOPE_ID,
+            ]
+            .map(|scope| {
+                let handle = workspace.routes[&scope];
+                let collection =
+                    faculties::collection_names::open_workspace_in(&snapshot, handle).unwrap();
+                let facts: TribleSet = collection.read(&snapshot).unwrap();
+                let coverage = triblespace::core::collection::CoverageRead::coverage(
+                    &snapshot,
+                    &BTreeSet::from([handle]),
+                )
+                .unwrap();
+                (facts, coverage.frontier(handle).collect::<Vec<_>>())
+            })
+        })
+    };
+    let before_foreign_reference = selected_state();
+    assert!(before_foreign_reference[1][0].0.is_empty(), "B has no Files imports or files");
+    assert!(!before_foreign_reference[1][1].0.is_empty(), "B already has its own account");
+    let mut emitted = Vec::new();
+    let error = f.dispatch.call(
+        "erp_amex_import",
+        Bytes::from(serde_json::to_vec(&by_reference).unwrap()),
+        &mut Out::new(&mut |part| {
+            emitted.push(part);
+            Ok(())
+        }),
+    ).expect_err("B's valid account cannot consume A's exact Files reference");
+    let refusal = error.downcast_ref::<faculties::mcp::input::NotAFile>()
+        .unwrap_or_else(|| panic!("expected source-file refusal, got {error:#}"));
+    assert_eq!(refusal.id, file_id);
+    assert!(emitted.is_empty(), "foreign reference must emit no partial result");
+    let after_foreign_reference = selected_state();
+    for (index, label) in ["A", "B"].into_iter().enumerate() {
+        for (role, name) in ["Files/imports", "ERP"].into_iter().enumerate() {
+            assert!(
+                before_foreign_reference[index][role].0 == after_foreign_reference[index][role].0,
+                "{label} {name} facts changed after foreign reference refusal"
+            );
+            assert_eq!(
+                before_foreign_reference[index][role].1, after_foreign_reference[index][role].1,
+                "{label} {name} publication frontier changed after foreign reference refusal"
+            );
+        }
+    }
+    assert_eq!(a_files.get(file_id).unwrap().bytes.as_ref(), original_before.as_ref());
+    let review = |workspace: &Workspace| {
+        f.call(
+            "erp_review",
+            json!({
+                "workspace": format!("{:X}", workspace.id), "month": "2026-09",
+            }),
+        )
+        .unwrap()
+    };
+    let before_review = fs::read(&f.dispatch.node.pile).unwrap();
+    let only_a = review(&a);
+    assert!(
+        only_a.contains("Synthetic shop")
+            && only_a.contains("synthetic-ref")
+            && only_a.contains("Original FX USD 8.19 / rate 1.162"),
+        "{only_a}"
+    );
+    let only_b = review(&b);
+    assert!(
+        !only_b.contains("Synthetic shop") && !only_b.contains("synthetic-ref"),
+        "{only_b}"
+    );
+    assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before_review);
+    assert!(
+        f.call(
+            "files_show",
+            json!({
+                "workspace":format!("{:X}", a.id),"id":imported["file"],
+            })
+        )
+        .unwrap()
+        .contains("synthetic-statement.csv")
+    );
+    assert!(
+        f.call(
+            "files_show",
+            json!({
+                "workspace":format!("{:X}", b.id),"id":imported["file"],
+            })
+        )
+        .is_err()
+    );
+    let mut wrong_workspace = import;
+    wrong_workspace["workspace"] = json!(format!("{:X}", b.id));
+    assert!(
+        f.call("erp_amex_import", wrong_workspace).is_err(),
+        "an account in A is not an account in B"
+    );
+    assert_eq!(review(&b), only_b);
+    assert!(
+        !f.call("files_list", selection(&b))
+            .unwrap()
+            .contains("synthetic-statement.csv")
+    );
+    assert!(f.call("erp_review", json!({"month":"2026-09"})).is_err());
+    assert!(
+        f.call(
+            "erp_review",
+            json!({
+                "workspace":"Same label","month":"2026-09",
+            })
+        )
+        .is_err()
+    );
+    assert!(
+        f.call(
+            "erp_review",
+            json!({
+                "workspace":format!("{:X}",genid().id),"month":"2026-09",
+            })
+        )
+        .is_err()
+    );
+    assert!(f.call("erp_unregistered", selection(&a)).is_err());
+}
+
+#[test]
+fn erp_missing_role_keeps_the_catalog_and_older_workspace_available() {
+    let f = Fixture::new();
+    let mut workspace = f.workspace_with_erp("Earlier workspace");
+    workspace
+        .routes
+        .remove(&faculties_erp::bookkeeping::DEFAULT_SCOPE_ID);
+    f.configure(&mut workspace);
+    let before = fs::read(&f.dispatch.node.pile).unwrap();
+    for (tool, arguments) in [
+        (
+            "erp_review",
+            json!({
+                "workspace":format!("{:X}",workspace.id),"month":"2026-09",
+            }),
+        ),
+        (
+            "erp_account_add",
+            json!({
+                "workspace":format!("{:X}",workspace.id),"label":"must not exist",
+                "actor":format!("{:X}",genid().id),
+            }),
+        ),
+    ] {
+        let error = f.call(tool, arguments).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("ERP collection role is unconfigured"),
+            "{error:#}"
+        );
+    }
+    assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
+    assert!(
+        f.dispatch
+            .tools()
+            .iter()
+            .any(|tool| tool.name == "erp_review")
+    );
+    assert!(
+        f.call(
+            "compass_add",
+            json!({
+                "workspace":format!("{:X}",workspace.id),"title":"Public tools still work",
+            })
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn erp_import_does_not_supply_a_missing_files_role() {
+    let f = Fixture::new();
+    let original = f.dir.path().join("synthetic-statement.csv");
+    fs::write(&original, ERP_CSV).unwrap();
+    let mut workspace = f.workspace_with_erp("No Files route");
+    let actor = format!("{:X}", genid().id);
+    let account: Value = serde_json::from_str(
+        &f.call(
+            "erp_account_add",
+            json!({
+                "workspace":format!("{:X}",workspace.id),"label":"Synthetic account","actor":actor,
+            }),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    workspace
+        .routes
+        .remove(&faculties::schemas::files::DEFAULT_SCOPE_ID);
+    f.configure(&mut workspace);
+    let before = fs::read(&f.dispatch.node.pile).unwrap();
+    let error = f
+        .call(
+            "erp_amex_import",
+            json!({
+                "workspace":format!("{:X}",workspace.id),"path":original,
+                "name":"must-not-import.csv","account":account["account"],
+                "currency":"EUR","month":"2026-09","actor":actor,
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("is unconfigured"),
+        "{error:#}"
+    );
+    assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
 }
 
 #[test]

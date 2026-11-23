@@ -2674,6 +2674,7 @@ dependencies = [
  "egui-winit",
  "erlkonig-core",
  "faculties",
+ "faculties-erp",
  "libc",
  "lissajous",
  "pollster",
@@ -2689,6 +2690,7 @@ version = "0.1.2"
 dependencies = [
  "anyhow",
  "erlkonig-core",
+ "faculties-erp",
  "serde",
  "serde_json",
  "signal-hook",
@@ -2703,6 +2705,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek 2.2.0",
  "faculties",
+ "faculties-erp",
  "getrandom 0.4.3",
  "hex",
  "hifitime",
@@ -2934,6 +2937,25 @@ dependencies = [
  "zeroize",
  "zip",
  "zmij",
+]
+
+[[package]]
+name = "faculties-erp"
+version = "0.1.0"
+dependencies = [
+ "anybytes",
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "ed25519-dalek 2.2.0",
+ "faculties",
+ "hifitime",
+ "num-rational",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "triblespace",
 ]
 
 [[package]]

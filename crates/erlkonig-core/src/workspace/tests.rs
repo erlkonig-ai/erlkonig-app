@@ -5,10 +5,15 @@ use triblespace::core::metadata;
 use triblespace::core::repo::StorageFlush;
 
 #[test]
-fn public_roles_match_the_supported_faculty_table() {
+fn erp_role_extends_the_workspace_role_table() {
     let public = faculties::collection_names::table();
-    assert_eq!(roles(), public);
-    assert!(!public.iter().any(|(_, name)| *name == "erp"));
+    let supported = roles();
+    assert_eq!(&supported[..public.len()], &public);
+    assert_eq!(supported.len(), public.len() + 1);
+    let erp = faculties_erp::bookkeeping::DEFAULT_SCOPE_ID;
+    assert!(!public.iter().any(|(role, name)| *role == erp || *name == "erp"));
+    assert_eq!(supported.last(), Some(&(erp, "erp")));
+    assert_eq!(role_name(erp), Some("erp"));
     for (role, name) in public {
         assert_eq!(role_name(role), Some(name));
     }
@@ -164,6 +169,10 @@ fn local_discovery_preserves_bytes_distinguishes_same_names_and_supports_exact_p
     );
     assert!(discovery.select(wiki, denied.handle()).is_err());
     assert!(discovery.select(wiki, descriptor_only.handle()).is_ok());
+    let erp = faculties_erp::bookkeeping::DEFAULT_SCOPE_ID;
+    assert!(discovery.select(erp, own.handle()).is_ok());
+    assert!(discovery.select(erp, read_only.handle()).is_ok());
+    assert!(discovery.select(erp, denied.handle()).is_err());
     assert!(discovery.select(genid().id, own.handle()).is_err());
     assert!(
         discovery

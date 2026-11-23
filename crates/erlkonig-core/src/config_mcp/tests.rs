@@ -358,8 +358,26 @@ fn sharing_read_only_enrolls_same_roots_and_reads_without_write_or_delegation() 
     let recipient = Fixture::new();
     let third = Fixture::new();
     let id = owner.create("Shared research");
+    let before = owner.workspace(&id);
+    let role = faculties_erp::bookkeeping::DEFAULT_SCOPE_ID;
+    assert_eq!(before.routes.len(), faculties::collection_names::table().len());
+    assert!(!before.routes.contains_key(&role));
+    let observation = owner.inspect()["observation"].clone();
+    let args = json!({"workspace": id, "observation": observation});
+    let proofs_before = owner.proofs();
+    let id = owner.call("config_enable_workspace_erp", args.clone()).unwrap()["workspace"].clone();
     let original = owner.workspace(&id);
-    assert_eq!(original.routes.len(), workspace::roles().len());
+    assert_eq!(original.anchor, before.anchor);
+    assert_eq!(original.label, before.label);
+    let mut existing = original.routes.clone();
+    assert!(existing.remove(&role).is_some());
+    assert_eq!(existing, before.routes);
+    assert_eq!(proofs_before, owner.proofs());
+    assert!(owner.call("config_enable_workspace_erp", args).is_err());
+    assert!(owner.call("config_enable_workspace_erp", json!({
+        "workspace": id, "observation": owner.inspect()["observation"],
+    })).is_err());
+    assert!(call(&owner.dispatch, "erp_review", json!({"workspace":id, "month":"2026-09"})).is_ok());
     call(&owner.dispatch, "compass_add", json!({"workspace":id,"title":"Shared evidence"})).unwrap();
     let before = owner.inspect();
     let shared = owner.share(&id, &recipient, "read_only", None).unwrap();
@@ -409,6 +427,10 @@ fn sharing_read_only_enrolls_same_roots_and_reads_without_write_or_delegation() 
     owner.replicate_to(&recipient, &original);
     assert!(call(&recipient.dispatch, "compass_list", json!({"workspace":local_id})).unwrap().contains("Shared evidence"));
     assert!(call(&recipient.dispatch, "compass_add", json!({"workspace":local_id,"title":"Denied write"})).is_err());
+    assert!(call(&recipient.dispatch, "erp_review", json!({"workspace":local_id,"month":"2026-09"})).is_ok());
+    assert!(call(&recipient.dispatch, "erp_account_add", json!({
+        "workspace":local_id, "label":"Denied ERP write", "actor":format!("{:X}",genid().id),
+    })).is_err());
     let proof_count = recipient.proofs();
     assert!(recipient.share(local_id, &third, "read_only", None).is_err());
     assert_eq!(recipient.proofs(), proof_count, "failed delegation publishes no proof");
@@ -2195,4 +2217,33 @@ fn native_sync_telemetry_requires_effective_write_before_any_append() {
     grant_collection_write(&mut node.pile, root, &foreign, signer).unwrap();
     reporter.publish(node, &health).unwrap();
     assert!(reporter.publisher().is_some());
+}
+#[test]
+fn erp_reenable_uses_new_authority_even_when_a_previous_root_was_shared() {
+    let owner = Fixture::new();
+    let recipient = Fixture::new();
+    let role = faculties_erp::bookkeeping::DEFAULT_SCOPE_ID;
+    let enable = |id: &Value| {
+        owner.call("config_enable_workspace_erp", json!({
+            "observation":owner.inspect()["observation"], "workspace":id,
+        })).unwrap()["workspace"].clone()
+    };
+    let first_id = enable(&owner.create("Synthetic workspace"));
+    let first = owner.workspace(&first_id);
+    owner.share(&first_id, &recipient, "read_only", None).unwrap();
+    let public_routes: Vec<_> = first.routes.iter().filter(|(id, _)| **id != role)
+        .map(|(id, root)| json!({"role":workspace::role_name(*id).unwrap(),
+            "root":format!("blake3:{}", hex::encode(root.raw))})).collect();
+    let without = owner.call("config_edit_workspace", json!({
+        "observation": owner.inspect()["observation"], "workspace": first_id, "routes": public_routes,
+    })).unwrap()["workspace"].clone();
+    let second = owner.workspace(&enable(&without));
+    let mut guard = owner.config.node.lock().unwrap();
+    let snap = guard.as_mut().unwrap().pile.snapshot().unwrap();
+    let key = VerifyingKey::from_bytes(&recipient.config.binding.signer).unwrap();
+    let original = triblespace::core::collection::Collection::<blobencodings::SimpleArchive>::open(&snap, first.routes[&role]).unwrap();
+    let fresh = triblespace::core::collection::Collection::<blobencodings::SimpleArchive>::open(&snap, second.routes[&role]).unwrap();
+    assert_ne!(original.handle(), fresh.handle());
+    assert!(original.reader_is_admitted(&snap, key).unwrap());
+    assert!(!fresh.reader_is_admitted(&snap, key).unwrap());
 }

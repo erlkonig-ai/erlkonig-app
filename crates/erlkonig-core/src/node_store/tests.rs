@@ -301,7 +301,7 @@ fn workspace_revisions_are_path_free_and_old_requests_never_retarget() {
     let id = node.create_workspace(&view, "Research").unwrap();
     let view = node.config().unwrap();
     let mut workspace = view.workspace(id).unwrap().unwrap();
-    assert_eq!(workspace.routes.len(), crate::workspace::roles().len());
+    assert_eq!(workspace.routes.len(), faculties::collection_names::table().len());
     let facts = view.facts().unwrap();
     assert!(!exists!(
         pattern!(&facts, [{id @ attrs::pile_path: _?path}])
@@ -333,7 +333,7 @@ fn equal_names_get_distinct_private_bundles_with_friendly_names() {
     let view = node.config().unwrap();
     let a = view.workspace(first).unwrap().unwrap();
     let b = view.workspace(second).unwrap().unwrap();
-    for (role, _) in crate::workspace::roles() {
+    for (role, _) in faculties::collection_names::table() {
         assert_ne!(a.routes[&role], b.routes[&role]);
         let descriptor: TribleSet = node.pile.snapshot().unwrap().get(a.routes[&role]).unwrap();
         let name = triblespace::core::collection::descriptor::name(&descriptor)

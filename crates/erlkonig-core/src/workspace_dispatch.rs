@@ -58,8 +58,33 @@ pub struct WorkspaceDispatch {
 
 struct Owner {
     binding: Workspace,
-    catalog: catalog::Catalog,
+    catalog: NativeFaculties,
     storage: Storage,
+}
+
+/// Each adapter borrows the same workspace storage. The catalog closes it once.
+struct NativeFaculties {
+    catalog: catalog::Catalog,
+    erp: faculties_erp::bookkeeping::mcp::Erp,
+}
+
+impl NativeFaculties {
+    fn with_storage(config: catalog::Config, storage: Storage) -> Self {
+        Self {
+            catalog: catalog::Catalog::with_storage(config, storage.clone()),
+            erp: faculties_erp::bookkeeping::mcp::Erp::with_storage(storage),
+        }
+    }
+
+    fn registrations(&self) -> Vec<&dyn Faculty> {
+        let mut registrations = self.catalog.registrations();
+        registrations.push(&self.erp);
+        registrations
+    }
+
+    fn close(&self) -> Result<()> {
+        self.catalog.close()
+    }
 }
 
 impl WorkspaceDispatch {
@@ -70,7 +95,7 @@ impl WorkspaceDispatch {
         // Catalog construction is I/O-free. The schema-only catalog has no
         // usable path and is never dispatched; there is no node-pile fallback.
         let path = PathBuf::new();
-        let catalog = catalog::Catalog::with_storage(
+        let catalog = NativeFaculties::with_storage(
             catalog::Config::new(&path),
             Storage::shared_with_daemon(path, None, None).with_collections(BTreeMap::new()),
         );
@@ -174,7 +199,7 @@ impl WorkspaceDispatch {
         Ok(Owner {
             binding: workspace,
             storage: storage.clone(),
-            catalog: catalog::Catalog::with_storage(config, storage),
+            catalog: NativeFaculties::with_storage(config, storage),
         })
     }
 

@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 pub const INPUT_LIMIT: usize = 1024 * 1024;
 pub const HELP: &str = "Erlkonig — foreground owner and Faculty client
 
+  erlkonig erp --help
   erlkonig --version
   erlkonig serve [--data-dir ABSOLUTE_PATH]
   erlkonig workspaces list --url http://127.0.0.1:PORT/ [--output json]
@@ -14,7 +15,7 @@ pub const HELP: &str = "Erlkonig — foreground owner and Faculty client
   erlkonig call TOOL --url http://127.0.0.1:PORT/ [--workspace LABEL_OR_ID]
       [--json JSON | --json -] [--output json]
 
-All commands accept --data-dir (the same app directory as the owner).
+Owner and Faculty client commands accept --data-dir (the same app directory as the owner).
 Client commands require an already-running owner and its explicit URL.
 --json - reads one JSON object from stdin. Default arguments are {}.
 --workspace resolves one current label or revision; selection lasts one call.

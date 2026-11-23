@@ -1,11 +1,37 @@
 # Erlkonig
 
-This isolated public-source candidate uses the public Faculty catalog. It does
-not include the private ERP adapter or its collection role. Its source and CI
-recipe are not yet publication-ready: dependency source availability, license
-notices and native validation remain outstanding. The retained lock has an ERP-only
-reconciliation verified with locked offline metadata; this is not a build validation.
-See `ci/source-inputs.json` and the inactive `ci/native.yml.draft` recipe.
+Erlkonig includes the Faculty catalog, workspace-scoped ERP tools, and the
+Revolver importer. From a clean checkout in an empty parent directory,
+fetch the pinned public source dependencies with
+`python3 scripts/ci/release_inputs.py --app "$PWD" --fetch-development-sources`.
+Install the formatter's compilation target with
+`rustup target add --toolchain 1.98.0 wasm32-unknown-unknown`.
+Build with `cargo build --locked -p erlkonig-mac` on macOS or
+`cargo build --locked -p erlkonig-linux` on Linux. For the headless CLI, use
+`cargo build --locked -p erlkonig-cli`. Run the shared checks with
+`cargo test --locked -p faculties-erp -p erlkonig-core -p erlkonig-app -p erlkonig-cli`.
+Toolchain and platform requirements are recorded in `ci/source-inputs.json`.
+
+The desktop shells share their UI and backend with the crates in this workspace.
+The Swift and Rust iOS client is planned for the same product repository.
+The current native packaging targets are macOS ARM64 and Linux x86-64 and ARM64.
+
+## Bookkeeping and Revolver imports
+
+Use `list_workspaces` and `config_inspect` on the running app to select a
+workspace. Pass its current revision and configuration observation to
+`config_enable_workspace_erp`. It returns the new workspace revision and
+creates a bookkeeping collection accessible to the owner. Use that revision
+with `erp_review`, `erp_invoice_add`, and the other ERP tools. Sharing uses
+the workspace’s existing grant and enrollment controls.
+
+The macOS, Linux and headless CLI binaries include the Revolver operator command. Run
+`erlkonig erp source revolver import --help` for its source options and
+`erlkonig erp --help` for the destination pile and signing key options.
+The importer reads a Revolver PostgreSQL database through `psql` or replays
+an ordered PostgreSQL COPY text capture from `--from-dir`. Select
+an independent destination pile for these direct CLI operations. Use the
+authenticated workspace tools for the running app’s collections.
 
 One macOS menu-bar application, one executable, one resident backend. The
 main thread owns the menu; native Rust workers own replication, maintenance
@@ -14,7 +40,7 @@ LaunchAgent or KeepAlive restarter is bundled. A client may start the same
 executable in `mcp-stdio` mode: this connection-scoped transport only forwards
 to the running app, and never owns a pile or starts a backend.
 
-## Local secret entry (private prototype)
+## Local secret entry
 
 `secrets_enter_local` takes the exact `workspace` ID from `list_workspaces`,
 `service` and `name` (each 1–160 visible characters), and optional `kind`
@@ -759,11 +785,7 @@ ticket. Test the downloaded artifact on a clean supported Mac, including fresh
 installation and upgrade, rather than treating a local mount check as those
 tests. Signing credentials and external submission are separate release work.
 
-The adjacent native dependency repositories must be the frozen source cohort
-recorded by the validation run. See `TESTING-for-JP.md` for the remaining
-interactive checks; automated success is not a claim those checks occurred.
-
-## Faculties viewer candidate
+## Faculties data viewer
 
 Choose **View data** from the crown menu, then select a workspace from the dropdown.
 Choosing it again brings the same window forward; after closing it, the command
@@ -881,3 +903,7 @@ retained lock hash. This source candidate adds only a local CLI package entry
 to the prior lock, without changing external dependency versions. Native build,
 runtime acceptance, complete license notices and publishing are separate release
 steps; source/fixture tests do not establish them.
+
+## License
+
+Erlkonig is available under the [MIT License](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE).

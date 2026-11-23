@@ -71,7 +71,7 @@ fi
   df -h . "$RUNNER_TEMP"
 } > "$output/build-environment.txt"
 nice -n 10 "${cargo_cmd[@]}" test --release --locked --offline \
-  -p erlkonig-core -p erlkonig-app -p "$package" -- --test-threads=1
+  -p faculties-erp -p erlkonig-cli -p erlkonig-core -p erlkonig-app -p "$package" -- --test-threads=1
 nice -n 10 "${cargo_cmd[@]}" build --release --locked --offline -p erlkonig-core --example accept-fixture
 nice -n 10 "${cargo_cmd[@]}" build --release --locked --offline -p "$package"
 if [ "$package" = erlkonig-linux ]; then

@@ -13,6 +13,7 @@ path = "../../scripts/linux/render-icons.rs"
 
 [dependencies]
 erlkonig-core.workspace = true
+faculties-erp.workspace = true
 faculties = { workspace = true, features = ["widgets"] }
 GORBIE = { package = "lissajous", path = "../../../GORBIE", default-features = false }
 egui.workspace = true

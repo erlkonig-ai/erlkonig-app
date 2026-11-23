@@ -59,7 +59,7 @@ fn main() {
         let length = body.string().length();
         body.setSelectedRange(NSRange::new(0, length));
         assert_eq!(body.selectedRange(), NSRange::new(0, length));
-        // Exercise native copying without reading or modifying JP's clipboard.
+        // Exercise native copying without reading or modifying the system clipboard.
         let pasteboard = NSPasteboard::pasteboardWithUniqueName();
         let plain_text = unsafe { NSPasteboardTypeString };
         assert!(

@@ -437,7 +437,7 @@ impl NodeStore {
         let mut staging = triblespace::core::repo::memoryrepo::MemoryStore::default();
         let mut routes = Fragment::empty();
         let mut roots = Vec::new();
-        for (role, name) in crate::workspace::roles() {
+        for (role, name) in faculties::collection_names::table() {
             use triblespace::core::capability::policy;
             use triblespace::core::collection::records as descriptor;
             // The opaque bundle tag gives equally named bundles separate
@@ -542,7 +542,42 @@ impl NodeStore {
         Ok(true)
     }
 
+    pub(crate) fn enable_workspace_erp(&mut self, expected: &ConfigView, revision: Id) -> Result<Id> {
+        let mut workspace = expected.workspace(revision)?
+            .context("workspace is no longer current; inspect its latest revision")?;
+        let role = faculties_erp::bookkeeping::DEFAULT_SCOPE_ID;
+        if workspace.routes.contains_key(&role) {
+            bail!("workspace already has an ERP route; inspect the current binding");
+        }
+        let mut staging = triblespace::core::repo::memoryrepo::MemoryStore::default();
+        use triblespace::core::capability::policy;
+        use triblespace::core::collection::records as descriptor;
+        // A fresh descriptor entity prevents reusing an older root or its
+        // grants when the same workspace opts in after a route was removed.
+        let descriptor_id = genid();
+        let collection: Collection<blobencodings::SimpleArchive> = staging.register_collection(entity! {
+            &descriptor_id @
+            metadata::tag*: [descriptor::KIND_COLLECTION_DESCRIPTOR, workspace.anchor],
+            descriptor::collection_name: format!("{} · erp", workspace.label),
+            attrs::collection_role: role,
+            policy::resource_policy*: faculties::collection_names::private_policy(self.signer.verifying_key()).fragment(),
+            descriptor::collection_representation*: <blobencodings::SimpleArchive as MetaDescribe>::describe(),
+        })?;
+        let root = collection.handle();
+        workspace.routes.insert(role, root);
+        self.publish_workspace(expected, &workspace, staging)
+    }
+
     pub fn put_workspace(&mut self, expected: &ConfigView, value: &Workspace) -> Result<Id> {
+        self.publish_workspace(expected, value, Default::default())
+    }
+
+    fn publish_workspace(
+        &mut self,
+        expected: &ConfigView,
+        value: &Workspace,
+        staging: triblespace::core::repo::memoryrepo::MemoryStore,
+    ) -> Result<Id> {
         if self.config_changed(expected)? {
             bail!("node configuration changed since this edit was opened; reload before saving");
         }
@@ -570,11 +605,12 @@ impl NodeStore {
                 config::anchor: *role, config::selects: *root,
             };
         }
-        let fragment = entity! {
+        let mut fragment = entity! {
             metadata::tag: attrs::WORKSPACE, config::anchor: value.anchor,
             attrs::enrolled: true, metadata::name: value.label.clone(),
             attrs::workspace_route*: routes, metadata::supersedes*: previous,
         };
+        fragment.blobs_mut().union(staging.blobs);
         let id = fragment.root().expect("workspace revision has a root");
         self.pile.commit(self.config, &self.signer, fragment)?;
         self.pile.flush()?;

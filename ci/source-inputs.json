@@ -1,51 +1,15 @@
 {
-  "status": "draft-blocked; source-only; not built or approved for publication",
+  "status": "Source candidate. Binary release qualification is pending.",
   "activation_requirements": {
     "public_snapshot_reviewed": false,
-    "all_source_inputs_public": false,
+    "all_source_inputs_public": true,
     "retained_lock_reconciled_and_validated": false,
     "licenses_and_notices_packaged": false
   },
   "app": {
-    "base_commit": "f5784f6c140a0719bf0fa5aab1329b566f142a65",
-    "base_tree": "7f90c8e8077695968ffbd44501eedb78dd2acad5",
-    "app44_validation_files_sha256": "526b827cae968fc4aa204ebb83fb70c221651a304611d6f123186e7133bf2d2b",
-    "app44_overlay_patch_sha256": "6ec1e8b2d9654833b92b75782b20cb7c9445046e5fd5799391f3bb97d7ebdcc8",
-    "retained_lock_sha256": "3de16defeb3780f4b077e72bfbeeee729e8f287d200c96053617bcaf0544e2ba",
-    "lock_status": "Predecessor validation only: offline Cargo 1.98.0 reconciliation removed only faculties-erp 0.1.0 and the erlkonig-core edge, and locked offline metadata passed for that predecessor. This successor retains the public lock byte-for-byte and checks static lock-graph equality only. No Cargo metadata, compilation or native checks were run after advancing the Faculty source pin.",
+    "retained_lock_sha256": "c26089d26e67f0d1f97718d2269d176b5e062352784223c2341f255f3ede1576",
     "icon_lock_sha256": "c170177d6d038cbce66728c0693a05b22ca3ce7d65aaca04837867d040ddd75c",
-    "candidate_change": "Public Catalog composition retained; binary inputs use paths or Files references; sharing uses native grants and local pending enrollment only.",
-    "removed_tools": [
-      "erp_account_add",
-      "erp_amex_import",
-      "erp_amex_migrate",
-      "erp_invoice_add",
-      "erp_review",
-      "erp_classify",
-      "erp_match"
-    ],
-    "app44_original_lock_sha256": "f02e014d96fd9dfe5953ba911719801b0483f4a0a7c1bc08e97519971d507364",
-    "lock_reconciliation": {
-      "packages_before": 1062,
-      "packages_after": 1061,
-      "only_removed_package": "faculties-erp 0.1.0",
-      "scope": "local metadata only; no compile or fetch"
-    },
-    "linux_menu_test_correction": {
-      "patch_sha256": "b9c9a21d1e3c5e218c4016a8f0276ae9b08648f6fe043787a47dd5f4236ce680",
-      "path": "crates/erlkonig-app/src/app.rs",
-      "scope": "expected Browse Wiki row and login index 6 to 7 only",
-      "validation": "Public candidate retains the previously prepared test correction; no public native tests run in this step."
-    },
-    "source_reconciliation": {
-      "predecessor_patch_sha256": "64b88d1dab8efd0aebf82b7aebc233ddc5cd3dafbd130c0edb901fa05db40fb6",
-      "reference_freeze_sha256": "7d04d70d91ece05f604bb67c4172eec0ae3b68d201dd328baf325185d699b051",
-      "scope": "Source-only public-safe product changes; public native validation not run.",
-      "faculty_previous_commit": "e5e4cbe1eb4733f9ae2995a20687131c379d2eff",
-      "faculty_commit": "327e4a3feac24ca25fc9ac7967caa89053574ebf",
-      "retained_lock_changed": false,
-      "dependency_delta": "No packages, versions, sources, checksums or dependency edges changed from retained public lock."
-    }
+    "candidate_change": "Adds workspace-scoped bookkeeping tools and the Revolver operator command."
   },
   "toolchain": "1.98.0",
   "targets": {
@@ -70,7 +34,7 @@
       "target": "aarch64-unknown-linux-gnu",
       "cpu": "generic",
       "format": "AppImage",
-      "toolchain_inventory_sha256": "249d595996055c5fb8724cffe8689cfe2b71eb476d1fe99f5d89a63976646336",
+      "toolchain_inventory_sha256": "533060b7d4d154b39025ba24c7ec072723ce386bec4cc0959454b3919ef1b97d",
       "package_snapshot": "Actual accepted runner/resource/FUSE and current-source native receipt unresolved"
     }
   },
@@ -78,34 +42,35 @@
     {
       "path": "faculties",
       "url": "https://github.com/triblespace/faculties.git",
-      "commit": "327e4a3feac24ca25fc9ac7967caa89053574ebf",
-      "tree": "75df72088e5e8bcf2e84ebcdb93505d9fc7d1d24",
-      "files_manifest_sha256": "007e24137dee70f1cb3105e52b960be0aa254172b2752f113030775019aaa975",
-      "public_ref_verified": false,
-      "public_ref_status": "Exact local frozen source verified; public availability of this successor revision not rechecked in this source-only step."
+      "commit": "5c3495d58854ff204a38c7f3ff2457cf008ea112",
+      "tree": "18427cc1d7a4c1d6c84dc30337f467ead82aac6b",
+      "public_ref_verified": true,
+      "public_ref_status": "Exact local frozen source verified; public availability of this successor revision not rechecked in this source-only step.",
+      "overlay": {
+        "path": "ci/overlays/faculties-wiki-images.patch",
+        "sha256": "ed173858e385c36bac6249e3f3a8b6985c2bea15016f1ad6fcef4ee6b9017650",
+        "tree": "1888744b69c3faab4841c288b289cb2e5c23aee3"
+      }
     },
     {
       "path": "triblespace-rs",
       "url": "https://github.com/erlkonig-ai/triblespace.git",
-      "commit": "e6660fd3be5e1534cc3fb5b10482f8926f611dec",
-      "tree": "9a05901906e9dfe61d30bb92b1fbc456943c26c0",
-      "files_manifest_sha256": "3f62e5dc738fba8e77059c7b74d976b8a6c5db1af446e4f1f9060cb8ed7419fe",
+      "commit": "c2984d23a0dfa97e951bdfe5fc1abfb0a27aebee",
+      "tree": "0559ca49331d2c481798dc2d052085ce48e54a3c",
       "public_ref_verified": true
     },
     {
       "path": "anybytes",
       "url": "https://github.com/erlkonig-ai/anybytes.git",
-      "commit": "2f8705a06f23f9a61ea53947b5270f23844a6a0e",
+      "commit": "55f1a2a1e63797b35b7a59f74b720017beb984c3",
       "tree": "9e343563b7163663331d9e4137b718070f10868e",
-      "files_manifest_sha256": "ebf0fcd328df2109c3569536552a9d5861502df4adda7bc140a30eaa92faeb24",
-      "public_ref_verified": false
+      "public_ref_verified": true
     },
     {
       "path": "jerky",
       "url": "https://github.com/erlkonig-ai/jerky.git",
       "commit": "94453322b83ff67fa4384ab49cd0685c43a9bb4b",
       "tree": "27b7f3bf071d9953973ea6b3aba5173fb6890554",
-      "files_manifest_sha256": "86d51c592a5d7c409e22444b2a1c479b5b2c8e797dc3d88920cd45fd20030f53",
       "public_ref_verified": true
     },
     {
@@ -113,23 +78,25 @@
       "url": "https://github.com/erlkonig-ai/maryml.git",
       "commit": "5107b58de20591bbd3eec75ccfd3f1a374026090",
       "tree": "2e2e2f5f1f8fa76bd1ca3a9273bf224f5a360f51",
-      "files_manifest_sha256": "f867e8c33a0ff48f0e6190a4921f2be613cb26da587a0521cdca9ec41f2d102f",
       "public_ref_verified": true
     },
     {
       "path": "GORBIE",
       "url": "https://github.com/erlkonig-ai/lissajous.git",
-      "commit": "07930452a75b15174d4f499d9968e79005b0fb0b",
-      "tree": "8351a83dead076189f6a3b4b43e983c839ead455",
-      "files_manifest_sha256": "b92543a7978770f832d054b92aa94989ff818126984315e95933fe38aa0c5b3d",
-      "public_ref_verified": true
+      "commit": "45563956e1468fd2407864bf6d00e22d7710e681",
+      "tree": "1320cedbffbebb77e7da9aedacb3f6dfb0eef085",
+      "public_ref_verified": true,
+      "overlay": {
+        "path": "ci/overlays/gorbie-typst-images.patch",
+        "sha256": "405e444d9049982d84778fd76966254cc9c49f21fe56ef83d29415a1d2896ae7",
+        "tree": "07c0562ccaf72ea36bfdbd41fb4e86ef3440cac1"
+      }
     },
     {
       "path": "cubecl-fork",
       "url": "https://github.com/erlkonig-ai/cubecl.git",
       "commit": "d434232fefe6aec2bca3e6b2f708931aa739bbb8",
       "tree": "ee6e52ef6fef03138d67978b0e9ef0ae4a31167d",
-      "files_manifest_sha256": "bcb7c8635b8e36826388f278c5e2f20f70ec187ae3186c0219014b5168a4e0ed",
       "public_ref_verified": true
     },
     {
@@ -137,7 +104,6 @@
       "url": "https://github.com/erlkonig-ai/burn.git",
       "commit": "6f7f89a8d5c96529ebffca6b12d093c27d9a6faa",
       "tree": "9b58e279ae7ae090150ba2b158351d3ad1bfecf5",
-      "files_manifest_sha256": "84cea9fd7b8ee76ba3f1c2d58e41a2d7a75a0da55821308b326104ce59441be5",
       "public_ref_verified": true
     },
     {
@@ -145,23 +111,25 @@
       "url": "https://github.com/erlkonig-ai/maryml-cubek.git",
       "commit": "aae5791dcadf8012211964ce9414a202f3276312",
       "tree": "f0b92b6619e3bcf8273ebfc4380b6c05df1800bf",
-      "files_manifest_sha256": "1f971c199ae4dac114bfa0590b3881a70b196e23b45ddcda565bd3da909721b6",
       "public_ref_verified": true
     },
     {
       "path": "soma",
-      "url": null,
-      "commit": "117812be71a41fc3bf972387e498f2762a391fc7",
-      "tree": "d5282c55fa2b70b272fdd7ad023000f865b5a573",
-      "files_manifest_sha256": "1f35e530d9dfc8e373ca7c8ea7e94d53a8168a7008b2a5fa9efe892f465f6814",
-      "public_ref_verified": false
+      "crate": "soma-client",
+      "version": "0.1.0",
+      "sha256": "f4600eca145a870e886c5f518ad755845bca5df878b4ba27136174a15561d66b",
+      "files": {
+        "Cargo.toml": "d66a5869ce15520fa6394691b4479dda88193099b25e948ddd4a93eaaed20549",
+        "Cargo.toml.orig": "fca283cf59df7f559ca6e7b16f6def6e5d4ffb6821b995d647e17867b8247109",
+        "Cargo.lock": "1701e89bfbf7d9f23ac2591c28b4a7242af13af3316959d9359bd561598e5ddf",
+        "src/lib.rs": "018a04533b23aa435aade0edd88d39f6b8fae8665cefba5d709f35ae62653a12"
+      }
     },
     {
       "path": "songbird",
       "url": "https://github.com/erlkonig-ai/songbird.git",
       "commit": "2de756cb9dd9302fa818f8428fa4e5607dfaf1c2",
       "tree": "b6beeb7ff22a1e04ce2c777a26aefddc1fc17418",
-      "files_manifest_sha256": "182f43329f10e17060f8818611ab815cd6de3d48dfdee332df9ee8fd8ec4f9e9",
       "public_ref_verified": true
     }
   ],
@@ -180,13 +148,9 @@
     }
   ],
   "unresolved": [
-    "Exact Faculty successor 327e4a3feac24ca25fc9ac7967caa89053574ebf requires public availability verification and public native validation.",
-    "Anybytes required packaging-snapshot commit returned HTTP 422 at its public repository.",
-    "Soma exact public repository/revision remains unresolved: recorded origin returned unauthenticated HTTP404; no revision substitution.",
-    "App/selected sibling license texts and font notices need completion; preserve OFL/GFL/Ubuntu-font and third-party terms in source and both packaged artifacts.",
+    "Review linked upstream code and asset notices before distributing native binaries.",
     "Native smoke fixture for the new candidate, clean install/upgrade checks and hosted resource budget remain to be validated.",
-    "Mac development DMG remains ad-hoc signed; Developer ID/notarization and App Store submission are separate trusted release work.",
-    "Stored private ERP routes are retained, become unnamed unknown roles, and sharing rejects unsupported roles; no migration is supplied."
+    "Mac development DMG remains ad-hoc signed; Developer ID/notarization and App Store submission are separate trusted release work."
   ],
   "validation_remaining": [
     "Hosted CPU/RAM/disk budget measurement",
@@ -196,43 +160,5 @@
   ],
   "additional_toolchain_targets": [
     "wasm32-unknown-unknown"
-  ],
-  "toolchain_input_finding": {
-    "evidence": "Parent-reported actual Linux build: triblespace-core inline WASM formatter macro failed E0463, missing core for wasm32-unknown-unknown; minimal Rust1.98 installation contained native std only.",
-    "classification": "Missing toolchain target input, not evidence of source or retained-lock regression.",
-    "change": "Install wasm32-unknown-unknown for Rust1.98.0 in addition to the native target, before fetch/tests/build.",
-    "validation": "Draft/source syntax checks only; no rerun, runtime or test-pass claim."
-  },
-  "sibling_overlays": [
-    {
-      "name": "faculties-linux-wiki-opener",
-      "repository": "faculties",
-      "base_commit": "773ea15ebc77d5d1013ca63de9af42e8884aba5c",
-      "patch": "ci/overlays/faculties-linux-opener.patch",
-      "patch_sha256": "8a036c0646d8d8179d9a64890dcd5ed0e5bd09377bf77669cfbfeffb32daddf1",
-      "target": "src/widgets/wiki.rs",
-      "before_sha256": "182081b3f7eab2b48b81da2a697e5548a70f245b9af9097e41a2f8bf368abb3e",
-      "after_sha256": "32423645b6e02817c131dbbc31b1010f0172bd77845430a532af21a3c68c2753",
-      "status": "Included byte-for-byte in the pinned Faculty successor; retained historical patch is evidence only, do not apply again",
-      "scope": "Linux selects xdg-open; other targets retain open",
-      "prepared_source_commit": "e5e4cbe1eb4733f9ae2995a20687131c379d2eff",
-      "prepared_source_status": "pushed to canonical public triblespace/faculties main and verified by remote readback",
-      "public_commit": "e5e4cbe1eb4733f9ae2995a20687131c379d2eff",
-      "successor_commit": "327e4a3feac24ca25fc9ac7967caa89053574ebf"
-    }
-  ],
-  "signing_release_candidate": {
-    "reviewed_patch_sha256": "4f7f600c712c67ccd62105d4d0649591c2c30d80e2d26dad6aa28878487fcd2b",
-    "wrapper": "scripts/release-dmg.sh",
-    "acceptance": "scripts/accept/release-dmg.py",
-    "validation": "24 stub-only cases; no real signing, notarization, submission or distribution",
-    "development_path": "Historical signing-candidate scope: that earlier step left bundle.sh and package-dmg.sh behavior unchanged. This notice successor changes bundle.sh to preserve notices; see notice_followthrough. package-dmg.sh remains byte-identical."
-  },
-  "notice_followthrough": {
-    "status": "partial authoritative notices packaged; root text decisions and complete dependency inventory remain unresolved",
-    "manifest": "notices/manifest.json",
-    "scope": "Selected pinned sibling notices, GORBIE embedded fonts, locked epaint_default_fonts 0.34.3; no legal compatibility or publication assertion",
-    "validation": "Source/package stubs only; no native build, install, signing or acceptance",
-    "licenses_and_notices_packaged": false
-  }
+  ]
 }

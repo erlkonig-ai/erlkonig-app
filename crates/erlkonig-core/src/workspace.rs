@@ -19,12 +19,18 @@ use crate::config::NodeBinding;
 
 /// Names label roles; they never resolve a collection by themselves.
 pub fn roles() -> Vec<(Id, &'static str)> {
-    faculties::collection_names::table()
+    let mut roles = faculties::collection_names::table();
+    roles.push((faculties_erp::bookkeeping::DEFAULT_SCOPE_ID, "erp"));
+    roles
 }
 
-/// Resolve only roles supported by the public Faculty catalog.
+/// Report the names supported by the native workspace dispatcher.
 pub(crate) fn role_name(role: Id) -> Option<&'static str> {
-    faculties::collection_names::name_for(role)
+    if role == faculties_erp::bookkeeping::DEFAULT_SCOPE_ID {
+        Some("erp")
+    } else {
+        faculties::collection_names::name_for(role)
+    }
 }
 
 /// One edit request / native-fact projection, not a catalog of the store.

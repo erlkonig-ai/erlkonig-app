@@ -75,7 +75,7 @@ pub fn run(args: &[OsString]) -> Result<bool> {
     };
     if command == "--help" {
         println!(
-            "erlkonig public-key --key EXISTING_KEY\nerlkonig inspect-node --pile EXISTING_PILE --public PUBLIC_HEX\nerlkonig inspect-fd-events --pile EXISTING_PILE --public PUBLIC_HEX [--collection OBSERVED_METRICS_HANDLE]\n  Without --collection: list accessible recorded metrics descriptors only.\nerlkonig bind-node --data-dir APP_DIR --pile EXISTING_PILE --key EXISTING_KEY --expect-public PUBLIC_HEX\nerlkonig migration-plan --request REQUEST_JSON\nerlkonig migrate-settings --request REQUEST_JSON\nerlkonig mcp-stdio --data-dir APP_DIR --url http://127.0.0.1:PORT/"
+            "erlkonig erp --help\nerlkonig public-key --key EXISTING_KEY\nerlkonig inspect-node --pile EXISTING_PILE --public PUBLIC_HEX\nerlkonig inspect-fd-events --pile EXISTING_PILE --public PUBLIC_HEX [--collection OBSERVED_METRICS_HANDLE]\n  Without --collection: list accessible recorded metrics descriptors only.\nerlkonig bind-node --data-dir APP_DIR --pile EXISTING_PILE --key EXISTING_KEY --expect-public PUBLIC_HEX\nerlkonig migration-plan --request REQUEST_JSON\nerlkonig migrate-settings --request REQUEST_JSON\nerlkonig mcp-stdio --data-dir APP_DIR --url http://127.0.0.1:PORT/"
         );
         return Ok(true);
     }

@@ -79,15 +79,15 @@ pub fn seed(bootstrap: &Bootstrap, first: Id, full_viewer: bool) -> Result<Value
             if full_viewer {
                 faculties::relations::Relations::with_storage(storage.clone()).add(
                     faculties::relations::ProfileInput {
-                        label: "liora-gpt".into(),
-                        display_name: Some("Liora · synthetic fixture author".into()),
+                        label: "fixture-operator".into(),
+                        display_name: Some("Synthetic fixture author".into()),
                         ..Default::default()
                     }, None, &[],
                 )?;
                 let compass = faculties::compass::Compass::with_storage(storage.clone());
                 for (title, status) in [("Inspect workspace graph", "doing"), ("Check file preview", "todo"), ("Seed synthetic content", "done")] {
                     compass.add(&format!("{marker} {title}"), faculties::compass::AddOptions {
-                        status, persona: Some("liora-gpt"), note: Some("PUBLIC SYNTHETIC fixture only"),
+                        status, persona: Some("fixture-operator"), note: Some("PUBLIC SYNTHETIC fixture only"),
                         ..Default::default()
                     })?;
                 }

@@ -59,9 +59,19 @@ with tempfile.TemporaryDirectory(prefix="erlkonig-packaging-inputs-") as directo
     root = Path(directory)
     app = root / "erlkonig-app"
     shutil.copytree(SOURCE, app)
-    for name in helper.REPOSITORIES - {"erlkonig-app"}:
+    for name in helper.REPOSITORIES - {"erlkonig-app", "soma"}:
         (root / name).mkdir()
         (root / name / "source.txt").write_text("synthetic " + name)
+    # Use a synthetic copy of the pinned crate layout so this test stays offline.
+    manifest_path = app / "ci/source-inputs.json"
+    manifest = json.loads(manifest_path.read_text())
+    soma = next(item for item in manifest["siblings"] if item["path"] == "soma")
+    for name in soma["files"]:
+        path = root / "soma/soma-client" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"synthetic crate fixture")
+        soma["files"][name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
     stubs = root / "stubs"
     stubs.mkdir()
     driver = stubs / "driver"
@@ -149,14 +159,15 @@ with tempfile.TemporaryDirectory(prefix="erlkonig-packaging-inputs-") as directo
     git(root, "init", "-q")
     git(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "fixture")
     bundle("parent-git-rejected", [], "Git root does not match selected source")
-    for name in helper.REPOSITORIES:
+    for name in helper.REPOSITORIES - {"soma"}:
         git(root / name, "init", "-q")
         git(root / name, "add", ".")
         git(root / name, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
     git_bundle, _ = bundle("git-bundle", [])
     git_provenance = (git_bundle / "Contents/Resources/provenance.txt").read_text()
-    assert "source-provenance git-tracked\n" in git_provenance and "source-inventory-sha256" not in git_provenance
-    assert all(("app" if name == "erlkonig-app" else name) + " " in git_provenance for name in helper.REPOSITORIES)
+    assert "source-provenance git-tracked-and-registry\n" in git_provenance and "source-inventory-sha256" not in git_provenance
+    assert all(("app" if name == "erlkonig-app" else name) + " " in git_provenance for name in helper.REPOSITORIES - {"soma"})
+    assert "soma-client 0.1.0 registry-sha256 " in git_provenance
     bundle("git-diff-failure", [], "source provenance verification failed", extra_env={"FAIL_GIT_DIFF": "1"})
 
     def package(label, fixture=bundled, expected=None):

@@ -1,0 +1,486 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index ab521af7f8f8c05e0f1c783dfa3d4b3a7b719569..36921da97c9a9c3bd19130fa987813f79a6a66b1 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -27,6 +27,7 @@ include = [
+     "assets/fonts/Jersey_15/OFL.txt",
+     "assets/fonts/NewComputerModern/NewCMMath-Regular.otf",
+     "assets/fonts/NewComputerModern/LICENSE.txt",
++    "assets/typst/unavailable-image.png",
+ ]
+
+ [dependencies]
+diff --git a/assets/typst/unavailable-image.png b/assets/typst/unavailable-image.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..b88bc295cfc750854d8b296e08e84784f22559eb
+GIT binary patch
+literal 303
+zcmeAS@N?(olHy`uVBq!ia0y~yU~~Yow{Wll$)``g3IeHbo-U3d6}R3VWaI_%4lVfZ
+ipUY>y0LUE9pu)7}Ap_&v<87)SUwXRwxvX<aXaWH6^A|J#
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/card_ctx.rs b/src/card_ctx.rs
+index 40fedfd4222f8114d8fe4df6624222fba95f0bfe..56faeff273db50fd5e8a173f8f5e388ddff9122c 100644
+--- a/src/card_ctx.rs
++++ b/src/card_ctx.rs
+@@ -167,6 +167,17 @@ impl<'a> CardCtx<'a> {
+         crate::widgets::typst_widget::typst_with_preamble(self.ui, source);
+     }
+
++    /// [`Self::typst`], with `files` answering the files the source names,
++    /// for example `#image("files:…")`. Nothing else is ever read.
++    #[cfg(feature = "typst")]
++    pub fn typst_with_files(
++        &mut self,
++        source: &str,
++        files: &crate::widgets::typst_render::world::FileResolver<'_>,
++    ) {
++        crate::widgets::typst_widget::typst_with_preamble_and_files(self.ui, source, files);
++    }
++
+     /// Render an inline math expression via Typst: `$<expr>$`.
+     #[cfg(feature = "typst")]
+     pub fn typst_math_inline(&mut self, expr: &str) {
+diff --git a/src/widgets/typst_render/painter.rs b/src/widgets/typst_render/painter.rs
+index a8a997128388d5a94728e627bb4b3b4df858457d..283248c9c7cfbd987d3ad218023d3954c4354b08 100644
+--- a/src/widgets/typst_render/painter.rs
++++ b/src/widgets/typst_render/painter.rs
+@@ -38,6 +38,19 @@ pub struct PositionedLink {
+     pub url: String,
+ }
+
++/// A placed image: the quad it covers after every enclosing transform, and
++/// where it falls in paint order among the returned shapes.
++#[derive(Clone)]
++pub struct PositionedImage {
++    /// The decoded Typst image (raster pixels, SVG or PDF).
++    pub image: typst::visualize::Image,
++    /// Corners in frame-relative coordinates: the image's top-left,
++    /// top-right, bottom-right and bottom-left, in that order.
++    pub corners: [egui::Pos2; 4],
++    /// Number of shapes painted before this image.
++    pub shape_index: usize,
++}
++
+ /// Layout info collected during rendering for selection.
+ #[derive(Clone, Default)]
+ pub struct TextLayout {
+@@ -47,6 +60,8 @@ pub struct TextLayout {
+     pub spans: Vec<PositionedSpan>,
+     /// Link regions for click/hover handling.
+     pub links: Vec<PositionedLink>,
++    /// Images, painted by the caller because they need GPU textures.
++    pub images: Vec<PositionedImage>,
+ }
+
+ /// Render a Typst frame into egui shapes plus text layout info for selection.
+@@ -192,7 +207,20 @@ fn render_frame_inner(
+                     });
+                 }
+             }
+-            FrameItem::Image(..) | FrameItem::Tag(..) => {}
++            FrameItem::Image(image, size, _) => {
++                let (w, h) = (size.x.to_pt() as f32, size.y.to_pt() as f32);
++                text_layout.images.push(PositionedImage {
++                    image: image.clone(),
++                    corners: [
++                        local.transform_point(0.0, 0.0),
++                        local.transform_point(w, 0.0),
++                        local.transform_point(w, h),
++                        local.transform_point(0.0, h),
++                    ],
++                    shape_index: shapes.len(),
++                });
++            }
++            FrameItem::Tag(..) => {}
+         }
+     }
+ }
+diff --git a/src/widgets/typst_render/world.rs b/src/widgets/typst_render/world.rs
+index 98c786bd0ecd01f9cc276c7270422dc30dac16e6..d0a714a57606cfccccdc625ed9dfd4dda1907fe4 100644
+--- a/src/widgets/typst_render/world.rs
++++ b/src/widgets/typst_render/world.rs
+@@ -18,6 +18,22 @@ pub struct TypstDiag {
+     pub span_range: Option<std::ops::Range<usize>>,
+ }
+
++/// Bytes a file resolver may return for a path it recognises but cannot
++/// serve right now (not in scope, not yet synced, too large). The painter
++/// draws a labelled box in its place instead of these transparent pixels, so
++/// one missing picture never turns a whole page into a compile error.
++pub const UNAVAILABLE_IMAGE: &[u8] = include_bytes!(concat!(
++    env!("CARGO_MANIFEST_DIR"),
++    "/assets/typst/unavailable-image.png"
++));
++
++/// Caller-supplied bytes for files a document names, for example
++/// `image("files:3fa4…")`. It receives the path relative to the document
++/// root exactly as Typst resolved it (`files:3fa4…`). GORBIE itself reads
++/// nothing from disk or network: without a resolver, and for every path the
++/// resolver declines, the file is simply not found.
++pub type FileResolver<'a> = dyn Fn(&str) -> FileResult<Bytes> + Send + Sync + 'a;
++
+ const MATH_FONT: &[u8] = include_bytes!(concat!(
+     env!("CARGO_MANIFEST_DIR"),
+     "/assets/fonts/NewComputerModern/NewCMMath-Regular.otf"
+@@ -87,23 +103,84 @@ impl GorbieWorld {
+
+     /// Compile the current source into a paged document.
+     pub fn compile(&self) -> Result<PagedDocument, Vec<TypstDiag>> {
+-        let result = typst::compile::<PagedDocument>(self);
+-        match result.output {
+-            Ok(doc) => Ok(doc),
+-            Err(errors) => {
+-                let src = &self.source;
+-                let diags = errors
+-                    .iter()
+-                    .map(|e| TypstDiag {
+-                        severity: e.severity,
+-                        message: e.message.to_string(),
+-                        hints: e.hints.iter().map(|h| h.to_string()).collect(),
+-                        span_range: src.range(e.span),
+-                    })
+-                    .collect();
+-                Err(diags)
+-            }
++        self.diagnose(typst::compile::<PagedDocument>(self).output)
++    }
++
++    /// Compile with `files` answering every file the document names.
++    ///
++    /// The resolver is borrowed for this one compilation only, so a caller
++    /// can scope it to whatever data it is rendering from this frame.
++    pub fn compile_with_files(
++        &self,
++        files: &FileResolver<'_>,
++    ) -> Result<PagedDocument, Vec<TypstDiag>> {
++        let world = ResolvingWorld { base: self, files };
++        self.diagnose(typst::compile::<PagedDocument>(&world).output)
++    }
++
++    fn diagnose(
++        &self,
++        output: typst::diag::SourceResult<PagedDocument>,
++    ) -> Result<PagedDocument, Vec<TypstDiag>> {
++        output.map_err(|errors| {
++            errors
++                .iter()
++                .map(|e| TypstDiag {
++                    severity: e.severity,
++                    message: e.message.to_string(),
++                    hints: e.hints.iter().map(|h| h.to_string()).collect(),
++                    span_range: self.source.range(e.span),
++                })
++                .collect()
++        })
++    }
++}
++
++fn not_found(id: FileId) -> typst::diag::FileError {
++    typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into())
++}
++
++/// The base world with one compilation's file resolver beside it.
++struct ResolvingWorld<'a> {
++    base: &'a GorbieWorld,
++    files: &'a FileResolver<'a>,
++}
++
++impl World for ResolvingWorld<'_> {
++    fn library(&self) -> &LazyHash<Library> {
++        self.base.library()
++    }
++
++    fn book(&self) -> &LazyHash<FontBook> {
++        self.base.book()
++    }
++
++    fn main(&self) -> FileId {
++        self.base.main()
++    }
++
++    fn source(&self, id: FileId) -> FileResult<Source> {
++        self.base.source(id)
++    }
++
++    fn file(&self, id: FileId) -> FileResult<Bytes> {
++        // Packages are never resolved; a path that is not valid UTF-8 cannot
++        // name anything a resolver knows.
++        if id.package().is_some() {
++            return Err(not_found(id));
+         }
++        match id.vpath().as_rootless_path().to_str() {
++            Some(path) => (self.files)(path),
++            None => Err(not_found(id)),
++        }
++    }
++
++    fn font(&self, index: usize) -> Option<Font> {
++        self.base.font(index)
++    }
++
++    fn today(&self, offset: Option<i64>) -> Option<Datetime> {
++        self.base.today(offset)
+     }
+ }
+
+@@ -131,9 +208,7 @@ impl World for GorbieWorld {
+     }
+
+     fn file(&self, id: FileId) -> FileResult<Bytes> {
+-        Err(typst::diag::FileError::NotFound(
+-            id.vpath().as_rootless_path().into(),
+-        ))
++        Err(not_found(id))
+     }
+
+     fn font(&self, index: usize) -> Option<Font> {
+diff --git a/src/widgets/typst_widget.rs b/src/widgets/typst_widget.rs
+index ded274622df60f8f29b6538906e236ffc5435c89..2c00f09982f36bc81e6d7e77a19bb8c6196a49a9 100644
+--- a/src/widgets/typst_widget.rs
++++ b/src/widgets/typst_widget.rs
+@@ -7,7 +7,7 @@ use eframe::egui;
+ use typst::syntax::Span;
+
+ use super::typst_render::painter;
+-use super::typst_render::world::GorbieWorld;
++use super::typst_render::world::{FileResolver, GorbieWorld, UNAVAILABLE_IMAGE};
+ use crate::themes::colorhash::RAL_CATEGORICAL;
+ use crate::themes::ral::RAL_COLORS;
+
+@@ -38,7 +38,7 @@ thread_local! {
+ pub fn typst(ui: &mut egui::Ui, source: &str) {
+     TYPST_STATE.with(|state| {
+         let mut state = state.borrow_mut();
+-        render_typst(ui, &mut state, source, 0);
++        render_typst(ui, &mut state, source, 0, None);
+     });
+ }
+
+@@ -57,7 +57,7 @@ pub fn typst_math_inline(ui: &mut egui::Ui, expr: &str) {
+     let source = format!("{preamble}${expr}$");
+     TYPST_STATE.with(|state| {
+         let mut state = state.borrow_mut();
+-        render_typst(ui, &mut state, &source, preamble.len());
++        render_typst(ui, &mut state, &source, preamble.len(), None);
+     });
+ }
+
+@@ -77,7 +77,7 @@ pub fn typst_math_display(ui: &mut egui::Ui, expr: &str) {
+     let source = format!("{preamble}$ {expr} $");
+     TYPST_STATE.with(|state| {
+         let mut state = state.borrow_mut();
+-        render_typst(ui, &mut state, &source, preamble.len());
++        render_typst(ui, &mut state, &source, preamble.len(), None);
+     });
+ }
+
+@@ -102,6 +102,16 @@ pub fn typst_math_fn() -> impl Fn(&mut egui::Ui, &str, bool) {
+ /// The Typst page margin replaces the grid edge padding so the interactive
+ /// area extends to the card edges (better for drag-selection).
+ pub fn typst_with_preamble(ui: &mut egui::Ui, content: &str) {
++    typst_with_preamble_inner(ui, content, None);
++}
++
++/// [`typst_with_preamble`], with `files` answering the files the content
++/// names (`image("files:…")` and the like). See [`FileResolver`].
++pub fn typst_with_preamble_and_files(ui: &mut egui::Ui, content: &str, files: &FileResolver<'_>) {
++    typst_with_preamble_inner(ui, content, Some(files));
++}
++
++fn typst_with_preamble_inner(ui: &mut egui::Ui, content: &str, files: Option<&FileResolver<'_>>) {
+     let width = ui.available_width();
+     let pad = crate::card_ctx::GRID_EDGE_PAD;
+     let body_size = ui
+@@ -127,7 +137,7 @@ pub fn typst_with_preamble(ui: &mut egui::Ui, content: &str) {
+     let source = format!("{preamble}{content}");
+     TYPST_STATE.with(|state| {
+         let mut state = state.borrow_mut();
+-        render_typst(ui, &mut state, &source, preamble.len());
++        render_typst(ui, &mut state, &source, preamble.len(), files);
+     });
+ }
+
+@@ -676,12 +686,144 @@ fn render_typst_errors_inner(
+     ui.spacing_mut().item_spacing.y = prev_spacing;
+ }
+
++// ── Images ────────────────────────────────────────────────────────────
++
++/// Longest texture side for one document image. A larger picture is
++/// downscaled once on upload; wiki pages show photos far below this size.
++const MAX_IMAGE_TEXTURE_SIDE: usize = 2048;
++
++/// Render passes an unused image texture is kept before it is freed.
++const IMAGE_TEXTURE_IDLE_PASSES: u64 = 600;
++
++/// GPU textures for document images, keyed by Typst's image hash (which
++/// covers the bytes and decode options), with the pass that last used them.
++#[derive(Clone, Default)]
++struct ImageTextures(
++    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u128, (egui::TextureHandle, u64)>>>,
++);
++
++/// The texture for a raster image, or `None` for anything that is not
++/// painted as pixels (the unavailable placeholder, SVG, PDF).
++fn image_texture(
++    ctx: &egui::Context,
++    image: &typst::visualize::Image,
++) -> Option<egui::TextureHandle> {
++    use typst::visualize::{ImageKind, ImageScaling};
++
++    let ImageKind::Raster(raster) = image.kind() else {
++        return None;
++    };
++    if raster.data().as_slice() == UNAVAILABLE_IMAGE {
++        return None;
++    }
++    let key = typst::utils::hash128(image);
++    let pass = ctx.cumulative_pass_nr();
++    let textures = ctx.data_mut(|data| {
++        data.get_temp_mut_or_default::<ImageTextures>(egui::Id::new("gorbie_typst_image_textures"))
++            .clone()
++    });
++    let mut textures = textures
++        .0
++        .lock()
++        .unwrap_or_else(|poison| poison.into_inner());
++    if let Some((texture, used)) = textures.get_mut(&key) {
++        *used = pass;
++        return Some(texture.clone());
++    }
++    textures.retain(|_, (_, used)| pass.saturating_sub(*used) <= IMAGE_TEXTURE_IDLE_PASSES);
++
++    let max_side = ctx
++        .input(|i| i.max_texture_side)
++        .min(MAX_IMAGE_TEXTURE_SIDE) as u32;
++    let dynamic = raster.dynamic();
++    let rgba = if dynamic.width() > max_side || dynamic.height() > max_side {
++        dynamic.thumbnail(max_side, max_side).to_rgba8()
++    } else {
++        dynamic.to_rgba8()
++    };
++    let pixels = egui::ColorImage::from_rgba_unmultiplied(
++        [rgba.width() as usize, rgba.height() as usize],
++        rgba.as_raw(),
++    );
++    let options = match image.scaling() {
++        typst::foundations::Smart::Custom(ImageScaling::Pixelated) => egui::TextureOptions::NEAREST,
++        _ => egui::TextureOptions {
++            mipmap_mode: Some(egui::TextureFilter::Linear),
++            ..egui::TextureOptions::LINEAR
++        },
++    };
++    let texture = ctx.load_texture(format!("typst-image-{key:032x}"), pixels, options);
++    textures.insert(key, (texture.clone(), pass));
++    Some(texture)
++}
++
++/// Paint one placed image: its pixels on the transformed quad, or a
++/// labelled box when the pixels are unavailable or not raster.
++fn paint_image(ui: &egui::Ui, placed: &painter::PositionedImage, offset: egui::Vec2) {
++    let corners = placed.corners.map(|corner| corner + offset);
++    let bounds = egui::Rect::from_points(&corners);
++    if !ui.is_rect_visible(bounds) {
++        return;
++    }
++    if let Some(texture) = image_texture(ui.ctx(), &placed.image) {
++        let mut mesh = egui::Mesh::with_texture(texture.id());
++        let uvs = [
++            egui::pos2(0.0, 0.0),
++            egui::pos2(1.0, 0.0),
++            egui::pos2(1.0, 1.0),
++            egui::pos2(0.0, 1.0),
++        ];
++        for (pos, uv) in corners.into_iter().zip(uvs) {
++            mesh.vertices.push(egui::epaint::Vertex {
++                pos,
++                uv,
++                color: egui::Color32::WHITE,
++            });
++        }
++        mesh.indices.extend([0, 1, 2, 0, 2, 3]);
++        ui.painter().add(egui::Shape::mesh(mesh));
++        return;
++    }
++    let color = ui.visuals().weak_text_color();
++    let painter = ui
++        .painter()
++        .with_clip_rect(ui.clip_rect().intersect(bounds));
++    painter.rect_stroke(
++        bounds,
++        2.0,
++        egui::Stroke::new(1.0_f32, color),
++        egui::StrokeKind::Inside,
++    );
++    let label = match placed.image.alt() {
++        Some(alt) if !alt.trim().is_empty() => format!("image unavailable: {alt}"),
++        _ => "image unavailable".to_owned(),
++    };
++    let galley = painter.layout(
++        label,
++        egui::FontId::proportional(12.0),
++        color,
++        (bounds.width() - 8.0).max(8.0),
++    );
++    let pos = bounds.center() - galley.size() / 2.0;
++    painter.galley(pos, galley, color);
++}
++
+ // ── Main render ───────────────────────────────────────────────────────
+
+-fn render_typst(ui: &mut egui::Ui, state: &mut TypstState, source: &str, preamble_len: usize) {
++fn render_typst(
++    ui: &mut egui::Ui,
++    state: &mut TypstState,
++    source: &str,
++    preamble_len: usize,
++    files: Option<&FileResolver<'_>>,
++) {
+     state.world.set_source(source.to_string());
+
+-    let doc = match state.world.compile() {
++    let compiled = match files {
++        Some(files) => state.world.compile_with_files(files),
++        None => state.world.compile(),
++    };
++    let doc = match compiled {
+         Ok(doc) => doc,
+         Err(diags) => {
+             render_typst_errors(ui, source, preamble_len, &diags);
+@@ -888,11 +1030,31 @@ fn render_typst(ui: &mut egui::Ui, state: &mut TypstState, source: &str, preambl
+             }
+         }
+
+-        // ── Paint text shapes ────────────────────────────────────
+-        for mut shape in shapes {
++        // ── Paint shapes, with images at their place in paint order ──
++        let mut images = text_layout.images.iter().peekable();
++        for (index, mut shape) in shapes.into_iter().enumerate() {
++            while let Some(image) = images.next_if(|image| image.shape_index <= index) {
++                paint_image(ui, image, offset);
++            }
+             shape.translate(offset);
+             ui.painter().add(shape);
+         }
++        for image in images {
++            paint_image(ui, image, offset);
++        }
++        if let Some(hover_pos) = response.hover_pos() {
++            let frame_pos = hover_pos - offset;
++            let hovered_alt = text_layout.images.iter().rev().find_map(|image| {
++                let bounds = egui::Rect::from_points(&image.corners);
++                bounds
++                    .contains(frame_pos)
++                    .then(|| image.image.alt())
++                    .flatten()
++            });
++            if let Some(alt) = hovered_alt {
++                response.clone().on_hover_text_at_pointer(alt);
++            }
++        }
+
+         // ── Link interaction ─────────────────────────────────────
+         if !text_layout.links.is_empty() {

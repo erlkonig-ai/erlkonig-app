@@ -2,7 +2,7 @@
   {
     "bytes": 1121,
     "origin": {
-      "commit": "2f8705a06f23f9a61ea53947b5270f23844a6a0e",
+      "commit": "55f1a2a1e63797b35b7a59f74b720017beb984c3",
       "path": "LICENSE",
       "repository": "anybytes"
     },
@@ -200,16 +200,6 @@
     },
     "path": "preserved/GORBIE/assets/fonts/Jersey_15/OFL.txt",
     "sha256": "f61c1e05c894baafffeb06dbd58870f9e8c6eaf317da3c84c61d5e3cc6bfcb38"
-  },
-  {
-    "bytes": 194,
-    "origin": {
-      "commit": "117812be71a41fc3bf972387e498f2762a391fc7",
-      "path": "assets/NOTICE",
-      "repository": "soma"
-    },
-    "path": "preserved/soma/assets/NOTICE",
-    "sha256": "d65fad973f38cba9b403e7e4d1d11b374a43e2be395922ad18c39880b777be60"
   },
   {
     "bytes": 11347,
@@ -547,8 +537,9 @@
     "origin": {
       "frozen_inputs_sha256": "a130f5aebed535508fe85077722e3ce9f6fc8b43266ad9c8085cebb3e7055f80",
       "repository": "anybytes",
-      "revision": "2f8705a06f23f9a61ea53947b5270f23844a6a0e",
-      "source_path": "LICENSE"
+      "revision": "55f1a2a1e63797b35b7a59f74b720017beb984c3",
+      "source_path": "LICENSE",
+      "commit": "55f1a2a1e63797b35b7a59f74b720017beb984c3"
     },
     "path": "repositories/anybytes/LICENSE",
     "sha256": "5b5a6b5e2777affc6e84ca932b0b85776a675d5c7d8e77c4acc1d2fdf19cd72b"
@@ -1553,17 +1544,6 @@
     },
     "path": "repositories/jerky/LICENSE-MIT",
     "sha256": "2f3f56d5f90b285dc346eb54747b25a920bf012ab6dff76783ce2d1b249d5081"
-  },
-  {
-    "bytes": 194,
-    "origin": {
-      "frozen_inputs_sha256": "a130f5aebed535508fe85077722e3ce9f6fc8b43266ad9c8085cebb3e7055f80",
-      "repository": "soma",
-      "revision": "117812be71a41fc3bf972387e498f2762a391fc7",
-      "source_path": "assets/NOTICE"
-    },
-    "path": "repositories/soma/assets/NOTICE",
-    "sha256": "d65fad973f38cba9b403e7e4d1d11b374a43e2be395922ad18c39880b777be60"
   },
   {
     "bytes": 759,

@@ -22,7 +22,12 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> Result<bool> {
-    let args = command::parse(std::env::args_os().skip(1))?;
+    let mut argv = std::env::args_os().skip(1).peekable();
+    if argv.peek().is_some_and(|arg| arg == "erp") {
+        faculties_erp::cli::run_from(argv)?;
+        return Ok(true);
+    }
+    let args = command::parse(argv)?;
     if args.command == command::Command::Help {
         println!("{}", command::HELP);
         return Ok(true);

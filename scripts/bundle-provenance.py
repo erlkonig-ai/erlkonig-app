@@ -14,6 +14,10 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "ci"))
+import soma_input
 
 REPOSITORIES = {
     "erlkonig-app", "faculties", "triblespace-rs", "anybytes", "jerky", "mary",
@@ -87,9 +91,15 @@ def main():
         # The pinned manifest remains external evidence; never relabel its claimed
         # base commits as Git-verified release revisions.
     else:
-        lines.append("source-provenance git-tracked")
+        lines.append("source-provenance git-tracked-and-registry")
         for name in sorted(names):
             root = repo if name == "erlkonig-app" else repo.parent / name
+            if name == "soma":
+                item = next(item for item in json.loads((repo / "ci/source-inputs.json").read_text())["siblings"]
+                            if item["path"] == name)
+                soma_input.verify(root, item)
+                lines.append(f"soma-client {item['version']} registry-sha256 {item['sha256']}")
+                continue
             if Path(git(root, "rev-parse", "--show-toplevel").decode().strip()).resolve() != root.resolve():
                 raise ValueError(f"Git root does not match selected source: {name}")
             head = git(root, "rev-parse", "HEAD").decode().strip()

@@ -1,8 +1,4 @@
 {
-  "actor": "liora-gpt",
-  "closure_archive_sha256": "a0c51bca3d2a29377498700616d1856f878c3c5c85264972e46c74413aca9564",
-  "closure_report_sha256": "0e149e1983a558a8a3c2b92e1261a2ef9ae4b02741ead09b81891d96b2ef800f",
-  "closure_resource_manifest_sha256": "00b4a2b0b7958fab680abab281fd39506dc1502ecfa40d84cb40de5c11b302e9",
   "files": [
     {
       "bytes": 4493,
@@ -61,7 +57,7 @@
       "path": "anybytes/LICENSE",
       "sha256": "5b5a6b5e2777affc6e84ca932b0b85776a675d5c7d8e77c4acc1d2fdf19cd72b",
       "source": {
-        "commit": "2f8705a06f23f9a61ea53947b5270f23844a6a0e",
+        "commit": "55f1a2a1e63797b35b7a59f74b720017beb984c3",
         "path": "LICENSE",
         "repository": "anybytes"
       }
@@ -157,9 +153,9 @@
       }
     },
     {
-      "bytes": 763112,
+      "bytes": 764739,
       "path": "dependency-license-index.json",
-      "sha256": "8137301e2a9dc020eeccd8e7a48ebfab9256a26572f10cdb9d09f13bbefcc358",
+      "sha256": "889a28d8ffcb3bdfe05907377ed09b97f3361ce236f26e3fb97a9165b8fd0210",
       "source": {
         "path": "dependency-license-index.json",
         "resource_manifest_sha256": "00b4a2b0b7958fab680abab281fd39506dc1502ecfa40d84cb40de5c11b302e9",
@@ -235,9 +231,9 @@
       }
     },
     {
-      "bytes": 15980,
+      "bytes": 15662,
       "path": "font-asset-attribution.json",
-      "sha256": "161d95b618259e251f2a7c31f2c75b5d2df13dab512e674d028a55e62fb19559",
+      "sha256": "8f665cd93c11379e66ae0b21f42feca6eab026bacbd14c8dc1f5bfdcd472d82e",
       "source": {
         "path": "font-asset-attribution.json",
         "resource_manifest_sha256": "00b4a2b0b7958fab680abab281fd39506dc1502ecfa40d84cb40de5c11b302e9",
@@ -500,16 +496,6 @@
       "sha256": "2f3f56d5f90b285dc346eb54747b25a920bf012ab6dff76783ce2d1b249d5081",
       "source": {
         "path": "preserved/jerky/LICENSE-MIT",
-        "resource_manifest_sha256": "00b4a2b0b7958fab680abab281fd39506dc1502ecfa40d84cb40de5c11b302e9",
-        "retained_closure_archive_sha256": "a0c51bca3d2a29377498700616d1856f878c3c5c85264972e46c74413aca9564"
-      }
-    },
-    {
-      "bytes": 194,
-      "path": "preserved/soma/assets/NOTICE",
-      "sha256": "d65fad973f38cba9b403e7e4d1d11b374a43e2be395922ad18c39880b777be60",
-      "source": {
-        "path": "preserved/soma/assets/NOTICE",
         "resource_manifest_sha256": "00b4a2b0b7958fab680abab281fd39506dc1502ecfa40d84cb40de5c11b302e9",
         "retained_closure_archive_sha256": "a0c51bca3d2a29377498700616d1856f878c3c5c85264972e46c74413aca9564"
       }
@@ -18318,6 +18304,42 @@
       }
     },
     {
+      "path": "repositories/erlkonig-app/LICENSE-APACHE",
+      "source": {
+        "repository": "erlkonig-app",
+        "path": "LICENSE-APACHE"
+      },
+      "bytes": 11347,
+      "sha256": "99eebd67cb8dc081eacb69840a3643b92bd81dff2e0235b938ba281d74f95df2"
+    },
+    {
+      "path": "repositories/erlkonig-app/LICENSE-MIT",
+      "source": {
+        "repository": "erlkonig-app",
+        "path": "LICENSE-MIT"
+      },
+      "bytes": 1057,
+      "sha256": "52a37bc5a154f648cb3dbef8244c2c2ca7d4b49fa7acfb64e901c1a3620d41ad"
+    },
+    {
+      "path": "repositories/faculties-erp/LICENSE-APACHE",
+      "source": {
+        "path": "crates/faculties-erp/LICENSE-APACHE",
+        "repository": "erlkonig-app"
+      },
+      "bytes": 11347,
+      "sha256": "99eebd67cb8dc081eacb69840a3643b92bd81dff2e0235b938ba281d74f95df2"
+    },
+    {
+      "path": "repositories/faculties-erp/LICENSE-MIT",
+      "source": {
+        "path": "crates/faculties-erp/LICENSE-MIT",
+        "repository": "erlkonig-app"
+      },
+      "bytes": 1057,
+      "sha256": "52a37bc5a154f648cb3dbef8244c2c2ca7d4b49fa7acfb64e901c1a3620d41ad"
+    },
+    {
       "bytes": 11347,
       "path": "repositories/faculties/LICENSE-APACHE",
       "sha256": "99eebd67cb8dc081eacb69840a3643b92bd81dff2e0235b938ba281d74f95df2",
@@ -18353,16 +18375,6 @@
       "sha256": "2f3f56d5f90b285dc346eb54747b25a920bf012ab6dff76783ce2d1b249d5081",
       "source": {
         "path": "repositories/jerky/LICENSE-MIT",
-        "resource_manifest_sha256": "00b4a2b0b7958fab680abab281fd39506dc1502ecfa40d84cb40de5c11b302e9",
-        "retained_closure_archive_sha256": "a0c51bca3d2a29377498700616d1856f878c3c5c85264972e46c74413aca9564"
-      }
-    },
-    {
-      "bytes": 194,
-      "path": "repositories/soma/assets/NOTICE",
-      "sha256": "d65fad973f38cba9b403e7e4d1d11b374a43e2be395922ad18c39880b777be60",
-      "source": {
-        "path": "repositories/soma/assets/NOTICE",
         "resource_manifest_sha256": "00b4a2b0b7958fab680abab281fd39506dc1502ecfa40d84cb40de5c11b302e9",
         "retained_closure_archive_sha256": "a0c51bca3d2a29377498700616d1856f878c3c5c85264972e46c74413aca9564"
       }
@@ -18428,23 +18440,13 @@
       }
     },
     {
-      "bytes": 924131,
+      "bytes": 923495,
       "path": "retained-notice-sources.json",
-      "sha256": "1b4568cf1fb86725e926ac90760934481f8382bd91691e7876f60bebb25c886e",
+      "sha256": "80d83888692d22f7313d08764bcdfc63d8fb8a0c7de02ae9caafeddb77f851b6",
       "source": {
         "path": "retained-notice-sources.json",
         "resource_manifest_sha256": "00b4a2b0b7958fab680abab281fd39506dc1502ecfa40d84cb40de5c11b302e9",
         "retained_closure_archive_sha256": "a0c51bca3d2a29377498700616d1856f878c3c5c85264972e46c74413aca9564"
-      }
-    },
-    {
-      "bytes": 194,
-      "path": "soma/assets/NOTICE",
-      "sha256": "d65fad973f38cba9b403e7e4d1d11b374a43e2be395922ad18c39880b777be60",
-      "source": {
-        "commit": "117812be71a41fc3bf972387e498f2762a391fc7",
-        "path": "assets/NOTICE",
-        "repository": "soma"
       }
     },
     {
@@ -19338,42 +19340,26 @@
       }
     }
   ],
-  "goal": "ad16909614e513b104118f00fbf370ce",
   "known_project_owner_source_decisions": [
-    "App: MIT OR Apache-2.0 declared, no root license/copyright text supplied. Owner must supply authoritative app license texts and copyright attribution or explicitly decide the intended license grant. No owner/year or license choice inferred.",
     "Mary and GORBIE: MIT OR Apache-2.0 declared but no root license files at frozen commits. Authoritative project texts and asset attribution still required; existing font notices do not license project code or icons/themes.",
-    "Soma: Apache-2.0 declared for code, no root license file; assets/NOTICE only identifies Reachy Mini kinematics provenance. Full authoritative code and upstream asset license/notice follow-through remains unresolved."
+    "The published soma-client 0.1.0 declares Apache-2.0 and contains no standalone license file."
   ],
   "license_election_or_shipping_clearance": false,
   "limitations": [
-    "The AccessKit first tree was read in a prior tool invocation: status200 and names were observed, but tree body was not retained. Its three exact raw files have URL/status/SHA256 receipts; all other successful tree bodies are retained.",
-    "A root license/notice file is source evidence, not proof of complete required alternatives or bundled asset terms.",
-    "No named root/ancestor file is a limited source observation, not absence of permission. Retained source README/Cargo/VCS evidence stays in audit.",
-    "No builds, Cargo commands, cache edits, source edits, signing, live-owner changes, installed-app changes or publication occurred.",
-    "Original inventory is immutable; this successor changes only its own isolated directory.",
-    "Package authors and declarations are not invented or used to infer missing grants."
+    "License declarations and available texts are recorded by dependency. Native package composition requires separate validation."
   ],
-  "readiness_20261113": {
-    "actor": "liora-gpt",
-    "new_files": 24,
-    "package_graph_match": "All1061 public-lock package entries equal CLI-lock entries; only extra CLI package is erlkonig-cli0.1.1.",
-    "public_lock_sha256": "3de16defeb3780f4b077e72bfbeeee729e8f287d200c96053617bcaf0544e2ba",
-    "recovery_combined_notice_sha256": "0c13d2189c35d9091922bf891c6cea0875bed6de05b968806107c70c3f1586bd",
-    "scope": "Adds24 exact recovered source notice and linked standard-term files to original desktop graph notices; preserves original1906 files except manifest. No grant or copyright attribution invented.",
-    "status": "isolated unsigned staging awaiting Developer ID; historical manifest status fields remain historical evidence"
-  },
-  "scope": "Full retained 1061-package graph, not a linked/shipped dependency list. Mechanical exact-source text retrieval; no license election or compatibility conclusion.",
+  "scope": "License notices for the locked source graph and associated assets.",
   "status": "retained full-graph notice evidence; unresolved source/rights questions; publication remains blocked",
   "supporting_files": [
     {
-      "bytes": 1099,
+      "bytes": 943,
       "path": "README.txt",
-      "sha256": "6c46c2d0ff3bd661a4a0afdffab665f3f7989d1533317242781bdf3b3e7ccba1"
+      "sha256": "9882d7ab5dfbbd93bce84084b5696c04b27fe85039e6fb182a1572e88511bc98"
     },
     {
-      "bytes": 15980,
+      "bytes": 15662,
       "path": "asset-evidence.json",
-      "sha256": "161d95b618259e251f2a7c31f2c75b5d2df13dab512e674d028a55e62fb19559"
+      "sha256": "8f665cd93c11379e66ae0b21f42feca6eab026bacbd14c8dc1f5bfdcd472d82e"
     }
   ]
 }

@@ -118,12 +118,11 @@ def check_public_catalog(client, workspace):
           "public tool discovery is incomplete")
     names = [tool.get("name") for tool in tools]
     check(all(isinstance(name, str) for name in names), "invalid public tool name")
-    check(not any(name.startswith("erp_") for name in names), "private ERP tool advertised")
-    for name in ERP_TOOLS:
-        response = client.call(name, {"workspace": workspace})
-        check(response.get("error", {}).get("code") == -32602
-              and response["error"].get("message") == "Unknown tool",
-              "private ERP call was not rejected as an unknown tool")
+    for name in (*ERP_TOOLS, "config_enable_workspace_erp"):
+        check(names.count(name) == 1, f"missing or duplicate {name}")
+    response = client.call("erp_review", {"workspace": workspace, "month": "2024-01"})
+    check("ERP collection role is unconfigured" in json.dumps(response),
+          "workspace without an ERP route accepted or misrouted a review")
     return len(names)
 
 
@@ -404,21 +403,31 @@ print('{{"installed":[]}}' if name == "codex" else '[]')
             check(3 < time.monotonic() - before < 10, "stalled HTTP body did not use the bounded Quit drain")
         final, client = start("final")
         same_identity(client)
+        def client_inventory():
+            log = root / "client-commands.jsonl"
+            if not log.exists():
+                return None
+            # Both client commands run asynchronously after native startup.
+            # Only consume complete newline-terminated records from the shims.
+            commands = [json.loads(line) for line in log.read_text().splitlines(keepends=True)
+                        if line.endswith("\n")]
+            return commands if {entry["client"] for entry in commands} == {"codex", "claude"} else None
+
+        commands = wait_until(client_inventory, 20, "native client inventory did not finish")
         final.send_signal(signal.SIGTERM)
         stopped(final, client.url)
-        commands = [json.loads(line) for line in (root / "client-commands.jsonl").read_text().splitlines()]
         check({entry["client"] for entry in commands} == {"codex", "claude"}, "fake client inventory was not observed")
         for entry in commands:
             expected = (["--disable", "remote_plugin", "plugin", "list", "--marketplace", "erlkonig-local", "--json"]
                         if entry["client"] == "codex" else ["plugin", "list", "--json"])
             check(entry["args"] == expected, "candidate attempted an unrequested client mutation")
         (root / "result.json").write_text(json.dumps({"status": "passed", "node_id": fixture["node_id"],
-            "public_tool_count": public_tool_count, "unknown_erp_calls_rejected": list(ERP_TOOLS),
+            "public_tool_count": public_tool_count, "workspace_erp_tools": list(ERP_TOOLS),
             "native_decline_observed_and_verified": args.decline_first,
             "operator_native_quit_observed": args.operator_quit,
             "signal_shutdown_tested": args.signal_quit,
             "supported_framing_upgrade": args.old_framing, "canonical_32_conversion_tested": args.legacy32_writer is not None,
-            "checks": ["authenticated HTTP", "explicit workspace", "public catalog excludes ERP and rejects ERP calls", "native item tools", "duplicate refusal",
+            "checks": ["authenticated HTTP", "explicit workspace", "ERP advertised and unconfigured workspace refused", "native item tools", "duplicate refusal",
                        "stdio forwarding only", "shutdown closes listener and forwarder",
                        "bounded signal shutdown drain" if args.signal_quit else ("native Quit with bounded cleanup wait" if args.operator_quit else "bounded AppKit drain"), "same identity on relaunch"]}, indent=2) + "\n")
         print("isolated candidate acceptance passed; no fixture app left running")
