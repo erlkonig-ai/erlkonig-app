@@ -7,7 +7,7 @@
     "licenses_and_notices_packaged": false
   },
   "app": {
-    "retained_lock_sha256": "c26089d26e67f0d1f97718d2269d176b5e062352784223c2341f255f3ede1576",
+    "retained_lock_sha256": "ebed6dfa811315271900111a841fadad581d9da4283941d2f86b44c58aed1d54",
     "icon_lock_sha256": "c170177d6d038cbce66728c0693a05b22ca3ce7d65aaca04837867d040ddd75c",
     "candidate_change": "Adds workspace-scoped bookkeeping tools and the Revolver operator command."
   },
