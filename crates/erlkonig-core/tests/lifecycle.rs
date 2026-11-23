@@ -311,8 +311,10 @@ fn one_store_services_ignore_workspace_edits_allow_concurrent_writers_and_close_
         thread::sleep(Duration::from_millis(20));
     }
     let view = app.config().unwrap();
-    app.create_workspace(&view, "First bundle").unwrap();
-    wait_for(&app, |s| s.sync_collections >= before.sync_collections + 30);
+    let revision = app.create_workspace(&view, "First bundle").unwrap();
+    let workspace = app.config().unwrap().workspace(revision).unwrap().unwrap();
+    let expected_selections = before.sync_collections + workspace.routes.len();
+    wait_for(&app, |s| s.sync_collections == expected_selections);
     assert_eq!(
         app.status().node.sessions_started,
         1,
