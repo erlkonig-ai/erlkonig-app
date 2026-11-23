@@ -38,7 +38,7 @@ impl Observation {
     pub(crate) fn observe(health: &HealthSnapshot, previous: Option<&Self>) -> Option<Self> {
         let host_epoch = health.started_at?.as_nanos();
         let sampled_at = health.observed_at?.as_nanos();
-        let previous = previous.filter(|old| old.host_epoch == host_epoch && old.sampled_at < sampled_at);
+        let previous = previous.filter(|old| old.host_epoch == host_epoch && old.sampled_at <= sampled_at);
         let seconds = previous.map(|old| (sampled_at - old.sampled_at) as f64 / 1e9);
         let connections = health.connections.iter().map(|row| {
             let peer = hex::encode(row.peer);
@@ -47,10 +47,18 @@ impl Observation {
             let sent_bytes = row.traffic.map(|stats| stats.sent_bytes);
             // Both counters must advance monotonically. A reset is a new baseline,
             // never a wrapped delta or a zero-rate claim.
-            let rates = before.and_then(|old| Some((
-                received_bytes?.checked_sub(old.received_bytes?)? as f64 / seconds?,
-                sent_bytes?.checked_sub(old.sent_bytes?)? as f64 / seconds?,
-            )));
+            let rates = before.and_then(|old| {
+                let received = received_bytes?.checked_sub(old.received_bytes?)?;
+                let sent = sent_bytes?.checked_sub(old.sent_bytes?)?;
+                let seconds = seconds?;
+                if seconds > 0.0 {
+                    Some((received as f64 / seconds, sent as f64 / seconds))
+                } else if received == 0 && sent == 0 {
+                    Some((old.receive_bytes_per_second?, old.send_bytes_per_second?))
+                } else {
+                    None
+                }
+            });
             Connection {
                 id: row.id, peer, received_bytes, sent_bytes,
                 receive_bytes_per_second: rates.map(|rate| rate.0),
@@ -91,7 +99,14 @@ mod tests {
         let next = Observation::observe(&health, Some(&first)).unwrap();
         assert_eq!(next.connections[0].receive_bytes_per_second, Some(500.0));
         assert_eq!(next.connections[0].send_bytes_per_second, Some(250.0));
-        assert!(Observation::observe(&health, Some(&next)).unwrap().connections[0].receive_bytes_per_second.is_none());
+        let repeated = Observation::observe(&health, Some(&next)).unwrap();
+        assert_eq!(repeated.sampled_at, next.sampled_at);
+        assert_eq!(repeated.connections[0].receive_bytes_per_second, Some(500.0));
+        assert_eq!(repeated.connections[0].send_bytes_per_second, Some(250.0));
+        health.connections[0].traffic.as_mut().unwrap().received_bytes += 1;
+        let ambiguous = Observation::observe(&health, Some(&repeated)).unwrap();
+        assert!(ambiguous.connections[0].receive_bytes_per_second.is_none());
+        assert!(ambiguous.connections[0].send_bytes_per_second.is_none());
         health.observed_at = health.observed_at.map(|at| at + Duration::from_secs(1));
         health.connections[0].id += 1;
         assert!(Observation::observe(&health, Some(&next)).unwrap().connections[0].receive_bytes_per_second.is_none());
