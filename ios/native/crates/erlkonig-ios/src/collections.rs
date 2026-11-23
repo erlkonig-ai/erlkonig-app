@@ -2,6 +2,8 @@
 use anyhow::{Context, Result, ensure};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::Serialize;
+use std::sync::Arc;
+use crate::CollectionSnapshot;
 use triblespace_core::{
     capability::QuorumOutcome,
     collection::{self, CollectionHandle, CollectionRead, CollectionStoreExt, descriptor,
@@ -66,7 +68,7 @@ pub fn state_token(state: &Selection) -> String {
 #[derive(Clone, Serialize)]
 pub struct Row {
     #[serde(skip)]
-    handle: CollectionHandle,
+    pub(crate) handle: CollectionHandle,
     pub root: String,
     pub name: String,
     pub state: String,
@@ -79,15 +81,31 @@ pub struct Row {
 }
 #[derive(Clone, Default, Serialize)]
 pub struct Page {
+    #[serde(skip)]
+    pub(crate) observed: Option<Arc<(CollectionSnapshot, StoreDependencies)>>,
     pub rows: Vec<Row>,
     pub offset: usize,
     pub total: usize,
     pub has_more: bool,
     pub pending: usize,
     pub prefix_bytes: u64,
+    pub revision: u64,
 }
 
-/// One disposable metadata projection, bounded at the FFI boundary. Collection
+impl Page {
+    /// Does this cut still authorize the old visible rows and their metadata?
+    /// Totals, offsets and counts remain facts about the original cut. On a
+    /// changed generation the index checks can visit all observed dependencies.
+    pub fn metadata_current(&self, latest: &CollectionSnapshot) -> bool {
+        let Some(observed) = &self.observed else { return false; };
+        let (old, dependencies) = observed.as_ref();
+        if old == latest { return true; }
+        old.same_replica(latest) && old.complete == latest.complete && old.revision < latest.revision
+            && latest.snapshot.changes_for(&old.snapshot, dependencies).is_empty()
+    }
+}
+
+/// One disposable bounded metadata projection. Collection
 /// payloads are never read here. Native admission follows all supported policies,
 /// exactly as desktop AllAccessible does; availability does not select anything.
 pub fn page(pile: &mut Pile, key: &SigningKey, offset: usize) -> Result<Page> {
@@ -95,8 +113,7 @@ pub fn page(pile: &mut Pile, key: &SigningKey, offset: usize) -> Result<Page> {
     project(&snapshot, key.verifying_key(), offset, PAGE_SIZE)
 }
 
-/// The same ephemeral row projection for a page or a whole chart observation.
-/// A chart supplies its immutable snapshot and does not select or track roots.
+/// Read a page from one immutable snapshot.
 pub(crate) fn project(snapshot: &PileSnapshot, reader: VerifyingKey, offset: usize, limit: usize) -> Result<Page> {
     project_observation(snapshot, snapshot, reader, offset, limit, true)
 }
@@ -108,14 +125,26 @@ pub(crate) fn project_prefix(snapshot: &PileSnapshot, reader: VerifyingKey, offs
     project_observation(snapshot, snapshot, reader, offset, limit, false)
 }
 
-pub(crate) struct PrefixPage {
+pub(crate) struct CachedPage {
     snapshot: PileSnapshot,
     dependencies: StoreDependencies,
     reader: VerifyingKey,
     page: Page,
+    complete: bool,
 }
 
-impl PrefixPage {
+impl CachedPage {
+    pub(crate) fn read_view(previous: &mut Option<Self>, view: &CollectionSnapshot, offset: usize) -> Result<Page> {
+        let mut page = Self::read(previous, &view.snapshot, view.reader, offset, view.complete, view.revision)?;
+        if let Some(cached) = previous {
+            if !cached.page.observed.as_ref().is_some_and(|observed| observed.0 == *view) {
+                cached.page.observed = Some(Arc::new((view.clone(), cached.dependencies.clone())));
+            }
+            page.observed = cached.page.observed.clone();
+        }
+        Ok(page)
+    }
+
     fn metadata_current(&self, snapshot: &PileSnapshot, reader: VerifyingKey, offset: usize) -> Result<bool> {
         Ok(self.reader == reader && self.page.offset == offset
             && snapshot.changes_for(&self.snapshot, &self.dependencies).is_empty()
@@ -123,13 +152,17 @@ impl PrefixPage {
                 || snapshot.collections()? == self.snapshot.collections()?))
     }
 
-    pub fn observe(previous: &mut Option<Self>, snapshot: &PileSnapshot, reader: VerifyingKey, offset: usize) -> Result<Page> {
+    pub fn read(previous: &mut Option<Self>, snapshot: &PileSnapshot, reader: VerifyingKey, offset: usize, complete: bool, revision: u64) -> Result<Page> {
         if let Some(old) = previous {
-            if old.metadata_current(snapshot, reader, offset)? {
+            if old.page.revision == revision && old.page.offset == offset && old.reader == reader && old.complete == complete {
+                return Ok(old.page.clone());
+            }
+            if old.page.revision < revision && old.complete == complete && old.metadata_current(snapshot, reader, offset)? {
                 for row in &mut old.page.rows {
                     (row.counts, row.count_error, row.counts_replay_complete) = count_fields(snapshot.record_count_status(row.handle));
                 }
                 old.page.prefix_bytes = snapshot.prefix_len() as u64;
+                old.page.revision = revision;
                 old.snapshot = snapshot.clone();
                 return Ok(old.page.clone());
             }
@@ -137,13 +170,48 @@ impl PrefixPage {
         // Metadata reads include missing descriptor/name blobs, config and grants.
         // Candidate roots and per-row counts have separate indexed checks above.
         let tracked = ObservedStore::new(snapshot.clone());
-        let page = project_observation(snapshot, &tracked, reader, offset, PAGE_SIZE, false)?;
-        *previous = Some(Self { snapshot: snapshot.clone(), dependencies: tracked.dependencies(), reader, page: page.clone() });
+        let mut page = project_observation(snapshot, &tracked, reader, offset, PAGE_SIZE, complete)?;
+        page.revision = revision;
+        *previous = Some(Self { snapshot: snapshot.clone(), dependencies: tracked.dependencies(), reader, page: page.clone(), complete });
         Ok(page)
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FULL_PAGE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn project_observation(source: &PileSnapshot, snapshot: &impl StoreRead, reader: VerifyingKey, offset: usize, limit: usize, complete: bool) -> Result<Page> {
+    #[cfg(test)]
+    FULL_PAGE_READS.set(FULL_PAGE_READS.get() + 1);
+    let mut rows = Vec::new();
+    let (total, pending) = visit_visible(source, snapshot, reader, offset, limit, complete, |root, name, state, readable| {
+        let (counts, count_error, counts_replay_complete) = count_fields(source.record_count_status(root));
+        rows.push(Row {
+            handle: root, root: hex::encode(root.raw), name,
+            state: state.as_ref().map(state_token).unwrap_or_else(|| "unknown".into()),
+            selected: state == Some(Selection::Selected),
+            conflicted: matches!(state, Some(Selection::Conflicted(_))), readable,
+            counts, count_error, counts_replay_complete,
+        });
+    })?;
+    Ok(Page { has_more: total > offset.saturating_add(rows.len()), total, pending, rows, offset,
+        prefix_bytes: source.prefix_len() as u64, ..Page::default() })
+}
+
+/// Storage composition needs the visible root handles and names only. It has
+/// its own explicit visibility demand and never constructs list rows or counts.
+pub(crate) fn chart_roots(snapshot: &PileSnapshot, reader: VerifyingKey) -> Result<Vec<(CollectionHandle, String)>> {
+    let mut roots = Vec::new();
+    visit_visible(snapshot, snapshot, reader, 0, usize::MAX, true, |root, name, _, _| roots.push((root, name)))?;
+    Ok(roots)
+}
+
+fn visit_visible(source: &PileSnapshot, snapshot: &impl StoreRead, reader: VerifyingKey,
+    offset: usize, limit: usize, complete: bool,
+    mut visit: impl FnMut(CollectionHandle, String, Option<Selection>, bool),
+) -> Result<(usize, usize)> {
     let facts = if !complete && !snapshot.contains_blob(selection::config_handle(reader))? {
         None
     } else {
@@ -165,7 +233,8 @@ fn project_observation(source: &PileSnapshot, snapshot: &impl StoreRead, reader:
             pattern!(facts, [{ _?state @ selection::sync_collection: ?root }])));
     }
     candidates.sort_unstable(); candidates.dedup();
-    let mut page = Page { offset, prefix_bytes: source.prefix_len() as u64, ..Page::default() };
+    let mut total = 0;
+    let mut pending = 0;
     for root in candidates {
         if root == selection::config_handle(reader) { continue; }
         let state = facts.as_ref().map(|facts| selection::sync_selection(facts, root));
@@ -173,16 +242,18 @@ fn project_observation(source: &PileSnapshot, snapshot: &impl StoreRead, reader:
         if descriptor.as_ref().is_some_and(|d| descriptor::parents(d).is_ok_and(|p| !p.is_empty())) {
             continue;
         }
-        let admission = collection::collection_reader_is_admitted_by(
-            snapshot, root, reader, &proofs);
-        let readable = matches!(admission, Ok(QuorumOutcome::Met));
+        // The descriptor facts above are exactly the action helper's input.
+        // Reuse them for admission, including missing quorum definitions.
+        let admission = descriptor.as_ref().map(|facts| collection::collection_action_is_admitted_by_descriptor(
+            snapshot, root, facts, None, collection::ACTION_READ, reader, &proofs));
+        let readable = matches!(admission, Some(QuorumOutcome::Met));
         if !complete && descriptor.is_none() && state.is_none() { continue; }
-        if descriptor.is_none() || matches!(admission, Err(_) | Ok(QuorumOutcome::Undefined(_))) {
-            page.pending += 1;
+        if matches!(admission, None | Some(QuorumOutcome::Undefined(_))) {
+            pending += 1;
         }
         if !readable && matches!(state, None | Some(Selection::Unset | Selection::Unselected)) { continue; }
-        let index = page.total; page.total += 1;
-        if index < offset || page.rows.len() >= limit { continue; }
+        let index = total; total += 1;
+        if index < offset || index >= offset.saturating_add(limit) { continue; }
         let mut names = std::collections::BTreeSet::new();
         if let Some(descriptor) = descriptor {
             for handle in find!(name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
@@ -194,21 +265,12 @@ fn project_observation(source: &PileSnapshot, snapshot: &impl StoreRead, reader:
                 }
             }
         }
-        let (counts, count_error, counts_replay_complete) = count_fields(source.record_count_status(root));
-        page.rows.push(Row {
-            handle: root,
-            root: hex::encode(root.raw),
-            name: if names.is_empty() {
-                if complete { "Unnamed collection".into() } else { hex::encode(root.raw) }
-            } else { names.into_iter().collect::<Vec<_>>().join(" / ").chars().take(160).collect() },
-            state: state.as_ref().map(state_token).unwrap_or_else(|| "unknown".into()),
-            selected: state == Some(Selection::Selected),
-            conflicted: matches!(state, Some(Selection::Conflicted(_))), readable,
-            counts, count_error, counts_replay_complete,
-        });
+        let name = if names.is_empty() {
+            if complete { "Unnamed collection".into() } else { hex::encode(root.raw) }
+        } else { names.into_iter().collect::<Vec<_>>().join(" / ").chars().take(160).collect() };
+        visit(root, name, state, readable);
     }
-    page.has_more = page.total > offset.saturating_add(page.rows.len());
-    Ok(page)
+    Ok((total, pending))
 }
 
 /// Projection only: native owns canonical/direct state; no fallback enumeration.

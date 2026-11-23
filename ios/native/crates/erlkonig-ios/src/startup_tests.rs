@@ -96,7 +96,7 @@ fn opening_worker_publishes_prefixes_and_moves_one_store_after_complete_local_pa
         *budget = 1; // One complete native record per turn, no wall-clock race.
         let pile = pile.unwrap();
         *first_origin.lock().unwrap() = Some(pile.snapshot_replayed());
-        first_observation.send(("identity", peer, pile.replayed_length(), serde_json::to_value(&*status.lock().unwrap()).unwrap())).unwrap();
+        first_observation.send(("identity", peer, pile.replayed_length(), status.lock().unwrap().test_value())).unwrap();
     }))).unwrap();
     let before_origin = origin.clone();
     let before_observation = observations.clone();
@@ -106,7 +106,7 @@ fn opening_worker_publishes_prefixes_and_moves_one_store_after_complete_local_pa
             &std::collections::BTreeSet::from([CollectionRecordSelector::Foundations(roots[0])]),
         ).unwrap();
         before_observation.send(("before peer", matches!(changes, RecordViewChanges::Rebuild),
-            pile.replayed_length(), serde_json::to_value(&*status.lock().unwrap()).unwrap())).unwrap();
+            pile.replayed_length(), status.lock().unwrap().test_value())).unwrap();
     }))).unwrap();
     // A direct caller cannot mutate incomplete local state even if it bypasses UI.
     sender.send(Command::Choose(roots[0], "unset".into(), false)).unwrap();
@@ -117,7 +117,7 @@ fn opening_worker_publishes_prefixes_and_moves_one_store_after_complete_local_pa
         let observations = observations.clone();
         sender.send(Command::OpeningCheckpoint(Box::new(move |pile, peer, status, _| {
             observations.send(("page", peer, pile.map_or(0, |p| p.replayed_length()),
-                serde_json::to_value(&*status.lock().unwrap()).unwrap())).unwrap();
+                status.lock().unwrap().test_value())).unwrap();
         }))).unwrap();
     }
     let transferred_origin = origin.clone();
@@ -129,7 +129,7 @@ fn opening_worker_publishes_prefixes_and_moves_one_store_after_complete_local_pa
             &std::collections::BTreeSet::from([CollectionRecordSelector::Foundations(roots[0])]),
         ).unwrap();
         transferred_observation.send(("after peer", matches!(changes, RecordViewChanges::Rebuild),
-            pile.replayed_length(), serde_json::to_value(&*status.lock().unwrap()).unwrap())).unwrap();
+            pile.replayed_length(), status.lock().unwrap().test_value())).unwrap();
     }))).unwrap();
     sender.send(Command::Stop).unwrap();
     drop(sender); drop(observations);
@@ -183,7 +183,7 @@ fn opening_pause_retains_partial_reader_and_stop_closes_without_replacing_identi
         let (state, states) = mpsc::channel();
         sender.send(Command::OpeningCheckpoint(Box::new(move |pile, peer, status, _| {
             state.send((pile.map(|p| p.replayed_length()), peer,
-                serde_json::to_value(&*status.lock().unwrap()).unwrap())).unwrap();
+                status.lock().unwrap().test_value())).unwrap();
         }))).unwrap();
         sender.send(Command::Stop).unwrap(); drop(sender);
         run_script(dir.path().to_owned(), receiver, status);
@@ -238,7 +238,7 @@ fn offline_foreground_replays_resumes_and_pages_without_starting_a_peer() {
     let checkpoint = || {
         let observations = observations.clone();
         Command::OpeningCheckpoint(Box::new(move |pile, peer, status, _| {
-            observations.send((pile.is_some(), peer, serde_json::to_value(&*status.lock().unwrap()).unwrap())).unwrap();
+            observations.send((pile.is_some(), peer, status.lock().unwrap().test_value())).unwrap();
         }))
     };
     sender.send(Command::OpeningCheckpoint(Box::new(|_, _, _, budget| *budget = 1))).unwrap();
@@ -334,7 +334,7 @@ fn actual_replay_publications_keep_useful_counts_during_continuous_append() {
             assert!(!peer);
             let snapshot = pile.unwrap().snapshot_replayed();
             let counts = snapshot.record_count_status(root);
-            observations.send((serde_json::to_value(&*status.lock().unwrap()).unwrap(), snapshot, counts)).unwrap();
+            observations.send((status.lock().unwrap().test_value(), snapshot, counts)).unwrap();
         }))).unwrap();
     }
     sender.send(Command::Stop).unwrap(); drop(sender); drop(observations);
@@ -384,7 +384,7 @@ fn blob_only_arrival_republishes_actual_peer_rows_and_local_selected_aggregate()
         sender.send(if local_selected { Command::LocalActive(1) } else { Command::Active(true, 1) }).unwrap();
         let capture = |observations: mpsc::Sender<serde_json::Value>| {
             Command::OpeningCheckpoint(Box::new(move |_, _, status, _| {
-                observations.send(serde_json::to_value(&*status.lock().unwrap()).unwrap()).unwrap();
+                observations.send(status.lock().unwrap().test_value()).unwrap();
             }))
         };
         sender.send(capture(observations.clone())).unwrap();
@@ -474,7 +474,7 @@ fn retained_peer_pause_resume_keeps_native_lineage_and_stop_releases_owner() {
             let status = status.lock().unwrap();
             assert_eq!(status.activity_serial, serial);
             assert!(status.replay_complete && !status.running && !status.network_started);
-            assert_eq!(status.collections.total, 2);
+            assert_eq!(status.test_page().total, 2);
         }))).unwrap();
         sender.send(Command::Active(true, serial + 1)).unwrap();
         let before = baseline.clone();
@@ -565,7 +565,7 @@ fn partial_pause_stays_put_then_resume_consumes_only_appended_suffix() {
         assert!(matches!(changes, RecordViewChanges::Append(ref rows) if rows.is_empty()), "suffix resume rebuilt preexisting records");
         let status = status.lock().unwrap();
         assert_eq!(status.activity_serial, 6);
-        assert_eq!(status.collections.total, 3);
+        assert_eq!(status.test_page().total, 3);
         assert!(status.replay_complete);
     }))).unwrap();
     sender.send(Command::Stop).unwrap(); drop(sender);
@@ -603,7 +603,7 @@ fn queued_inactive_choices_and_discovery_use_retained_owner_and_resume_in_order(
         assert!(status.action_error.is_none());
         assert!(status.listening && status.replay_complete && !status.network_started);
         assert_eq!(status.selected, 0);
-        assert!(status.collections.rows.iter().any(|row| row.root == hex::encode(roots[0].raw) && row.state == "unselected"));
+        assert!(status.test_page().rows.iter().any(|row| row.root == hex::encode(roots[0].raw) && row.state == "unselected"));
     }))).unwrap();
     sender.send(Command::Stop).unwrap(); drop(sender);
     run_script(dir.path().to_owned(), receiver, status.clone());
@@ -636,5 +636,91 @@ fn failed_pause_is_not_acknowledged_and_final_cleanup_releases_retained_owner() 
     assert_eq!(status.activity_serial, 1, "failed pause or queued activation was acknowledged");
     assert!(status.error.as_ref().unwrap().contains("injected checkpoint failure"));
     assert!(!status.running && status.network.is_none());
-    assert!(!status.replay_complete && status.collections.rows.is_empty(), "fatal owner close left live local readiness");
+    assert!(!status.replay_complete && status.test_page().rows.is_empty(), "fatal owner close left live local readiness");
+}
+
+#[test]
+fn hidden_replica_performs_no_list_projections_and_reader_pins_its_cut_after_stop() {
+    let (dir, _, _, _) = fixture();
+    let (command, receiver) = mpsc::channel();
+    let status = Arc::new(Mutex::new(Status::default()));
+    let replica = Replica { command: command.clone(), status: status.clone(), activity_serial: AtomicU64::new(0) };
+    let (tx, rx) = mpsc::channel();
+    command.send(Command::Active(true, 1)).unwrap();
+    command.send(Command::StorageCheckpoint(Box::new(move |_, _, status| {
+        tx.send((collections::FULL_PAGE_READS.get(), status.lock().unwrap().list_snapshot.clone().unwrap())).unwrap();
+    }))).unwrap();
+    command.send(Command::Active(false, 2)).unwrap();
+    command.send(Command::Stop).unwrap();
+    run_script(dir.path().into(), receiver, status);
+
+    let (writer_projections, pinned) = rx.recv().unwrap();
+    assert_eq!(writer_projections, 0);
+    let status = replica.read_after(None).unwrap();
+    let started = Instant::now();
+    for _ in 0..10_000 { assert!(replica.read_after(Some(status.revision)).is_none()); }
+    let idle_reads = started.elapsed();
+    drop(replica);
+    let mut pages = CollectionPages::default();
+    let before = collections::FULL_PAGE_READS.get();
+    let cold = Instant::now();
+    let first = pages.read(&pinned, 0).unwrap();
+    let cold = cold.elapsed();
+    assert_eq!(first.total, 2);
+    for _ in 0..100 { assert_eq!(pages.read(&pinned, 0).unwrap().total, 2); }
+    assert_eq!(collections::FULL_PAGE_READS.get() - before, 1);
+    assert!(pages.read(&pinned, 32).unwrap().rows.is_empty());
+    assert_eq!(collections::FULL_PAGE_READS.get() - before, 2);
+    eprintln!("10,000 unchanged typed reads {idle_reads:?}, cold two-root page {cold:?}; worker projections {writer_projections}");
+}
+
+#[test]
+fn reader_refreshes_visible_counts_and_never_reuses_a_page_across_equally_numbered_owners() {
+    let one = tempfile::tempdir().unwrap();
+    let two = tempfile::tempdir().unwrap();
+    let (key, mut pile) = open_local(one.path()).unwrap();
+    let reader = key.verifying_key();
+    let root = pile.collection("same collection", private_policy(reader)).unwrap();
+    pile.commit(root, &key, entity! { metadata::name: "first" }).unwrap();
+    let mut first = Status::default();
+    first.offer_snapshot(&pile.snapshot().unwrap(), reader, true);
+    let cutoff = first.list_snapshot.clone().unwrap();
+    let mut pages = CollectionPages::default();
+    let captured_page = pages.read(&cutoff, 0).unwrap();
+    assert!(captured_page.metadata_current(&cutoff));
+    let row = captured_page.rows[0].clone();
+    assert_eq!(row.counts.unwrap().records, 1);
+    pile.commit(root, &key, entity! { metadata::name: "second" }).unwrap();
+    first.offer_snapshot(&pile.snapshot().unwrap(), reader, true);
+    let advanced = first.list_snapshot.unwrap();
+    assert!(captured_page.metadata_current(&advanced));
+    let later = pages.read(&advanced, 0).unwrap();
+    assert_eq!(later.rows[0].counts.as_ref().unwrap().records, 2);
+    assert_eq!(pages.read(&cutoff, 0).unwrap().rows[0].counts.as_ref().unwrap().records, 1);
+    pile.close().unwrap();
+
+    fs::copy(one.path().join("node.key"), two.path().join("node.key")).unwrap();
+    let (other_key, mut other_pile) = open_local(two.path()).unwrap();
+    assert_eq!(other_key.verifying_key(), reader);
+    let same = other_pile.collection("same collection", private_policy(reader)).unwrap();
+    assert_eq!(same.handle(), root.handle());
+    for name in ["replacement A", "replacement B", "replacement C"] {
+        other_pile.commit(same, &other_key, entity! { metadata::name: name }).unwrap();
+    }
+    collections::choose(&mut other_pile, &other_key, same.handle(), "unset", true).unwrap();
+    let mut other = Status::default();
+    other.offer_snapshot(&other_pile.snapshot().unwrap(), reader, true);
+    let replacement = other.list_snapshot.clone().unwrap();
+    assert_eq!(replacement.revision, cutoff.revision);
+    assert!(replacement != cutoff);
+    assert!(!captured_page.metadata_current(&replacement));
+    let other_row = pages.read(&replacement, 0).unwrap().rows.remove(0);
+    assert_eq!(other_row.root, row.root);
+    assert!(other_row.selected);
+    assert_eq!(other_row.counts.unwrap().records, 3);
+    let selected_page = pages.read(&replacement, 0).unwrap();
+    collections::choose(&mut other_pile, &other_key, same.handle(), "selected", false).unwrap();
+    other.offer_snapshot(&other_pile.snapshot().unwrap(), reader, true);
+    assert!(!selected_page.metadata_current(other.list_snapshot.as_ref().unwrap()));
+    other_pile.close().unwrap();
 }

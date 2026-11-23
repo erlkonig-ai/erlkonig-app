@@ -3,7 +3,6 @@ use anyhow::{Context, Result, bail};
 use ed25519_dalek::SigningKey;
 use serde::Serialize;
 use std::{
-    ffi::{CStr, CString, c_char},
     fs::{self, OpenOptions},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
@@ -27,7 +26,14 @@ use triblespace_net::{
     reconcile::ReplicationMode,
 };
 
-mod network;
+pub mod network;
+#[cfg(target_os = "ios")]
+mod application;
+#[cfg(target_os = "ios")]
+mod ui;
+#[cfg(all(test, not(target_os = "ios")))]
+#[path = "ui/host_tests.rs"]
+mod ui_model_tests;
 pub mod collections;
 pub mod storage;
 #[cfg(feature = "synthetic-proof")]
@@ -96,12 +102,13 @@ fn selected_in(snapshot: &PileSnapshot, key: &SigningKey) -> Result<Vec<Collecti
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ReplayProgress {
-    prefix_bytes: u64,
-    observed_bytes: u64,
-    activity_serial: u64,
-    records_per_second: Option<ReplayRate>,
+pub struct ReplayProgress {
+    pub prefix_bytes: u64,
+    pub observed_bytes: u64,
+    pub activity_serial: u64,
+    pub records_per_second: Option<ReplayRate>,
 }
+#[cfg(test)]
 impl Serialize for ReplayProgress {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
@@ -123,11 +130,12 @@ impl ReplayProgress {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ReplayRate {
-    records_per_second: u64,
-    measured_at: Instant,
+pub struct ReplayRate {
+    pub records_per_second: u64,
+    pub measured_at: Instant,
 }
 
+#[cfg(test)]
 impl Serialize for ReplayRate {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if self.measured_at.elapsed() > Duration::from_secs(5) {
@@ -166,10 +174,10 @@ impl ReplayMeter {
 /// Current-source native count aggregate for admitted selected roots only.
 /// Native replay maintains the index; this is only a snapshot projection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-struct SyncProgress {
-    records: u64,
-    direct_present: u64,
-    unknown_roots: usize,
+pub struct SyncProgress {
+    pub records: u64,
+    pub direct_present: u64,
+    pub unknown_roots: usize,
 }
 
 impl SyncProgress {
@@ -197,35 +205,41 @@ fn sync_progress(snapshot: &PileSnapshot, key: &SigningKey, selected: &[Collecti
     Ok(progress)
 }
 
-#[derive(Default, Serialize)]
-struct Status {
-    node_id: String,
-    running: bool,
-    ready: bool,
+#[derive(Default, Clone, PartialEq)]
+pub struct Status {
+    pub revision: u64,
+    origin: Arc<()>,
+    pub node_id: String,
+    pub running: bool,
+    pub ready: bool,
     /// False means values describe a prefix; mutations still wait for EOF.
-    replay_complete: bool,
-    replay_progress: Option<ReplayProgress>,
-    sync_progress: Option<SyncProgress>,
+    pub replay_complete: bool,
+    pub replay_progress: Option<ReplayProgress>,
+    pub sync_progress: Option<SyncProgress>,
     /// Acknowledges activation after complete local observation, pause after checkpoint.
-    activity_serial: u64,
-    selected: usize,
-    listening: bool,
-    collections: collections::Page,
-    storage: Vec<storage::ByteObservation>,
-    composition: Option<storage::Composition>,
-    action_error: Option<String>,
-    action_serial: u64,
-    last_cleanup_error: Option<String>,
-    network_started: bool,
-    network: Option<network::Observation>,
-    bound_sockets: usize,
-    message: String,
-    error: Option<String>,
+    pub activity_serial: u64,
+    pub selected: usize,
+    pub listening: bool,
+    pub list_revision: u64,
+    pub list_snapshot: Option<CollectionSnapshot>,
+    #[cfg(test)]
+    test_page_offset: usize,
+    pub storage: Arc<Vec<storage::ByteObservation>>,
+    pub composition: Option<Arc<storage::Composition>>,
+    pub action_error: Option<String>,
+    pub action_serial: u64,
+    pub last_cleanup_error: Option<String>,
+    pub network_started: bool,
+    pub network: Option<Arc<network::Observation>>,
+    pub bound_sockets: usize,
+    pub message: String,
+    pub error: Option<String>,
 }
 enum Command {
     Active(bool, u64),
     LocalActive(u64),
     Discover,
+    #[cfg(test)]
     Page(usize),
     Storage(Vec<CollectionHandle>),
     StorageActive(bool),
@@ -244,9 +258,62 @@ pub struct Replica {
     status: Arc<Mutex<Status>>,
 }
 
+#[derive(Clone)]
+pub struct CollectionSnapshot {
+    origin: Arc<()>,
+    snapshot: Arc<PileSnapshot>,
+    reader: ed25519_dalek::VerifyingKey,
+    pub complete: bool,
+    pub revision: u64,
+}
+
+impl CollectionSnapshot {
+    pub fn same_replica(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.origin, &other.origin) && self.reader == other.reader
+    }
+}
+
+impl PartialEq for CollectionSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_replica(other) && self.revision == other.revision
+    }
+}
+
+impl Status {
+    fn offer_snapshot(&mut self, snapshot: &PileSnapshot, reader: ed25519_dalek::VerifyingKey, complete: bool) {
+        if self.list_snapshot.as_ref().is_some_and(|old| old.complete == complete && old.reader == reader
+            && old.snapshot.prefix_len() == snapshot.prefix_len() && snapshot.changes_since(&old.snapshot).is_empty()) {
+            return;
+        }
+        self.list_revision = self.list_revision.wrapping_add(1);
+        self.list_snapshot = Some(CollectionSnapshot { origin: self.origin.clone(), snapshot: Arc::new(snapshot.clone()), reader, complete, revision: self.list_revision });
+    }
+}
+
+/// One visible page and its native dependency read set. Each screen owns its reader.
+#[derive(Default)]
+pub struct CollectionPages {
+    origin: Option<Arc<()>>,
+    cached: Option<collections::CachedPage>,
+}
+
+impl CollectionPages {
+    /// May traverse metadata on a cold/invalidated page. Call on a reader thread.
+    /// The owned immutable snapshot stays valid across worker progress or release.
+    pub fn read(&mut self, view: &CollectionSnapshot, offset: usize) -> Result<collections::Page> {
+        if !self.origin.as_ref().is_some_and(|origin| Arc::ptr_eq(origin, &view.origin)) {
+            self.cached = None;
+            self.origin = Some(view.origin.clone());
+        }
+        collections::CachedPage::read_view(&mut self.cached, view, offset)
+    }
+}
+
 fn publish(status: &Arc<Mutex<Status>>, f: impl FnOnce(&mut Status)) {
     if let Ok(mut status) = status.lock() {
+        let previous = status.clone();
         f(&mut status);
+        if *status != previous { status.revision = status.revision.wrapping_add(1); }
     }
 }
 // The retained native host reports this only after its runtime thread joined.
@@ -375,10 +442,9 @@ fn worker_with_cleanup(
         let mut replay_budget = replay_budget;
         #[cfg(test)]
         let mut before_foreground: Option<Box<dyn FnOnce(&Pile, &Arc<Mutex<Status>>) + Send>> = None;
-        let mut opening_page_requested = true;
+        let mut snapshot_requested = true;
         let mut opening_published = Instant::now();
         let mut replay_meter = ReplayMeter::default();
-        let mut prefix_page = None;
         let mut peer = None;
         let mut previous = None;
         let mut roots = Vec::new();
@@ -387,7 +453,6 @@ fn worker_with_cleanup(
         let mut network_allowed = true;
         let mut requested_activity = 0;
         let mut listening = false;
-        let mut page_offset = 0;
         let mut storage_roots = Vec::new();
         let mut storage_requested = false;
         let mut storage_changed = false;
@@ -441,7 +506,7 @@ fn worker_with_cleanup(
                     // A dormant peer needs an eager host afterward, but not a reopen.
                     cleanup(&mut peer, &mut opening)?;
                     collections::start_discovery(opening.as_mut().expect("local owner"), &key)?;
-                    opening_page_requested = true;
+                    snapshot_requested = true;
                     previous = None;
                 }
                 #[cfg(test)]
@@ -465,7 +530,7 @@ fn worker_with_cleanup(
                     if !update_storage_request(&mut storage_roots, requested, &mut storage_sample) { continue; }
                     storage_requested = true;
                     let visible: std::collections::HashSet<_> = storage_roots.iter().map(|root| hex::encode(root.raw)).collect();
-                    publish(&status, |s| s.storage.retain(|row| visible.contains(&row.root)));
+                    publish(&status, |s| Arc::make_mut(&mut s.storage).retain(|row| visible.contains(&row.root)));
                     if storage_roots.is_empty() {
                         storage_changed = false;
                         storage_authority = None;
@@ -481,10 +546,10 @@ fn worker_with_cleanup(
                         publish(&status, |s| s.composition = None);
                     }
                 }
+                #[cfg(test)]
                 Ok(Command::Page(offset)) => {
-                    page_offset = offset;
-                    opening_page_requested = true;
-                    previous = None;
+                    publish(&status, |s| s.test_page_offset = offset);
+                    snapshot_requested = true;
                 }
                 Ok(Command::Choose(root_handle, expected, enabled)) => {
                     if !replay_complete {
@@ -507,14 +572,14 @@ fn worker_with_cleanup(
                         let snapshot = pile.snapshot()?;
                         let selected = selected_in(&snapshot, &key)?;
                         let sync = sync_progress(&snapshot, &key, &selected)?;
-                        inactive_view = Some((collections::project(&snapshot, key.verifying_key(), page_offset, collections::PAGE_SIZE)?,
-                            selected, ReplayProgress::observe(&snapshot, pile.observed_length()?, requested_activity), sync));
+                        let progress = ReplayProgress::observe(&snapshot, pile.observed_length()?, requested_activity);
+                        inactive_view = Some((snapshot, selected, progress, sync));
                         result
                     };
                     let error = choice.err().map(|error| format!("{error:#}"));
-                    if let Some((page, selected, progress, sync)) = inactive_view {
+                    if let Some((snapshot, selected, progress, sync)) = inactive_view {
                         publish(&status, |s| {
-                            s.collections = page;
+                            s.offer_snapshot(&snapshot, key.verifying_key(), true);
                             s.replay_progress = Some(progress);
                             s.sync_progress = Some(sync);
                             s.selected = selected.len();
@@ -522,7 +587,7 @@ fn worker_with_cleanup(
                             s.action_serial = s.action_serial.wrapping_add(1);
                         });
                     } else {
-                        // Acknowledge only with the post-choice row/count projection
+                        // Acknowledge only with the post-choice snapshot
                         // after replication retargeting and the durable checkpoint.
                         completed_choice = Some(error);
                     }
@@ -570,7 +635,7 @@ fn worker_with_cleanup(
                     if let Some(pile) = opening.as_ref() {
                         replay_complete = pile.replayed_length() == pile.observed_length()?;
                     }
-                    opening_page_requested = true;
+                    snapshot_requested = true;
                     active = true;
                     publish(&status, |s| {
                         s.running = false;
@@ -580,30 +645,18 @@ fn worker_with_cleanup(
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            if !paused && opening.is_some() && (!replay_complete || opening_page_requested) {
+            if !paused && opening.is_some() && (!replay_complete || snapshot_requested) {
                 let progress = (|| -> Result<bool> {
                     let (snapshot, complete) = opening.as_mut().unwrap().snapshot_step(replay_budget)?;
-                    if complete || opening_page_requested || opening_published.elapsed() >= Duration::from_millis(250) {
+                    if complete || snapshot_requested || opening_published.elapsed() >= Duration::from_millis(250) {
                         let pile = opening.as_ref().unwrap();
                         let mut progress = ReplayProgress::observe(&snapshot, pile.observed_length()?, requested_activity);
                         if !complete {
                             progress.records_per_second = replay_meter.observe(Instant::now(), pile.replayed_records());
-                            // Publish the cursor first. The catalog snapshot can take longer to derive.
-                            publish(&status, |s| {
-                                s.replay_complete = false;
-                                s.replay_progress = Some(progress);
-                                s.sync_progress = None;
-                                s.storage.clear();
-                                s.composition = None;
-                            });
                         }
-                        let page = if complete {
-                            prefix_page = None;
+                        if complete {
                             replay_meter = ReplayMeter::default();
-                            collections::project(&snapshot, key.verifying_key(), page_offset, collections::PAGE_SIZE)?
-                        } else {
-                            collections::PrefixPage::observe(&mut prefix_page, &snapshot, key.verifying_key(), page_offset)?
-                        };
+                        }
                         let (selected, sync) = if complete {
                             let selected = selected_in(&snapshot, &key)?;
                             (selected.len(), Some(sync_progress(&snapshot, &key, &selected)?))
@@ -613,17 +666,18 @@ fn worker_with_cleanup(
                         let listening = complete && collections::listening_in(&snapshot, key.verifying_key())?;
                         publish(&status, |s| {
                             if s.replay_progress.map(|old| old.prefix_bytes)
-                                != Some(progress.prefix_bytes) { s.storage.clear(); }
+                                != Some(progress.prefix_bytes) { s.storage = Arc::default(); }
                             s.replay_progress = Some(progress);
                             s.sync_progress = sync;
-                            s.collections = page;
+                            s.offer_snapshot(&snapshot, key.verifying_key(), complete);
+                            if !complete { s.composition = None; }
                             s.replay_complete = complete;
                             if complete && active { s.activity_serial = requested_activity; }
                             s.selected = selected;
                             s.listening = listening;
                             s.message = if complete { "Local collections ready" } else { "Loading local collections…" }.into();
                         });
-                        opening_page_requested = false;
+                        snapshot_requested = false;
                         opening_published = Instant::now();
                     }
                     Ok(complete)
@@ -635,7 +689,7 @@ fn worker_with_cleanup(
             }
             if active && network_allowed && replay_complete {
                 if let Some(pile) = opening.take() {
-                    // Complete local rows have already been published. Network
+                    // The complete local snapshot is already readable. Network
                     // startup and serving indexes cannot delay that publication.
                     #[cfg(test)]
                     if let Some(checkpoint) = before_foreground.take() { checkpoint(&pile, &status); }
@@ -662,9 +716,8 @@ fn worker_with_cleanup(
                         storage_changed = true;
                         chart_changed = true;
                         listening = collections::listening(&mut current.store(), &key)?;
-                        let page = collections::project(&snapshot, key.verifying_key(), page_offset, collections::PAGE_SIZE)?;
                         let next = selected_in(&snapshot, &key)?;
-                        changed_view = Some((page, sync_progress(&snapshot, &key, &next)?));
+                        changed_view = Some(sync_progress(&snapshot, &key, &next)?);
                         if previous.is_none() || roots != next {
                             current.set_replication(ReplicationMode::Full, next.iter().copied());
                             if !next.is_empty() {
@@ -677,11 +730,11 @@ fn worker_with_cleanup(
                         // race our selection writes; a newer snapshot was not all examined.
                         previous = Some(snapshot.clone());
                     }
-                    // Publish snapshot-native rows/counts before optional inventory
+                    // Expose the immutable snapshot before optional inventory
                     // setup or byte steps. No byte batch owns their readiness.
                     publish(&status, |s| {
-                        if let Some((page, sync)) = changed_view {
-                            s.collections = page;
+                        if let Some(sync) = changed_view {
+                            s.offer_snapshot(&snapshot, key.verifying_key(), true);
                             s.sync_progress = Some(sync);
                         }
                         s.replay_progress = Some(snapshot_progress);
@@ -708,12 +761,12 @@ fn worker_with_cleanup(
                         if let Some((observations, summary)) = sample.step(4096) {
                             if summary.is_some() { storage_statistics = summary; }
                             if !storage_requested {
-                                publish(&status, |s| s.storage = observations);
+                                publish(&status, |s| s.storage = Arc::new(observations));
                             }
                             storage_sample = None;
                         } else if started_bytes {
                             // An already complete sample never needs a pending publication.
-                            publish(&status, |s| s.storage = sample.pending_rows(&s.storage));
+                            publish(&status, |s| s.storage = Arc::new(sample.pending_rows(&s.storage)));
                         }
                     }
                     // Chart roots come from the complete native row projection,
@@ -722,7 +775,7 @@ fn worker_with_cleanup(
                         (chart_changed && chart_sampled.elapsed() >= Duration::from_secs(5))) {
                         match storage::IncrementalCompositionSample::new(snapshot.clone(), key.verifying_key(), chart_statistics.as_ref()) {
                             Ok(sample) => chart_sample = Some(sample),
-                            Err(error) => publish(&status, |s| s.composition = Some(storage::Composition::unavailable(error))),
+                            Err(error) => publish(&status, |s| s.composition = Some(Arc::new(storage::Composition::unavailable(error)))),
                         }
                         chart_requested = false;
                         chart_changed = false;
@@ -731,7 +784,7 @@ fn worker_with_cleanup(
                     if let Some(sample) = chart_sample.as_mut() {
                         if let Some((composition, summary)) = sample.step(4096) {
                             if summary.is_some() { chart_statistics = summary; }
-                            publish(&status, |s| s.composition = Some(composition));
+                            publish(&status, |s| s.composition = Some(Arc::new(composition)));
                             chart_sample = None;
                         }
                     }
@@ -759,7 +812,7 @@ fn worker_with_cleanup(
                             s.action_serial = s.action_serial.wrapping_add(1);
                         }
                         s.network_started = health.started_at.is_some();
-                        s.network = network::Observation::observe(&health, s.network.as_ref());
+                        s.network = network::Observation::observe(&health, s.network.as_deref()).map(Arc::new);
                         s.bound_sockets = current.bound_sockets().len();
                         s.message = if roots.is_empty() {
                             if listening {
@@ -804,8 +857,9 @@ fn worker_with_cleanup(
             s.replay_complete = false;
             s.replay_progress = None;
             s.sync_progress = None;
-            s.collections = collections::Page::default();
-            s.storage.clear();
+            s.list_snapshot = None;
+            s.list_revision = s.list_revision.wrapping_add(1);
+            s.storage = Arc::default();
             s.composition = None;
             s.network_started = false;
             s.bound_sockets = 0;
@@ -820,167 +874,91 @@ fn worker_with_cleanup(
 // Own the execution stack rather than depending on the caller's thread budget.
 const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
-/// All pointers belong to the native shell; no Swift object crosses the ABI.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn erl_ios_open(path: *const c_char) -> *mut Replica {
-    if path.is_null() { return std::ptr::null_mut(); }
-    let Ok(path) = (unsafe { CStr::from_ptr(path) }).to_str() else {
-        return std::ptr::null_mut();
-    };
-    let root = PathBuf::from(path);
-    let (command, receiver) = mpsc::channel();
-    let status = Arc::new(Mutex::new(Status::default()));
-    let worker_status = status.clone();
-    if std::thread::Builder::new()
-        .name("ios-replica".into())
-        .stack_size(WORKER_STACK_BYTES)
-        .spawn(move || worker(root, receiver, worker_status))
-        .is_err()
-    {
-        return std::ptr::null_mut();
+impl Replica {
+    /// Start the single native store owner. Opening/replay proceeds on its own stack.
+    pub fn open(root: &Path) -> Result<Self> {
+        let root = root.to_owned();
+        let (command, receiver) = mpsc::channel();
+        let status = Arc::new(Mutex::new(Status::default()));
+        let worker_status = status.clone();
+        std::thread::Builder::new().name("ios-replica".into()).stack_size(WORKER_STACK_BYTES)
+            .spawn(move || worker(root, receiver, worker_status))?;
+        Ok(Self { command, status, activity_serial: AtomicU64::new(0) })
     }
-    Box::into_raw(Box::new(Replica { command, status, activity_serial: AtomicU64::new(0) }))
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn erl_ios_active(replica: *mut Replica, active: bool) -> u64 {
-    let Some(replica) = (unsafe { replica.as_ref() }) else { return 0; };
-    let serial = replica.activity_serial.fetch_add(1, Ordering::Relaxed) + 1;
-    if replica.command.send(Command::Active(active, serial)).is_ok() { serial } else { 0 }
-}
-/// Foreground local replay for the synthetic proof reader, without networking.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn erl_ios_local_active(replica: *mut Replica) -> u64 {
-    let Some(replica) = (unsafe { replica.as_ref() }) else { return 0; };
-    let serial = replica.activity_serial.fetch_add(1, Ordering::Relaxed) + 1;
-    if replica.command.send(Command::LocalActive(serial)).is_ok() { serial } else { 0 }
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn erl_ios_discover(replica: *mut Replica) {
-    if let Some(replica) = unsafe { replica.as_ref() } {
-        let _ = replica.command.send(Command::Discover);
-    }
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn erl_ios_collections_page(replica: *mut Replica, offset: usize) {
-    if let Some(replica) = unsafe { replica.as_ref() } {
-        let _ = replica.command.send(Command::Page(offset));
-    }
-}
-/// Enable transient whole-row-set composition sampling while Storage is visible.
-/// Never changes selections, tracks inventories, or requests content.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn erl_ios_storage_active(replica: *mut Replica, active: bool) {
-    if let Some(replica) = unsafe { replica.as_ref() } {
-        let _ = replica.command.send(Command::StorageActive(active));
-    }
-}
 
-/// Replace the transient visible-root request set. Never persists a choice.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn erl_ios_storage_roots(replica: *mut Replica, roots: *const c_char) -> bool {
-    let Some(replica) = (unsafe { replica.as_ref() }) else { return false; };
-    if roots.is_null() { return false; }
-    let Ok(json) = (unsafe { CStr::from_ptr(roots) }).to_str() else { return false; };
-    let Ok(values) = serde_json::from_str::<Vec<String>>(json) else { return false; };
-    if values.len() > collections::PAGE_SIZE { return false; }
-    let mut roots = Vec::new();
-    for value in values {
-        let Ok(bytes) = hex::decode(value) else { return false; };
-        let Ok(bytes) = <[u8; 32]>::try_from(bytes) else { return false; };
-        roots.push(CollectionHandle::new(bytes));
+    /// A frame with no change or a busy writer can keep its current immutable view.
+    /// Capture does not query the pile or copy the storage and network observations.
+    pub fn read_after(&self, previous: Option<u64>) -> Option<Status> {
+        let status = self.status.try_lock().ok()?;
+        (previous != Some(status.revision)).then(|| status.clone())
     }
-    roots.sort_unstable(); roots.dedup();
-    replica.command.send(Command::Storage(roots)).is_ok()
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn erl_ios_choose(replica: *mut Replica, root: *const c_char,
-    expected: *const c_char, enabled: bool) -> bool {
-    let Some(replica) = (unsafe { replica.as_ref() }) else { return false; };
-    if root.is_null() || expected.is_null() { return false; }
-    let Ok(root) = (unsafe { CStr::from_ptr(root) }).to_str() else { return false; };
-    let Ok(expected) = (unsafe { CStr::from_ptr(expected) }).to_str() else { return false; };
-    let Ok(bytes) = hex::decode(root) else { return false; };
-    let Ok(bytes) = <[u8; 32]>::try_from(bytes) else { return false; };
-    replica.command.send(Command::Choose(CollectionHandle::new(bytes), expected.to_owned(), enabled)).is_ok()
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn erl_ios_status(replica: *const Replica) -> *mut c_char {
-    let Some(replica) = (unsafe { replica.as_ref() }) else {
-        return std::ptr::null_mut();
-    };
-    let Ok(status) = replica.status.lock() else {
-        return std::ptr::null_mut();
-    };
-    CString::new(serde_json::to_string(&*status).expect("status JSON"))
-        .expect("JSON has no NUL")
-        .into_raw()
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn erl_ios_string_free(value: *mut c_char) {
-    if !value.is_null() {
-        drop(unsafe { CString::from_raw(value) });
-    }
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn erl_ios_release(replica: *mut Replica) {
-    if !replica.is_null() {
-        let replica = unsafe { Box::from_raw(replica) };
-        let _ = replica.command.send(Command::Stop);
-    }
-}
-#[repr(C)]
-pub struct CrownPoint {
-    pub x: f64,
-    pub y: f64,
-}
-fn crown_activity(began: f64, ended: f64) -> Option<erlkonig_crown::WorkActivity> {
-    Some(erlkonig_crown::WorkActivity {
-        began_at: Duration::try_from_secs_f64(began).ok()?,
-        ended_at: (ended >= began).then(|| Duration::try_from_secs_f64(ended).ok()).flatten(),
-    })
-}
 
-/// Stateless bridge to the same activity observer used by the native crown.
-/// The caller retains only two timestamps; no replica
-/// state or timer is created.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn erl_ios_crown_observe(seconds: f64, working: bool,
-    began: *mut f64, ended: *mut f64) -> bool {
-    let Ok(now) = Duration::try_from_secs_f64(seconds) else { return false; };
-    let (Some(began), Some(ended)) = (unsafe { began.as_mut() }, unsafe { ended.as_mut() }) else { return false; };
-    let mut activity = crown_activity(*began, *ended);
-    if activity.is_some_and(|a| a.began_at > now || a.ended_at.is_some_and(|end| end > now)) { return false; }
-    erlkonig_crown::observe(&mut activity, working, now);
-    *began = activity.map_or(-1.0, |value| value.began_at.as_secs_f64());
-    *ended = activity.and_then(|value| value.ended_at).map_or(-1.0, |value| value.as_secs_f64());
-    true
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn erl_ios_crown(
-    seconds: f64,
-    began: f64,
-    ended: f64,
-    reduced: bool,
-    attention: bool,
-    points: *mut CrownPoint,
-    capacity: usize,
-) -> usize {
-    let Ok(now) = Duration::try_from_secs_f64(seconds) else { return 0; };
-    let frame = erlkonig_crown::parametric_frame(now, crown_activity(began, ended), reduced, attention);
-    if points.is_null() || capacity < frame.points.len() {
-        return frame.points.len();
+    fn activity(&self, command: impl FnOnce(u64) -> Command) -> u64 {
+        let serial = self.activity_serial.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.command.send(command(serial)).is_ok() { serial } else { 0 }
     }
-    let count = frame.points.len();
-    for (index, point) in frame.points.into_iter().enumerate() {
-        unsafe {
-            points.add(index).write(CrownPoint {
-                x: point.x,
-                y: point.y,
-            });
+
+    pub fn set_active(&self, active: bool) -> u64 { self.activity(|serial| Command::Active(active, serial)) }
+    pub fn set_local_active(&self) -> u64 { self.activity(Command::LocalActive) }
+    pub fn discover(&self) -> bool { self.command.send(Command::Discover).is_ok() }
+
+    /// Enable whole-device composition sampling only while the chart is visible.
+    pub fn set_storage_active(&self, active: bool) -> bool {
+        self.command.send(Command::StorageActive(active)).is_ok()
+    }
+
+    /// Replace the bounded visible-root byte request without changing selection.
+    pub fn set_storage_roots(&self, ids: &[String]) -> bool {
+        if ids.len() > collections::PAGE_SIZE { return false; }
+        let mut roots = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(root) = parse_handle(id) else { return false; };
+            roots.push(root);
         }
+        roots.sort_unstable();
+        roots.dedup();
+        self.command.send(Command::Storage(roots)).is_ok()
     }
-    count
+
+    pub fn choose(&self, root: &str, expected: &str, enabled: bool) -> bool {
+        let Some(root) = parse_handle(root) else { return false; };
+        self.command.send(Command::Choose(root, expected.to_owned(), enabled)).is_ok()
+    }
+}
+
+fn parse_handle(id: &str) -> Option<CollectionHandle> {
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(id, &mut bytes).ok()?;
+    Some(CollectionHandle::new(bytes))
+}
+
+impl Drop for Replica {
+    fn drop(&mut self) { let _ = self.command.send(Command::Stop); }
+}
+
+#[cfg(test)]
+impl Status {
+    // Reuse historical fixture assertions while explicitly querying the reader
+    // side. Production never constructs this combined object.
+    fn test_page(&self) -> collections::Page {
+        self.list_snapshot.as_ref().map(|view|
+            CollectionPages::default().read(view, self.test_page_offset).expect("fixture page")
+        ).unwrap_or_default()
+    }
+
+    fn test_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "node_id": self.node_id, "running": self.running, "ready": self.ready,
+            "replay_complete": self.replay_complete, "replay_progress": self.replay_progress,
+            "sync_progress": self.sync_progress, "activity_serial": self.activity_serial,
+            "selected": self.selected, "listening": self.listening, "collections": self.test_page(),
+            "storage": &*self.storage, "composition": self.composition.as_deref(),
+            "action_error": self.action_error, "action_serial": self.action_serial,
+            "last_cleanup_error": self.last_cleanup_error, "network_started": self.network_started,
+            "network": self.network.as_deref(), "bound_sockets": self.bound_sockets,
+            "message": self.message, "error": self.error
+        })
+    }
 }
 
 #[cfg(test)]
@@ -988,19 +966,18 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    unsafe fn wait(
-        replica: *mut Replica,
+    fn wait(
+        replica: &Replica,
         predicate: impl Fn(&serde_json::Value) -> bool,
     ) -> serde_json::Value {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let text = unsafe { erl_ios_status(replica) };
-            assert!(!text.is_null());
-            let value: serde_json::Value =
-                serde_json::from_slice(unsafe { CStr::from_ptr(text) }.to_bytes()).unwrap();
-            unsafe {
-                erl_ios_string_free(text);
-            }
+            let Some(status) = replica.read_after(None) else {
+                assert!(Instant::now() < deadline, "worker stayed busy");
+                std::thread::yield_now();
+                continue;
+            };
+            let value = status.test_value();
             assert!(value["error"].is_null(), "{value}");
             if predicate(&value) {
                 return value;
@@ -1016,75 +993,71 @@ mod tests {
     #[test]
     fn empty_shell_worker_pauses_and_restarts_with_the_same_identity() {
         let root = tempfile::tempdir().unwrap();
-        let path = CString::new(root.path().to_str().unwrap()).unwrap();
-        unsafe {
-            let first = erl_ios_open(path.as_ptr());
-            assert!(!first.is_null());
-            let before = wait(first, |s| s["ready"] == true && s["replay_complete"] == true);
-            erl_ios_active(first, true);
-            let active = wait(first, |s| s["running"] == true);
+        let path = root.path();
+        {
+            let first = Replica::open(path).unwrap();
+            let before = wait(&first, |s| s["ready"] == true && s["replay_complete"] == true);
+            first.set_active(true);
+            let active = wait(&first, |s| s["running"] == true);
             assert_eq!(active["selected"], 0);
             assert_eq!(active["network_started"], false);
             assert_eq!(active["bound_sockets"], 0);
             std::thread::sleep(Duration::from_millis(500));
-            let idle = wait(first, |s| s["running"] == true);
+            let idle = wait(&first, |s| s["running"] == true);
             assert_eq!(idle["network_started"], false);
             assert_eq!(idle["bound_sockets"], 0);
-            erl_ios_active(first, false);
-            wait(first, |s| {
+            first.set_active(false);
+            wait(&first, |s| {
                 s["running"] == false && s["message"] == "Replica paused"
             });
-            erl_ios_release(first);
-            let second = erl_ios_open(path.as_ptr());
-            assert!(!second.is_null());
-            let after = wait(second, |s| s["ready"] == true && s["replay_complete"] == true);
+            drop(first);
+            let second = Replica::open(path).unwrap();
+            let after = wait(&second, |s| s["ready"] == true && s["replay_complete"] == true);
             assert_eq!(before["node_id"], after["node_id"]);
-            erl_ios_active(second, true);
-            wait(second, |s| s["running"] == true);
-            erl_ios_active(second, false);
-            wait(second, |s| {
+            second.set_active(true);
+            wait(&second, |s| s["running"] == true);
+            second.set_active(false);
+            wait(&second, |s| {
                 s["running"] == false && s["message"] == "Replica paused"
             });
-            erl_ios_release(second);
+            drop(second);
         }
     }
     #[test]
     fn explicit_discovery_starts_empty_listener_and_survives_worker_restart() {
         let root = tempfile::tempdir().unwrap();
-        let path = CString::new(root.path().to_str().unwrap()).unwrap();
-        unsafe {
-            let first = erl_ios_open(path.as_ptr());
-            assert!(!first.is_null());
-            wait(first, |s| s["ready"] == true && s["replay_complete"] == true);
-            erl_ios_active(first, true);
-            let before = wait(first, |s| s["running"] == true);
+        let path = root.path();
+        {
+            let first = Replica::open(path).unwrap();
+            wait(&first, |s| s["ready"] == true && s["replay_complete"] == true);
+            first.set_active(true);
+            let before = wait(&first, |s| s["running"] == true);
             assert_eq!(before["network_started"], false);
             assert_eq!(before["selected"], 0);
-            erl_ios_discover(first);
-            let listening = wait(first, |s| {
+            first.discover();
+            let listening = wait(&first, |s| {
                 s["listening"] == true && s["network_started"] == true
             });
             assert_eq!(listening["selected"], 0);
             assert!(listening["bound_sockets"].as_u64().unwrap() > 0);
-            erl_ios_active(first, false);
-            wait(first, |s| {
+            first.set_active(false);
+            wait(&first, |s| {
                 s["running"] == false && s["message"] == "Replica paused"
             });
-            erl_ios_release(first);
-            let second = erl_ios_open(path.as_ptr());
-            assert!(!second.is_null());
-            wait(second, |s| s["ready"] == true && s["replay_complete"] == true);
-            erl_ios_active(second, true);
-            let reopened = wait(second, |s| {
+            drop(first);
+            let second = Replica::open(path).unwrap();
+            wait(&second, |s| s["ready"] == true && s["replay_complete"] == true);
+            second.set_active(true);
+            let reopened = wait(&second, |s| {
                 s["listening"] == true && s["network_started"] == true
             });
             assert_eq!(reopened["node_id"], before["node_id"]);
             assert_eq!(reopened["selected"], 0);
-            erl_ios_active(second, false);
-            wait(second, |s| {
+            second.set_active(false);
+            wait(&second, |s| {
                 s["running"] == false && s["message"] == "Replica paused"
             });
-            erl_ios_release(second);
+            drop(second);
         }
     }
     #[test]
@@ -1096,37 +1069,37 @@ mod tests {
         let root = pile.collection("available", private_policy(owner.verifying_key())).unwrap().handle();
         grant_collection_read(&mut pile, root, &owner, phone.verifying_key()).unwrap();
         pile.flush().unwrap(); pile.close().unwrap();
-        let path = CString::new(dir.path().to_str().unwrap()).unwrap();
-        let root_text = CString::new(hex::encode(root.raw)).unwrap();
-        let unset = CString::new("unset").unwrap();
-        let selected = CString::new("selected").unwrap();
-        unsafe {
-            let first = erl_ios_open(path.as_ptr());
-            erl_ios_active(first, true);
-            let available = wait(first, |s| s["collections"]["total"] == 1);
+        let path = dir.path();
+        let root_text = hex::encode(root.raw);
+        let unset = "unset";
+        let selected = "selected";
+        {
+            let first = Replica::open(path).unwrap();
+            first.set_active(true);
+            let available = wait(&first, |s| s["collections"]["total"] == 1);
             assert_eq!(available["selected"], 0);
             assert_eq!(available["network_started"], false);
-            assert!(erl_ios_choose(first, root_text.as_ptr(), unset.as_ptr(), true));
-            wait(first, |s| s["selected"] == 1 && s["action_serial"] == 1);
-            assert!(erl_ios_choose(first, root_text.as_ptr(), unset.as_ptr(), false));
-            let stale = wait(first, |s| s["action_serial"] == 2);
+            assert!(first.choose(&root_text, unset, true));
+            wait(&first, |s| s["selected"] == 1 && s["action_serial"] == 1);
+            assert!(first.choose(&root_text, unset, false));
+            let stale = wait(&first, |s| s["action_serial"] == 2);
             assert!(!stale["action_error"].is_null());
             assert_eq!(stale["selected"], 1);
-            assert!(erl_ios_choose(first, root_text.as_ptr(), selected.as_ptr(), false));
-            let off = wait(first, |s| s["selected"] == 0 && s["action_serial"] == 3);
+            assert!(first.choose(&root_text, selected, false));
+            let off = wait(&first, |s| s["selected"] == 0 && s["action_serial"] == 3);
             assert!(off["action_error"].is_null());
-            erl_ios_active(first, false);
-            wait(first, |s| s["running"] == false && s["message"] == "Replica paused");
-            erl_ios_release(first);
-            let second = erl_ios_open(path.as_ptr()); erl_ios_active(second, true);
-            let reopened = wait(second, |s| s["collections"]["total"] == 1);
+            first.set_active(false);
+            wait(&first, |s| s["running"] == false && s["message"] == "Replica paused");
+            drop(first);
+            let second = Replica::open(path).unwrap(); second.set_active(true);
+            let reopened = wait(&second, |s| s["collections"]["total"] == 1);
             assert_eq!(reopened["node_id"], available["node_id"]);
             assert_eq!(reopened["collections"]["rows"][0]["state"], "unselected");
             assert_eq!(reopened["selected"], 0);
             assert_eq!(reopened["network_started"], false);
-            erl_ios_active(second, false);
-            wait(second, |s| s["running"] == false && s["message"] == "Replica paused");
-            erl_ios_release(second);
+            second.set_active(false);
+            wait(&second, |s| s["running"] == false && s["message"] == "Replica paused");
+            drop(second);
         }
     }
 
@@ -1140,26 +1113,25 @@ mod tests {
         let root = collection.handle();
         pile.commit(collection, &key, entity! { metadata::name: "synthetic" }).unwrap();
         pile.flush().unwrap(); pile.close().unwrap();
-        let path = CString::new(dir.path().to_str().unwrap()).unwrap();
-        let root_text = CString::new(hex::encode(root.raw)).unwrap();
-        let unset = CString::new("unset").unwrap();
-        // Inactive worker exercises the real ABI/choice/checkpoint path without
+        let path = dir.path();
+        let root_text = hex::encode(root.raw);
+        let unset = "unset";
+        // Inactive worker exercises the real owner/choice/checkpoint path without
         // starting an endpoint or the known Mac CoreWLAN enrichment path.
-        let (acknowledged, stopped, stale) = unsafe {
-            let replica = erl_ios_open(path.as_ptr());
-            wait(replica, |s| s["ready"] == true && s["replay_complete"] == true);
-            assert!(erl_ios_choose(replica, root_text.as_ptr(), unset.as_ptr(), true));
-            let first = wait(replica, |s| s["action_serial"] == 1);
+        let (acknowledged, stopped, stale) = {
+            let replica = Replica::open(path).unwrap();
+            wait(&replica, |s| s["ready"] == true && s["replay_complete"] == true);
+            assert!(replica.choose(&root_text, unset, true));
+            let first = wait(&replica, |s| s["action_serial"] == 1);
             // Queue rapid valid choices without waiting for intermediate polls.
             for (expected, enabled) in [("selected", false), ("unselected", true), ("selected", false)] {
-                let expected = CString::new(expected).unwrap();
-                assert!(erl_ios_choose(replica, root_text.as_ptr(), expected.as_ptr(), enabled));
+                assert!(replica.choose(&root_text, expected, enabled));
             }
-            let stopped = wait(replica, |s| s["action_serial"] == 4);
-            let outdated = CString::new("selected").unwrap();
-            assert!(erl_ios_choose(replica, root_text.as_ptr(), outdated.as_ptr(), true));
-            let stale = wait(replica, |s| s["action_serial"] == 5);
-            erl_ios_release(replica);
+            let stopped = wait(&replica, |s| s["action_serial"] == 4);
+            let outdated = "selected";
+            assert!(replica.choose(&root_text, outdated, true));
+            let stale = wait(&replica, |s| s["action_serial"] == 5);
+            drop(replica);
             (first, stopped, stale)
         };
         let (key, mut reopened) = open_local(dir.path()).unwrap();
@@ -1206,7 +1178,7 @@ mod tests {
         pile.close().unwrap();
         let (sender, receiver) = mpsc::channel();
         let status = Arc::new(Mutex::new(Status::default()));
-        let mut replica = Replica { command: sender.clone(), status: status.clone(), activity_serial: AtomicU64::new(0) };
+        let replica = Replica { command: sender.clone(), status: status.clone(), activity_serial: AtomicU64::new(0) };
         let path = dir.path().to_owned();
         let thread = std::thread::Builder::new().stack_size(WORKER_STACK_BYTES).spawn(move || {
             worker_with_cleanup(path, receiver, status, |peer, local| {
@@ -1219,27 +1191,27 @@ mod tests {
                 } else { Ok(()) }
             });
         }).unwrap();
-        unsafe {
-            wait(&mut replica, |s| s["ready"] == true && s["replay_complete"] == true);
+        {
+            wait(&replica, |s| s["ready"] == true && s["replay_complete"] == true);
             sender.send(Command::Active(true, 0)).unwrap();
-            let first = wait(&mut replica, |s| s["running"] == true && s["collections"]["total"] == 1);
+            let first = wait(&replica, |s| s["running"] == true && s["collections"]["total"] == 1);
             sender.send(Command::Active(false, 0)).unwrap();
-            let paused = wait(&mut replica, |s| s["running"] == false && s["last_cleanup_error"].is_string());
+            let paused = wait(&replica, |s| s["running"] == false && s["last_cleanup_error"].is_string());
             assert!(paused["last_cleanup_error"].as_str().unwrap().contains(JOINED_TRANSPORT_TIMEOUT));
             assert_eq!(paused["network_started"], false);
             sender.send(Command::Active(true, 0)).unwrap();
-            wait(&mut replica, |s| s["running"] == true);
+            wait(&replica, |s| s["running"] == true);
             // A foreground command already queued behind failing background
             // cleanup must still run; a subsequent page ack proves channel life.
             sender.send(Command::Active(false, 0)).unwrap();
             sender.send(Command::Active(true, 0)).unwrap();
             sender.send(Command::Page(32)).unwrap();
-            let resumed = wait(&mut replica, |s| s["running"] == true && s["collections"]["offset"] == 32);
+            let resumed = wait(&replica, |s| s["running"] == true && s["collections"]["offset"] == 32);
             assert_eq!(resumed["node_id"], first["node_id"]);
             assert_eq!(resumed["selected"], 0);
             assert_eq!(resumed["network_started"], false);
             sender.send(Command::Active(false, 0)).unwrap();
-            wait(&mut replica, |s| s["running"] == false);
+            wait(&replica, |s| s["running"] == false);
             sender.send(Command::Stop).unwrap();
         }
         thread.join().unwrap();
@@ -1248,45 +1220,6 @@ mod tests {
         assert_eq!(collections::page(&mut reopened, &key, 0).unwrap().rows[0].state, "unselected");
         assert_eq!(storage::observe(&reopened.snapshot().unwrap(), key.verifying_key(), root).counts, Some(before));
         reopened.close().unwrap();
-    }
-
-    #[test]
-    fn crown_observer_ffi_preserves_rapid_resume_and_settles_at_canonical_rest() {
-        fn points(now: f64, began: f64, ended: f64) -> Vec<(f64, f64)> {
-            unsafe {
-                let count = erl_ios_crown(now, began, ended, false, false, std::ptr::null_mut(), 0);
-                let mut values: Vec<_> = (0..count).map(|_| CrownPoint { x: 0.0, y: 0.0 }).collect();
-                assert_eq!(erl_ios_crown(now, began, ended, false, false, values.as_mut_ptr(), count), count);
-                values.into_iter().map(|point| (point.x, point.y)).collect()
-            }
-        }
-        let idle = points(0.0, -1.0, -1.0);
-        assert!((idle[72].1 - 4.055).abs() < 1e-12);
-        let (mut began, mut ended) = (-1.0, -1.0);
-        unsafe {
-            assert!(erl_ios_crown_observe(1.0, true, &mut began, &mut ended));
-            assert_eq!(points(1.0, began, ended), idle);
-            assert!(erl_ios_crown_observe(2.0, false, &mut began, &mut ended));
-            let before_resume = points(2.4, began, ended);
-            assert!(erl_ios_crown_observe(2.4, true, &mut began, &mut ended));
-            assert_eq!(began, 1.0); // Swift's previous rising-edge reset changed this.
-            assert_eq!(before_resume, points(2.4, began, ended));
-            for (now, working) in [(2.5,false),(2.6,false),(2.7,true),(2.8,false),(2.9,true),(3.0,false)] {
-                assert!(erl_ios_crown_observe(now, working, &mut began, &mut ended));
-            }
-            assert_eq!(ended, 3.0);
-            assert!(erl_ios_crown_observe(4.0, false, &mut began, &mut ended));
-            assert_eq!(ended, 3.0); // Repeated inactive polls cannot postpone landing.
-            assert_eq!(points(4.6, began, ended), idle);
-            assert_eq!(points(20.0, began, ended), idle);
-            assert!(!erl_ios_crown_observe(f64::NAN, true, &mut began, &mut ended));
-            assert_eq!((began, ended), (1.0, 3.0));
-            assert!(!erl_ios_crown_observe(2.9, true, &mut began, &mut ended));
-            assert_eq!((began, ended), (1.0, 3.0));
-            assert!(erl_ios_crown_observe(4.6, true, &mut began, &mut ended));
-            assert_eq!((began, ended), (4.6, -1.0));
-            assert_eq!(points(4.6, began, ended), idle);
-        }
     }
 
     #[test]
@@ -1313,7 +1246,7 @@ mod tests {
             Command::StorageCheckpoint(Box::new(move |_, unfinished, status| {
                 let status = status.lock().unwrap();
                 observations.send((status.storage.clone(), unfinished,
-                    status.network_started, status.error.clone(), status.collections.rows.clone())).unwrap();
+                    status.network_started, status.error.clone(), status.test_page().rows)).unwrap();
             }))
         };
         // Queue the entire script first: no wall-clock polling can consume an
@@ -1441,28 +1374,27 @@ mod tests {
         // A descriptor alone is not a native available-collection candidate.
         pile.commit(collection, &key, entity! { metadata::name: "sample" }).unwrap();
         pile.flush().unwrap(); pile.close().unwrap();
-        let path = CString::new(dir.path().to_str().unwrap()).unwrap();
-        let request = CString::new(serde_json::to_string(&vec![hex::encode(root.raw)]).unwrap()).unwrap();
-        let too_many = CString::new(serde_json::to_string(&vec![hex::encode(root.raw); 33]).unwrap()).unwrap();
-        let hidden = CString::new("[]").unwrap();
-        unsafe {
-            let replica = erl_ios_open(path.as_ptr()); erl_ios_active(replica, true);
-            let before = wait(replica, |s| s["collections"]["total"] == 1);
+        let path = dir.path();
+        let request = vec![hex::encode(root.raw)];
+        let too_many = vec![hex::encode(root.raw); 33];
+        {
+            let replica = Replica::open(path).unwrap(); replica.set_active(true);
+            let before = wait(&replica, |s| s["collections"]["total"] == 1);
             assert_eq!(before["storage"], serde_json::json!([]));
             assert_eq!(before["collections"]["rows"][0]["counts"]["records"], 1, "row counts require no Storage request");
-            assert!(!erl_ios_storage_roots(replica, too_many.as_ptr()));
-            assert!(erl_ios_storage_roots(replica, request.as_ptr()));
-            let sampled = wait(replica, |s| s["storage"].as_array().is_some_and(|rows| rows.len() == 1));
+            assert!(!replica.set_storage_roots(&too_many));
+            assert!(replica.set_storage_roots(&request));
+            let sampled = wait(&replica, |s| s["storage"].as_array().is_some_and(|rows| rows.len() == 1));
             assert_eq!(sampled["collections"]["rows"][0]["counts"]["records"], 1);
             assert_eq!(sampled["collections"]["rows"][0]["counts"]["direct_present"], 1);
             assert!(sampled["storage"][0].get("counts").is_none());
             assert!(sampled["storage"][0]["resident_error"].is_null());
             assert_eq!(sampled["network_started"], false);
-            assert!(erl_ios_storage_roots(replica, hidden.as_ptr()));
-            wait(replica, |s| s["storage"] == serde_json::json!([]));
-            erl_ios_active(replica, false);
-            wait(replica, |s| s["running"] == false && s["message"] == "Replica paused");
-            erl_ios_release(replica);
+            assert!(replica.set_storage_roots(&[]));
+            wait(&replica, |s| s["storage"] == serde_json::json!([]));
+            replica.set_active(false);
+            wait(&replica, |s| s["running"] == false && s["message"] == "Replica paused");
+            drop(replica);
         }
     }
 

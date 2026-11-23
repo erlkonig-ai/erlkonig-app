@@ -133,9 +133,12 @@ fn prefix_choices_distinguish_unseen_config_missing_payload_and_resident_corrupt
             let page = if complete { project(&snapshot, phone.verifying_key(), 0, PAGE_SIZE) }
                 else { project_prefix(&snapshot, phone.verifying_key(), 0, PAGE_SIZE) };
             if !complete {
-                let reused = PrefixPage::observe(&mut cached, &snapshot, phone.verifying_key(), 0);
+                let reused = CachedPage::read(&mut cached, &snapshot, phone.verifying_key(), 0, false, snapshot.prefix_len() as u64);
                 match (&page, reused) {
-                    (Ok(expected), Ok(actual)) => assert_eq!(serde_json::to_value(expected)?, serde_json::to_value(actual)?),
+                    (Ok(expected), Ok(mut actual)) => {
+                        actual.revision = expected.revision;
+                        assert_eq!(serde_json::to_value(expected)?, serde_json::to_value(actual)?);
+                    }
                     (Err(_), Err(_)) => {}
                     _ => panic!("cached catalog disagreed with independent projection at byte {}", snapshot.prefix_len()),
                 }
@@ -188,7 +191,7 @@ fn unchanged_catalog_reuses_metadata_but_a_new_root_or_reader_requires_projectio
     pile.commit(first, &signer, entity! { metadata::name: "first row" })?;
     let mut observed = None;
     let before = pile.snapshot()?;
-    let page = PrefixPage::observe(&mut observed, &before, reader, 0)?;
+    let page = CachedPage::read(&mut observed, &before, reader, 0, false, 1)?;
     assert_eq!(page.rows.len(), 1);
     pile.put::<blobencodings::UTF8String, _>("unrelated payload")?;
     let unrelated = pile.snapshot()?;
@@ -200,7 +203,7 @@ fn unchanged_catalog_reuses_metadata_but_a_new_root_or_reader_requires_projectio
     pile.commit(second, &signer, entity! { metadata::name: "another row" })?;
     let added = pile.snapshot()?;
     assert!(!state.metadata_current(&added, reader, 0)?);
-    assert_eq!(PrefixPage::observe(&mut observed, &added, reader, 0)?.total, 2);
+    assert_eq!(CachedPage::read(&mut observed, &added, reader, 0, false, 2)?.total, 2);
     pile.close()?;
     Ok(())
 }

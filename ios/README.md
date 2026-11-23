@@ -1,6 +1,6 @@
 # Erlkönig for iOS
 
-The foreground replica runs a native TribleSpace store inside the app sandbox. It displays collections, storage and passive connection statistics. The user selects which readable collections to replicate. The SwiftUI project links the Rust static library through the declarations in `app/ErlkonigBridge.h`.
+The foreground replica runs a native TribleSpace store inside the app sandbox. It displays collections, storage and passive connection statistics. The user selects which readable collections to replicate. Rust creates the UIKit scene, native controls and collection views. Xcode links the Rust static library through the process entry point in `app/main.c`.
 
 ## Build the simulator app
 

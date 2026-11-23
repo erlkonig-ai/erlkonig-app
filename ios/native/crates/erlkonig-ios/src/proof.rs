@@ -219,27 +219,6 @@ pub fn run_owned(root: std::path::PathBuf, reopening: bool) -> Result<serde_json
         })?
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn erl_ios_synthetic_proof(
-    path: *const std::ffi::c_char,
-) -> *mut std::ffi::c_char {
-    use std::ffi::{CStr, CString};
-    let result = if path.is_null() {
-        Err(anyhow::anyhow!("missing fixture path"))
-    } else {
-        match (unsafe { CStr::from_ptr(path) }).to_str() {
-            Ok(path) => run_owned(path.into(), false),
-            Err(error) => Err(error.into()),
-        }
-    };
-    let value = match result {
-        Ok(report) => serde_json::json!({"ok":true,"report":report}),
-        Err(error) => serde_json::json!({"ok":false,"error":format!("{error:#}")}),
-    };
-    CString::new(value.to_string())
-        .expect("JSON has no NUL")
-        .into_raw()
-}
 
 /// A separate process can repeat this local-only check without rerunning transfer.
 pub fn reopen(root: &Path) -> Result<serde_json::Value> {
@@ -282,26 +261,4 @@ pub fn reopen(root: &Path) -> Result<serde_json::Value> {
         serde_json::json!({"separate_process_reopen":true,"reader_node_id":receipt["reader_node_id"],
         "source_off_read":true,"payload_bytes":payload.bytes.len()}),
     )
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn erl_ios_reopen_proof(
-    path: *const std::ffi::c_char,
-) -> *mut std::ffi::c_char {
-    use std::ffi::{CStr, CString};
-    let result = if path.is_null() {
-        Err(anyhow::anyhow!("missing fixture path"))
-    } else {
-        match (unsafe { CStr::from_ptr(path) }).to_str() {
-            Ok(path) => run_owned(path.into(), true),
-            Err(error) => Err(error.into()),
-        }
-    };
-    let value = match result {
-        Ok(report) => serde_json::json!({"ok":true,"report":report}),
-        Err(error) => serde_json::json!({"ok":false,"error":format!("{error:#}")}),
-    };
-    CString::new(value.to_string())
-        .expect("JSON has no NUL")
-        .into_raw()
 }

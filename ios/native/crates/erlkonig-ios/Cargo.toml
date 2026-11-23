@@ -37,3 +37,24 @@ required-features = ["synthetic-proof"]
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+block2 = "=0.6.2"
+objc2 = "=0.6.4"
+objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+    "std", "block2", "NSArray", "NSEnumerator", "NSDate", "NSDictionary", "NSError", "NSFileManager",
+    "NSGeometry", "NSIndexPath", "NSObject", "NSObjCRuntime", "NSPathUtilities",
+    "NSRunLoop", "NSString", "NSTimer", "NSURL", "NSValue",
+] }
+objc2-ui-kit = { version = "=0.3.2", default-features = false, features = [
+    "std", "block2", "objc2-core-foundation", "NSLayoutConstraint", "NSText", "NSIndexPath_UIKitAdditions", "UIAccessibility",
+    "UIAccessibilityConstants", "UIAccessibilityCustomAction", "UIAccessibilityIdentification", "UIApplication", "UIBezierPath",
+    "UIButton", "UIColor", "UIContentConfiguration", "UIContentSizeCategoryAdjusting", "UIControl",
+    "UICornerConfiguration", "UICornerRadius", "UIDevice", "UIFont", "UIFontDescriptor", "UIGeometry", "UIGestureRecognizer", "UIInterface", "UILabel",
+    "UIListContentConfiguration", "UIPasteboard", "UIProgressView", "UIResponder", "UIScene",
+    "UISceneConfiguration", "UISceneOptions", "UISceneSession", "UIScreen", "UIScrollView",
+    "UIStackView", "UIPanGestureRecognizer", "UISwipeGestureRecognizer", "UISwitch",
+    "UITableView", "UITableViewCell", "UITableViewController", "UIView", "UIViewController",
+    "UIWindow", "UIWindowScene",
+] }

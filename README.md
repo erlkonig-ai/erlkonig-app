@@ -14,7 +14,7 @@ Toolchain and platform requirements are recorded in `ci/source-inputs.json`.
 
 The desktop shells share their UI and backend with the crates in this workspace.
 Desktop packaging targets macOS ARM64 and Linux x86-64 and ARM64.
-The [Swift and Rust iOS client](ios/README.md) runs a foreground replica with
+The [Rust iOS client](ios/README.md) runs a foreground replica with
 collection selection and storage and connection status. Build its unsigned
 arm64 simulator app on an Apple silicon Mac with `./ios/build-simulator.sh`.
 

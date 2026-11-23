@@ -792,11 +792,16 @@ name = "erlkonig-ios"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "block2",
  "ed25519-dalek 2.2.0",
  "erlkonig-crown",
  "hex",
  "iroh",
  "iroh-base",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-foundation",
+ "objc2-ui-kit",
  "serde",
  "serde_json",
  "tempfile",
@@ -2451,6 +2456,19 @@ dependencies = [
  "objc2",
  "objc2-core-foundation",
  "objc2-security",
+]
+
+[[package]]
+name = "objc2-ui-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d87d638e33c06f577498cbcc50491496a3ed4246998a7fbba7ccb98b1e7eab22"
+dependencies = [
+ "bitflags",
+ "block2",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-foundation",
 ]
 
 [[package]]

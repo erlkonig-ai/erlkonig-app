@@ -34,7 +34,7 @@ pub struct Observation {
 }
 
 /// Optional held-inventory bytes; record counts live in snapshot-derived rows.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, PartialEq, Eq)]
 pub struct ByteObservation {
     pub root: String,
     pub resident_bytes: Option<u64>,
@@ -157,11 +157,7 @@ pub struct IncrementalCompositionSample {
 }
 impl IncrementalCompositionSample {
     pub fn new(snapshot: PileSnapshot, reader: VerifyingKey, previous: Option<&Statistics>) -> Result<Self> {
-        let rows = crate::collections::project(&snapshot, reader, 0, usize::MAX)?.rows;
-        let roots: Vec<_> = rows.into_iter().map(|row| {
-            let mut raw = [0; 32]; hex::decode_to_slice(&row.root, &mut raw)?;
-            Ok((CollectionHandle::new(raw), row.name))
-        }).collect::<Result<_>>()?;
+        let roots = crate::collections::chart_roots(&snapshot, reader)?;
         let scope: Vec<_> = roots.iter().map(|(root, _)| *root).collect();
         let sample = Statistics::begin(snapshot, &[], &scope, previous).map_err(anyhow::Error::msg)?;
         Ok(Self { roots, sample })
@@ -248,13 +244,13 @@ impl Sample {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Segment {
     pub root: String,
     pub name: String,
     pub bytes: u64,
 }
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct Composition {
     pub segments: Vec<Segment>,
     pub shared_bytes: u64,

@@ -1,30 +1,32 @@
 //! A disposable presentation of passive host observations. No network work.
-use serde::{Serialize, Serializer, ser::SerializeStruct};
+use serde::Serialize;
+#[cfg(test)]
+use serde::{Serializer, ser::SerializeStruct};
 use triblespace_net::health::HealthSnapshot;
 
-pub(crate) struct Observation {
-    host_epoch: u64,
-    sampled_at: u64,
-    connections: Vec<Connection>,
+#[derive(Clone, PartialEq)]
+pub struct Observation {
+    pub host_epoch: u64,
+    pub sampled_at: u64,
+    pub connections: Vec<Connection>,
 }
 
-#[derive(Serialize)]
-struct Connection {
-    id: u64,
-    peer: String,
-    received_bytes: Option<u64>,
-    sent_bytes: Option<u64>,
-    receive_bytes_per_second: Option<f64>,
-    send_bytes_per_second: Option<f64>,
-    rtt_ms: Option<f64>,
+#[derive(Serialize, Clone, PartialEq)]
+pub struct Connection {
+    pub id: u64,
+    pub peer: String,
+    pub received_bytes: Option<u64>,
+    pub sent_bytes: Option<u64>,
+    pub receive_bytes_per_second: Option<f64>,
+    pub send_bytes_per_second: Option<f64>,
+    pub rtt_ms: Option<f64>,
 }
 
-// Called by erl_ios_status serialization, not only by worker publication. A
-// stalled worker must not freeze the apparent age of its last observation.
+// Synthetic reports retain their printable representation.
+#[cfg(test)]
 impl Serialize for Observation {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let age_ms = triblespace_net::clock::mono_now().as_nanos()
-            .saturating_sub(self.sampled_at) / 1_000_000;
+        let age_ms = self.age_ms();
         let mut value = serializer.serialize_struct("NetworkObservation", 4)?;
         value.serialize_field("host_epoch", &self.host_epoch)?;
         value.serialize_field("sampled_at", &self.sampled_at)?;
@@ -35,6 +37,10 @@ impl Serialize for Observation {
 }
 
 impl Observation {
+    pub fn age_ms(&self) -> u64 {
+        triblespace_net::clock::mono_now().as_nanos().saturating_sub(self.sampled_at) / 1_000_000
+    }
+
     pub(crate) fn observe(health: &HealthSnapshot, previous: Option<&Self>) -> Option<Self> {
         let host_epoch = health.started_at?.as_nanos();
         let sampled_at = health.observed_at?.as_nanos();
@@ -136,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn network_observation_crosses_real_status_ffi() {
+    fn network_rate_and_age_are_available_from_a_pinned_typed_read() {
         let mut health = health();
         let before = Observation::observe(&health, None).unwrap();
         health.observed_at = health.observed_at.map(|at| at + Duration::from_secs(1));
@@ -149,36 +155,19 @@ mod tests {
             command, activity_serial: std::sync::atomic::AtomicU64::new(9),
             status: std::sync::Arc::new(std::sync::Mutex::new(crate::Status {
                 ready: true, running: true, replay_complete: true, activity_serial: 9,
-                network_started: true, network: Some(observation),
+                network_started: true, network: Some(std::sync::Arc::new(observation)),
                 ..Default::default()
             })),
         };
-        let read = || {
-            let pointer = unsafe { crate::erl_ios_status(&replica) };
-            assert!(!pointer.is_null());
-            let json = unsafe { std::ffi::CStr::from_ptr(pointer) }.to_str().unwrap().to_owned();
-            unsafe { crate::erl_ios_string_free(pointer); }
-            json
-        };
-        let json = read();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["network"]["connections"][0]["receive_bytes_per_second"], 4096.0);
-        assert_eq!(value["network"]["connections"][0]["rtt_ms"], 12.0);
-        assert_eq!(value["activity_serial"], 9);
-        assert!(value["network"]["age_ms"].as_u64().unwrap() <= 5000);
-        // Do not publish or mutate Status between reads. This proves that age
-        // advances at the C-read boundary even when the worker is stalled.
+        let view = replica.read_after(None).unwrap();
+        let net = view.network.as_ref().unwrap();
+        assert_eq!(net.connections[0].receive_bytes_per_second, Some(4096.0));
+        assert_eq!(net.connections[0].rtt_ms, Some(12.0));
+        assert_eq!(view.activity_serial, 9);
+        assert!(net.age_ms() <= 5000);
+        assert!(replica.read_after(Some(view.revision)).is_none());
         std::thread::sleep(Duration::from_millis(5100));
-        let stale_json = read();
-        let stale: serde_json::Value = serde_json::from_str(&stale_json).unwrap();
-        assert!(stale["network"]["age_ms"].as_u64().unwrap() > 5000);
-        assert_eq!(stale["network"]["sampled_at"], value["network"]["sampled_at"]);
-        assert_eq!(stale["network"]["connections"], value["network"]["connections"]);
-        assert_eq!(stale["activity_serial"], value["activity_serial"]);
-        if let Ok(path) = std::env::var("ERLKONIG_NETWORK_TEST_JSON") {
-            std::fs::write(path, serde_json::to_vec(&serde_json::json!({
-                "fresh_json": json, "stale_json": stale_json,
-            })).unwrap()).unwrap();
-        }
+        assert!(net.age_ms() > 5000);
+        assert!(replica.read_after(Some(view.revision)).is_none());
     }
 }
