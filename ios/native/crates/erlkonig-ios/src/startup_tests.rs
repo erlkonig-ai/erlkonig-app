@@ -37,6 +37,38 @@ fn run_script(root: PathBuf, commands: mpsc::Receiver<Command>, status: Arc<Mute
 }
 
 #[test]
+fn local_replay_meter_measures_complete_physical_records() {
+    let (dir, key, _, _) = fixture();
+    let path = dir.path().join("replica.pile");
+    let expected = PileRecords::open(&path).unwrap().count() as u64;
+    let mut pile = Pile::open_as(&path, key.verifying_key()).unwrap();
+    assert_eq!(pile.replayed_records(), 0);
+    assert!(!pile.snapshot_step(1).unwrap().1);
+    assert_eq!(pile.replayed_records(), 1);
+    assert!(pile.snapshot_step(u64::MAX).unwrap().1);
+    assert_eq!(pile.replayed_records(), expected);
+    assert!(pile.snapshot_step(1).unwrap().1);
+    assert_eq!(pile.replayed_records(), expected);
+    pile.close().unwrap();
+}
+
+#[test]
+fn local_replay_rate_has_a_monotonic_window_and_expires() {
+    let start = Instant::now() - Duration::from_secs(20);
+    let at = |millis| start + Duration::from_millis(millis);
+    let mut meter = ReplayMeter::default();
+    assert!(meter.observe(at(0), 40).is_none());
+    assert!(meter.observe(at(250), 100).is_none());
+    let measured = meter.observe(at(1500), 100).unwrap();
+    assert_eq!(measured.records_per_second, 40);
+    assert_eq!(meter.observe(at(1550), 100), Some(measured));
+    assert_eq!(meter.observe(at(3000), 100).unwrap().records_per_second, 0);
+    assert_eq!(serde_json::to_value(measured).unwrap(), serde_json::Value::Null);
+    assert!(meter.observe(at(3100), 2).is_none());
+    assert!(ReplayMeter::default().observe(at(9900), 200).is_none());
+}
+
+#[test]
 fn opening_worker_publishes_prefixes_and_moves_one_store_after_complete_local_page() {
     let (dir, key, roots, steps) = fixture();
     let file = dir.path().join("replica.pile");
@@ -230,6 +262,7 @@ fn offline_foreground_replays_resumes_and_pages_without_starting_a_peer() {
     assert_eq!(samples[3].2["collections"]["total"], 35);
     assert_eq!(samples[3].2["collections"]["offset"], 32);
     assert_eq!(samples[3].2["collections"]["rows"].as_array().unwrap().len(), 3);
+    assert!(samples.iter().all(|s| s.2["replay_progress"]["records_per_second"].is_null()));
     assert!(samples.iter().all(|s| s.2["network_started"] == false));
     assert_eq!(fs::read(dir.path().join("replica.pile")).unwrap(), original);
 }

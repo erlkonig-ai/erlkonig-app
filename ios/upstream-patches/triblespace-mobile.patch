@@ -1257,7 +1257,16 @@ diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.
      /// Complete canonical proofs keyed by the BLAKE3 identity of exact bytes.
      /// Each value owns its validated mmap-backed view, shared by snapshots and readers.
      capability_proofs: CapabilityProofIndex,
-@@ -3077,6 +3078,7 @@ fn padding_for_blob(blob_size: usize) -> usize {
+@@ -3054,6 +3055,8 @@ pub struct PileFile {
+     applied_length: usize,
+     /// The fixed prefix a [`Self::open_prefix`] handle is bounded to.
+     prefix: Option<usize>,
++    /// Number of complete physical pile records in the applied prefix.
++    applied_records: u64,
+     /// Whether this descriptor takes part in the writer-preference
+     /// turnstile (see the `turnstile` module). Fairness only: correctness
+     /// never depends on it.
+@@ -3077,6 +3080,7 @@ fn padding_for_blob(blob_size: usize) -> usize {
  /// cloning and [`StoreSnapshot::changes_since`](super::StoreSnapshot::changes_since)
  /// constant-time in the number of semantic components.
  pub struct PileFileSnapshot {
@@ -1265,7 +1274,7 @@ diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.
      record_origin: Arc<()>,
      mmap: Arc<MmapRaw>,
      covered_len: usize,
-@@ -3088,6 +3090,7 @@ pub struct PileFileSnapshot {
+@@ -3088,6 +3092,7 @@ pub struct PileFileSnapshot {
      /// validation state inline and is shared across immutable snapshots.
      blobs: PileBlobIndex,
      collection_records: CollectionRecordIndex,
@@ -1273,7 +1282,7 @@ diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.
      legacy_collection_headers: LegacyCollectionHeaderIndex,
      retired_equations: CollectionOccurrenceIndex,
      capability_proofs: CapabilityProofIndex,
-@@ -3122,6 +3125,7 @@ impl PileFileSnapshot {
+@@ -3122,6 +3127,7 @@ impl PileFileSnapshot {
          opaque_records: usize,
          blobs: PileBlobIndex,
          collection_records: CollectionRecordIndex,
@@ -1281,7 +1290,7 @@ diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.
          legacy_collection_headers: LegacyCollectionHeaderIndex,
          retired_equations: CollectionOccurrenceIndex,
          capability_proofs: CapabilityProofIndex,
-@@ -3129,12 +3133,14 @@ impl PileFileSnapshot {
+@@ -3129,12 +3135,14 @@ impl PileFileSnapshot {
          retired_proof_frames: Arc<Vec<(usize, usize)>>,
      ) -> Self {
          Self {
@@ -1296,7 +1305,7 @@ diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.
              legacy_collection_headers,
              retired_equations,
              capability_proofs,
-@@ -3536,7 +3542,9 @@ impl super::SnapshotSource for PileFile {
+@@ -3536,7 +3544,9 @@ impl super::SnapshotSource for PileFile {
  
      fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
          self.refresh()?;
@@ -1307,7 +1316,7 @@ diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.
      }
  }
  
-@@ -3544,7 +3552,9 @@ impl super::SnapshotStep for PileFile {
+@@ -3544,7 +3554,9 @@ impl super::SnapshotStep for PileFile {
      /// [`Self::refresh_step`], then [`Self::snapshot_replayed`].
      fn snapshot_step(&mut self, max_bytes: u64) -> Result<(Self::Snapshot, bool), ReadError> {
          let reached_end = self.refresh_step(max_bytes)?;
@@ -1318,7 +1327,7 @@ diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.
      }
  }
  
-@@ -4026,6 +4036,7 @@ impl PileFile {
+@@ -4026,6 +4038,7 @@ impl PileFile {
              blobs: PileBlobIndex::new(),
              branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
              collection_records: CollectionRecordIndex::new(),
@@ -1326,7 +1335,23 @@ diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.
              capability_proofs: CapabilityProofIndex::new(),
              legacy_collection_headers: LegacyCollectionHeaderIndex::new(),
              retired_equations: CollectionOccurrenceIndex::new(),
-@@ -4114,7 +4125,8 @@ impl PileFile {
+@@ -4035,6 +4048,7 @@ impl PileFile {
+             exact_frame_digests: PATCH::<32, IdentitySchema>::new(),
+             wants: PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new(),
+             applied_length: 0,
++            applied_records: 0,
+             prefix,
+             turnstile,
+         })
+@@ -4111,10 +4125,16 @@ impl PileFile {
+         self.applied_length as u64
+     }
+ 
++    /// Count complete physical records, including duplicate and opaque records.
++    pub fn replayed_records(&self) -> u64 {
++        self.applied_records
++    }
++
      /// A snapshot of exactly the records applied so far, without replaying
      /// anything new. After [`Self::refresh_step`] it is a prefix of the file;
      /// [`SnapshotSource::snapshot`](super::SnapshotSource::snapshot) is a full
@@ -1336,7 +1361,7 @@ diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.
      pub fn snapshot_replayed(&self) -> PileFileSnapshot {
          PileFileSnapshot::new(
              self.record_origin.clone(),
-@@ -4123,6 +4135,7 @@ impl PileFile {
+@@ -4123,6 +4143,7 @@ impl PileFile {
              self.opaque_records,
              self.blobs.clone(),
              self.collection_records.clone(),
@@ -1344,7 +1369,7 @@ diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.
              self.legacy_collection_headers.clone(),
              self.retired_equations.clone(),
              self.capability_proofs.clone(),
-@@ -4225,6 +4238,7 @@ impl PileFile {
+@@ -4225,6 +4246,7 @@ impl PileFile {
          });
          let applied = match record.content {
              PileRecordContent::Blob { hash, .. } => {
@@ -1352,7 +1377,7 @@ diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.
                  let candidate = IndexEntry::new(start_offset);
                  // Replay is an index construction path, not a payload
                  // validation pass. One segmented relation retains every
-@@ -4234,6 +4248,9 @@ impl PileFile {
+@@ -4234,6 +4256,9 @@ impl PileFile {
                  let key = blob_occurrence_key(&hash.raw, candidate);
                  self.blobs
                      .insert(&Entry::with_value(&key, CachedValidation::default()));
@@ -1362,7 +1387,7 @@ diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.
                  Applied::Blob { hash }
              }
              PileRecordContent::Branch { branch_id, head } => {
-@@ -4266,7 +4283,10 @@ impl PileFile {
+@@ -4266,7 +4291,10 @@ impl PileFile {
                              marker: slice[..16].try_into().expect("decoded frame marker"),
                          });
                      }
@@ -1374,7 +1399,15 @@ diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.
                  } else {
                      // MERGE retains the occurrence path. The other kinds
                      // never get an occurrence leaf in this relation.
-@@ -4576,6 +4596,7 @@ impl PileFile {
+@@ -4341,6 +4369,7 @@ impl PileFile {
+             }
+         };
+         self.applied_length = next_applied_length;
++        self.applied_records += 1;
+         Ok(Some(applied))
+     }
+ 
+@@ -4576,6 +4605,7 @@ impl PileFile {
              std::ptr::drop_in_place(&mut this.blobs);
              std::ptr::drop_in_place(&mut this.branches);
              std::ptr::drop_in_place(&mut this.collection_records);
@@ -1382,7 +1415,7 @@ diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.
              std::ptr::drop_in_place(&mut this.capability_proofs);
              std::ptr::drop_in_place(&mut this.legacy_collection_headers);
              std::ptr::drop_in_place(&mut this.retired_equations);
-@@ -5137,6 +5158,18 @@ impl PileFileSnapshot {
+@@ -5137,6 +5167,18 @@ impl PileFileSnapshot {
  }
  
  impl CollectionRead for PileFileSnapshot {
@@ -1401,7 +1434,7 @@ diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.
      type RecordsError = ReadError;
      type RecordIter<'a> = PileCollectionRecordIter;
  
-@@ -8473,6 +8506,39 @@ mod tests {
+@@ -8473,6 +8515,39 @@ mod tests {
          assert!(original_mapping.upgrade().is_none());
      }
  

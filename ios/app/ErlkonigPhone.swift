@@ -70,6 +70,7 @@ private struct ReplayProgress: Decodable, Equatable {
     var prefix_bytes: UInt64
     var observed_bytes: UInt64
     var activity_serial: UInt64
+    var records_per_second: UInt64?
     var fraction: Double {
         guard observed_bytes > 0 else { return 0 }
         return min(1, Double(prefix_bytes) / Double(observed_bytes))
@@ -486,7 +487,13 @@ private final class ReplicaModel: ObservableObject {
             && status.replay_progress?.activity_serial != pendingActivity {
             return status.replay_complete ? "Resuming" : "Reading local data"
         }
-        if !status.ready || !status.replay_complete { return "Reading local data" }
+        if !status.ready || !status.replay_complete {
+            if let replay = status.replay_progress, replay.activity_serial == pendingActivity,
+               let rate = replay.records_per_second {
+                return "Reading local data · \(rate.formatted()) local pile records/s"
+            }
+            return "Reading local data"
+        }
         if let observation = status.network {
             if !observation.isFresh { return "Waiting for update" }
             let count = observation.connections.count

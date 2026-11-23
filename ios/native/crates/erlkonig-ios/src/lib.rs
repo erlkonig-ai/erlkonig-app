@@ -100,10 +100,52 @@ struct ReplayProgress {
     prefix_bytes: u64,
     observed_bytes: u64,
     activity_serial: u64,
+    records_per_second: Option<ReplayRate>,
 }
 impl ReplayProgress {
     fn observe(snapshot: &PileSnapshot, observed_bytes: u64, activity_serial: u64) -> Self {
-        Self { prefix_bytes: snapshot.prefix_len() as u64, observed_bytes, activity_serial }
+        Self { prefix_bytes: snapshot.prefix_len() as u64, observed_bytes, activity_serial, records_per_second: None }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReplayRate {
+    records_per_second: u64,
+    measured_at: Instant,
+}
+
+impl Serialize for ReplayRate {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.measured_at.elapsed() > Duration::from_secs(5) {
+            serializer.serialize_none()
+        } else {
+            serializer.serialize_u64(self.records_per_second)
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReplayMeter {
+    baseline: Option<(Instant, u64)>,
+    rate: Option<ReplayRate>,
+}
+
+impl ReplayMeter {
+    fn observe(&mut self, now: Instant, records: u64) -> Option<ReplayRate> {
+        if let Some((start, previous)) = self.baseline {
+            if let Some(delta) = records.checked_sub(previous) {
+                let elapsed = now.duration_since(start);
+                if elapsed < Duration::from_secs(1) { return self.rate; }
+                self.rate = Some(ReplayRate {
+                    records_per_second: (delta as f64 / elapsed.as_secs_f64()).round() as u64,
+                    measured_at: now,
+                });
+            } else {
+                self.rate = None;
+            }
+        }
+        self.baseline = Some((now, records));
+        self.rate
     }
 }
 
@@ -321,6 +363,7 @@ fn worker_with_cleanup(
         let mut before_foreground: Option<Box<dyn FnOnce(&Pile, &Arc<Mutex<Status>>) + Send>> = None;
         let mut opening_page_requested = true;
         let mut opening_published = Instant::now();
+        let mut replay_meter = ReplayMeter::default();
         let mut peer = None;
         let mut previous = None;
         let mut roots = Vec::new();
@@ -468,6 +511,7 @@ fn worker_with_cleanup(
                     previous = None;
                 }
                 Ok(Command::Active(next, serial)) => {
+                    replay_meter = ReplayMeter::default();
                     requested_activity = serial;
                     if next == active && (next || paused) {
                         // Repeated lifecycle events still need their own ack.
@@ -536,8 +580,13 @@ fn worker_with_cleanup(
                         let listening = complete && collections::listening_in(&snapshot, key.verifying_key())?;
                         // Backing extent is a current observation, not snapshot state. An
                         // append after the replay step can make this denominator grow.
-                        let observed_bytes = opening.as_ref().unwrap().observed_length()?;
-                        let progress = ReplayProgress::observe(&snapshot, observed_bytes, requested_activity);
+                        let pile = opening.as_ref().unwrap();
+                        let mut progress = ReplayProgress::observe(&snapshot, pile.observed_length()?, requested_activity);
+                        if complete {
+                            replay_meter = ReplayMeter::default();
+                        } else {
+                            progress.records_per_second = replay_meter.observe(Instant::now(), pile.replayed_records());
+                        }
                         publish(&status, |s| {
                             if s.replay_progress.map(|old| old.prefix_bytes)
                                 != Some(progress.prefix_bytes) { s.storage.clear(); }
