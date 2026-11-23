@@ -8,6 +8,35 @@ use triblespace_core::{
 };
 
 #[test]
+fn collections_measurements_follow_the_visible_page_and_clear_on_pause() {
+    use triblespace_net::health::{CollectionBytes, CollectionHealth};
+    let mut model = Model::new(ModelSource::Error(String::new()));
+    model.status = Status::default();
+    let root = crate::CollectionHandle::new([9; 32]);
+    let other = crate::CollectionHandle::new([11; 32]);
+    model.set_screen(Screen::Collections);
+    assert!(model.storage_active);
+    assert_eq!(model.collection_rate_label(&root), "Sync payload ↓ —");
+    let mut h = crate::network::synthetic_health();
+    h.collections = [root, other].map(|collection| CollectionHealth {
+        collection, local_frontier: None, last_local_change_at: None, peers: Default::default(),
+    }).into_iter().collect();
+    h.received_payload.window_ns = 10_000_000_000;
+    h.received_payload.collections = [CollectionBytes { collection: root, bytes: 25_000 }]
+        .into_iter().collect();
+    crate::network::Observation::update(
+        crate::network::Subject::Collections(&[]), &mut model.peer_view, Some(Arc::new(h)),
+    );
+    assert_eq!(model.collection_rate_label(&root), "Sync payload ↓ <0.01 MB/s");
+    assert_eq!(model.collection_rate_label(&other), "Sync payload ↓ 0 MB/s");
+    model.set_screen(Screen::Peers);
+    assert!(!model.storage_active && model.peer_view.is_some());
+    model.set_active(false);
+    assert_eq!(model.collection_rate_label(&root), "Sync payload ↓ —");
+    assert!(model.peer_view.is_none());
+}
+
+#[test]
 fn replay_heading_keeps_the_native_prefix_and_the_real_measurement_age() {
     let mut model = Model::new(ModelSource::Error(String::new()));
     model.status = Status::default();
@@ -59,7 +88,7 @@ fn eof_is_visible_while_preparation_holds_back_choices_and_network_startup() {
     let mut model = Model::new(ModelSource::Error(String::new()));
     model.activity_serial = replica.set_active(true);
     model.replica = Some(replica);
-    model.set_screen(Screen::Sync);
+    model.set_screen(Screen::Peers);
     let root = dir.path().to_owned();
     let worker = std::thread::Builder::new().stack_size(crate::WORKER_STACK_BYTES)
         .spawn(move || crate::worker(root, commands, status, sessions)).unwrap();
@@ -113,7 +142,7 @@ fn sync_reads_the_peer_while_the_status_writer_and_first_durable_turn_are_blocke
 
     model.tick(); // Crown does not sample the peer.
     assert!(model.peer_reader.is_none() && model.peer_view.is_none());
-    model.set_screen(Screen::Sync);
+    model.set_screen(Screen::Peers);
     let deadline = Instant::now() + Duration::from_secs(5);
     while model.peer_observation().is_none() {
         assert!(Instant::now() < deadline, "actual empty host sample unavailable");
@@ -144,7 +173,7 @@ fn sync_reads_the_peer_while_the_status_writer_and_first_durable_turn_are_blocke
     for _ in 0..10_000 { model.tick(); }
     eprintln!("10k empty peer frame polls with worker lock held: visible {visible:?}, hidden {:?}", start.elapsed());
     assert!(model.peer_reader.is_none() && model.peer_view.is_none());
-    model.set_screen(Screen::Sync);
+    model.set_screen(Screen::Peers);
     model.tick();
 
     // A pinned screen does not become fresh merely because the host keeps running.
@@ -154,7 +183,7 @@ fn sync_reads_the_peer_while_the_status_writer_and_first_durable_turn_are_blocke
     assert_eq!(model.phase(), "No connected nodes");
     model.set_screen(Screen::Crown);
     assert!(model.peer_reader.is_none() && model.peer_view.is_none());
-    model.set_screen(Screen::Sync);
+    model.set_screen(Screen::Peers);
     model.tick();
     assert!(model.peer_observation().is_some());
 

@@ -199,8 +199,7 @@ define_class!(
             let actions: Vec<_> = [
                 ("Show crown", sel!(showCrown:)),
                 ("Show collections", sel!(showCollections:)),
-                ("Show storage", sel!(showStorage:)),
-                ("Show sync", sel!(showSync:)),
+                ("Show peers", sel!(showPeers:)),
             ]
             .into_iter()
             .map(|(name, selector)| unsafe {
@@ -287,14 +286,9 @@ define_class!(
             self.show(1);
             true
         }
-        #[unsafe(method(showStorage:))]
-        fn show_storage(&self, _: &UIAccessibilityCustomAction) -> bool {
+        #[unsafe(method(showPeers:))]
+        fn show_peers(&self, _: &UIAccessibilityCustomAction) -> bool {
             self.show(2);
-            true
-        }
-        #[unsafe(method(showSync:))]
-        fn show_sync(&self, _: &UIAccessibilityCustomAction) -> bool {
-            self.show(3);
             true
         }
         #[unsafe(method(accessibilityScroll:))]
@@ -398,7 +392,7 @@ impl Phone {
     fn step(&self, delta: isize) -> bool {
         let index = self.ivars().model.borrow().screen as isize;
         let next = index + delta;
-        if !(0..4).contains(&next) {
+        if !(0..3).contains(&next) {
             return false;
         }
         self.show(next);
@@ -445,13 +439,8 @@ impl Phone {
             let mut model = self.ivars().model.borrow_mut();
             if model.foreground {
                 model.visible_pages(indices.iter().copied());
-                if model.screen == Screen::Storage {
-                    let roots = indices
-                        .into_iter()
-                        .filter_map(|n| model.row(n).map(|r| r.root.clone()))
-                        .collect();
-                    model.storage_roots(roots);
-                }
+                let roots = indices.into_iter().filter_map(|n| model.row(n).map(|r| r.root.clone())).collect();
+                model.storage_roots(roots);
             }
         }
     }
@@ -469,20 +458,24 @@ impl Phone {
             match screen {
                 Screen::Crown => "",
                 Screen::Collections => "Collections",
-                Screen::Storage => "Storage",
-                Screen::Sync => "Sync",
+                Screen::Peers => "Peers",
             },
         );
         u.crown.setHidden(screen != Screen::Crown);
         u.table.setHidden(screen == Screen::Crown);
-        u.chart.setHidden(screen != Screen::Storage);
+        u.chart.setHidden(screen != Screen::Collections);
         u.fixture.setHidden(!m.visual());
         u.header
-            .setHidden(!matches!(screen, Screen::Storage | Screen::Sync));
-        if screen == Screen::Sync {
-            text(&u.header, &m.phase());
+            .setHidden(!matches!(screen, Screen::Collections | Screen::Peers));
+        if screen == Screen::Peers {
+            let phase = m.phase();
+            if !m.status.replay_complete && m.foreground && m.status.error.is_none() {
+                text(&u.header, &format!("Peer connections unavailable during startup\n{phase}"));
+            } else {
+                text(&u.header, &phase);
+            }
         }
-        if screen == Screen::Storage {
+        if screen == Screen::Collections {
             let summary = m
                 .capacity
                 .map(|(t, f)| {
@@ -494,7 +487,11 @@ impl Phone {
                     )
                 })
                 .unwrap_or_else(|| "iPhone     Capacity unavailable".into());
-            text(&u.header, &summary);
+            if !m.status.replay_complete && m.foreground && m.status.error.is_none() {
+                text(&u.header, &format!("{summary}\n{}", m.phase()));
+            } else {
+                text(&u.header, &summary);
+            }
             let key = (
                 m.capacity,
                 m.status
@@ -661,7 +658,7 @@ impl Phone {
             }
         }
         u.progress.setHidden(progress.is_none());
-        let key = (m.table_epoch, screen == Screen::Sync && m.fresh_network());
+        let key = (m.table_epoch, screen != Screen::Crown && m.fresh_network());
         let reload = st.painted.replace(Some(key)) != Some(key) && screen != Screen::Crown;
         drop(m);
         if reload {

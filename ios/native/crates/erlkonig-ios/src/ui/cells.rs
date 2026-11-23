@@ -29,23 +29,15 @@ fn abbrev(s: &str) -> String {
 pub(super) enum Item {
     Text(String, String),
     Copy(String, String, String),
-    Choice(Row),
+    Choice(Row, String),
     Volume(String, String, u32),
     Loading,
 }
 impl Model {
     fn preface(&self) -> Vec<Item> {
         let mut items = vec![];
-        match self.screen {
-            Screen::Collections | Screen::Storage => {
-                if let Some(e) = self.error() {
-                    items.push(Item::Copy(e.into(), "Copy error".into(), e.into()));
-                }
-                if self.screen == Screen::Storage {
-                    items.push(Item::Text("Local data".into(),"Resident content can belong to several collections. Record counts describe direct blobs.".into()));
-                }
-            }
-            _ => {}
+        if let Some(e) = self.error() {
+            items.push(Item::Copy(e.into(), "Copy error".into(), e.into()));
         }
         items
     }
@@ -53,7 +45,7 @@ impl Model {
         let mut items = vec![];
         if self.list_loaded && self.total == 0 && self.list_status().replay_complete {
             items.push(Item::Text(
-                if self.screen == Screen::Collections && self.list_status().listening {
+                if self.list_status().listening {
                     "Listening for collection access"
                 } else {
                     "No available collections"
@@ -67,43 +59,39 @@ impl Model {
         {
             items.push(Item::Loading);
         }
-        if self.screen == Screen::Collections
-            && self.access_pending > 0
-            && self.list_status().replay_complete
-        {
+        if self.access_pending > 0 && self.list_status().replay_complete {
             items.push(Item::Text(
                 "Some access metadata is unavailable".into(),
                 String::new(),
             ));
         }
-        if self.screen == Screen::Storage {
-            if let Some((total, free)) = self.capacity {
-                match self
-                    .list_status()
-                    .composition
-                    .as_ref()
-                    .filter(|_| self.list_status().replay_complete)
-                    .and_then(|c| other_used(total, free, c).map(|other| (c.shared_bytes, other)))
-                {
-                    Some((shared, other)) => {
-                        if shared > 0 {
-                            items.push(Item::Volume("Shared".into(), bytes(shared), 0x888888))
-                        }
-                        if other > 0 {
-                            items.push(Item::Volume("Other used".into(), bytes(other), 0x484848))
-                        }
+        if let Some((total, free)) = self.capacity {
+            match self
+                .list_status()
+                .composition
+                .as_ref()
+                .filter(|_| self.list_status().replay_complete)
+                .and_then(|c| other_used(total, free, c).map(|other| (c.shared_bytes, other)))
+            {
+                Some((shared, other)) => {
+                    if shared > 0 {
+                        items.push(Item::Volume("Shared".into(), bytes(shared), 0x888888))
                     }
-                    None if total > free => {
-                        items.push(Item::Volume("Used".into(), bytes(total - free), 0x888888))
+                    if other > 0 {
+                        items.push(Item::Volume("Other used".into(), bytes(other), 0x484848))
                     }
-                    _ => {}
                 }
+                None if total > free => {
+                    items.push(Item::Volume("Used".into(), bytes(total - free), 0x888888))
+                }
+                _ => {}
             }
         }
+        items.push(Item::Text("Local data".into(), "Collections can share local content. Counts show direct records present out of records known. Rates measure incoming collection sync payload over 10 seconds. Hash-only transfers are unattributed.".into()));
         items
     }
     pub fn number_of_rows(&self, section: isize) -> isize {
-        let count = if self.screen == Screen::Sync {
+        let count = if self.screen == Screen::Peers {
             if section == 1 {
                 self.peer_observation().map_or(0, |n| n.len())
             } else {
@@ -136,9 +124,8 @@ impl Model {
                 .nth(index)
                 .unwrap_or(Item::Loading);
         }
-        if self.screen == Screen::Sync {
-            let Some(c) = self.peer_observation().and_then(|n| n.row(index))
-            else {
+        if self.screen == Screen::Peers {
+            let Some(c) = self.peer_observation().and_then(|n| n.row(index)) else {
                 return Item::Loading;
             };
             let rx = rate(c.receive_bytes_per_second);
@@ -170,9 +157,6 @@ impl Model {
         let Some(row) = self.row(index) else {
             return Item::Loading;
         };
-        if self.screen != Screen::Storage {
-            return Item::Choice(row.clone());
-        }
         let sample = self
             .list_status()
             .storage
@@ -203,10 +187,10 @@ impl Model {
             .and_then(|s| s.resident_error.as_deref())
             .or(row.count_error.as_deref())
             .map_or_else(String::new, |e| format!("\n{e}"));
-        Item::Volume(
-            row.name.clone(),
-            format!("{resident}{updating}   ·   {records}{detail}"),
-            collection_color(&row.root),
+        let incoming = self.collection_rate_label(&row.handle);
+        Item::Choice(
+            row.clone(),
+            format!("Local {resident}{updating} · {records}\n{incoming}{detail}"),
         )
     }
 }
@@ -244,6 +228,10 @@ impl Phone {
                 )
             });
         cell.setAccessoryView(None);
+        #[allow(deprecated)]
+        if let Some(image) = cell.imageView() {
+            image.setImage(None);
+        }
         cell.setAccessibilityCustomActions(None, mtm);
         cell.setSelectionStyle(UITableViewCellSelectionStyle::None);
         cell.setBackgroundColor(Some(&rgb(0x121212)));
@@ -264,7 +252,7 @@ impl Phone {
             Item::Text(name, detail) => (name, detail),
             Item::Copy(name, detail, value) => {
                 cell.setSelectionStyle(UITableViewCellSelectionStyle::Default);
-                let hint = if self.ivars().model.borrow().screen == Screen::Sync {
+                let hint = if self.ivars().model.borrow().screen == Screen::Peers {
                     format!(
                         "Copy node ID {value}. Network traffic includes overhead and retransmissions."
                     )
@@ -281,11 +269,20 @@ impl Phone {
                 cell.setAccessoryView(Some(&swatch));
                 (name, detail)
             }
-            Item::Choice(row) => {
+            Item::Choice(row, measures) => {
                 let model = self.ivars().model.borrow();
                 let on = model.desired(&row);
                 let change = model.accepts_intent();
-                let mut detail = abbrev(&row.root);
+                let mut detail = format!("{}\n{measures}", abbrev(&row.root));
+                #[allow(deprecated)]
+                if let Some(image) = cell.imageView() {
+                    image.setIsAccessibilityElement(false, mtm);
+                    image.setAccessibilityElementsHidden(true, mtm);
+                    image.setImage(
+                        UIImage::systemImageNamed(&NSString::from_str("circle.fill")).as_deref(),
+                    );
+                    unsafe { image.setTintColor(Some(&rgb(collection_color(&row.root)))) };
+                }
                 copy_action(&cell, &row.root, mtm);
                 if model.list_status().replay_complete && !row.readable {
                     detail += "\nRead access unavailable";
@@ -320,6 +317,7 @@ impl Phone {
                         b.setTag(enabled as isize);
                         copy_action(&b, &row.root, mtm);
                         b.setAccessibilityIdentifier(Some(&NSString::from_str(&row.root)));
+                        b.setAccessibilityHint(Some(&NSString::from_str(&measures)), mtm);
                         b.setAccessibilityLabel(
                             Some(&NSString::from_str(&format!("{title} {}", row.name))),
                             mtm,
@@ -355,7 +353,10 @@ impl Phone {
                         })),
                         mtm,
                     );
-                    toggle.setAccessibilityHint(Some(&NSString::from_str(&hint)), mtm);
+                    toggle.setAccessibilityHint(
+                        Some(&NSString::from_str(&format!("{measures}. {hint}"))),
+                        mtm,
+                    );
                     unsafe {
                         toggle.addTarget_action_forControlEvents(
                             Some(self),
@@ -384,7 +385,7 @@ impl Phone {
     pub(super) fn select(&self, path: &NSIndexPath) {
         let m = self.ivars().model.borrow();
         let value = match m.item(path.section(), path.row() as usize) {
-            Item::Choice(row) => Some(row.root),
+            Item::Choice(row, _) => Some(row.root),
             Item::Copy(_, _, s) => Some(s),
             _ => None,
         };

@@ -16,6 +16,12 @@ pub(crate) struct Observation {
     current: Arc<HealthSnapshot>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Subject<'a> {
+    Peers,
+    Collections(&'a [String]),
+}
+
 pub(crate) struct Connection {
     pub peer: String,
     pub connected: bool,
@@ -37,6 +43,10 @@ impl Observation {
         self.current.traffic_rates.len()
     }
 
+    pub(crate) fn collection_receive_rate(&self, handle: &crate::CollectionHandle) -> Option<f64> {
+        self.current.collection_receive_bytes_per_second(handle)
+    }
+
     pub fn row(&self, index: usize) -> Option<Connection> {
         let rate = self.current.traffic_rates.iter().nth(index)?;
         let connection = self.current.connections.get(&rate.peer);
@@ -54,7 +64,11 @@ impl Observation {
 
     /// Keep one native cut. A newer heartbeat can update freshness without
     /// invalidating the table. Formatting happens only for requested rows.
-    pub(crate) fn update(view: &mut Option<Self>, snapshot: Option<Arc<HealthSnapshot>>) -> bool {
+    pub(crate) fn update(
+        subject: Subject<'_>,
+        view: &mut Option<Self>,
+        snapshot: Option<Arc<HealthSnapshot>>,
+    ) -> bool {
         let Some((current, sampled_at)) = snapshot.and_then(|s| {
             let at = s.started_at.and(s.observed_at)?;
             Some((s, at))
@@ -70,8 +84,27 @@ impl Observation {
                 if sampled_at < old.sampled_at {
                     return false;
                 }
-                changed = !old.current.traffic_rates.same_root(&current.traffic_rates)
-                    || !old.current.connections.same_root(&current.connections);
+                changed = match subject {
+                    Subject::Peers => {
+                        !old.current.traffic_rates.same_root(&current.traffic_rates)
+                            || !old.current.connections.same_root(&current.connections)
+                    }
+                    Subject::Collections(visible) => {
+                        let before = &old.current.received_payload;
+                        let after = &current.received_payload;
+                        let inputs_changed = before.window_ns != after.window_ns
+                            || !before.collections.same_root(&after.collections)
+                            || !old.current.collections.same_root(&current.collections);
+                        inputs_changed
+                            && visible
+                                .iter()
+                                .filter_map(|root| crate::parse_handle(root))
+                                .any(|root| {
+                                    old.current.collection_receive_bytes_per_second(&root)
+                                        != current.collection_receive_bytes_per_second(&root)
+                                })
+                    }
+                };
             }
         }
         *view = Some(Self {
@@ -97,6 +130,7 @@ pub(crate) fn synthetic_health() -> HealthSnapshot {
         observed_at: Some(now),
         connections: Default::default(),
         traffic_rates: Default::default(),
+        received_payload: Default::default(),
         store: Default::default(),
         collections: Default::default(),
         publication: Default::default(),
@@ -144,7 +178,11 @@ mod tests {
             .into_iter()
             .collect();
         let mut view = None;
-        assert!(Observation::update(&mut view, Some(Arc::new(h))));
+        assert!(Observation::update(
+            Subject::Peers,
+            &mut view,
+            Some(Arc::new(h))
+        ));
         let view = view.unwrap();
         assert_eq!(view.connected_count(), 1);
         assert_eq!(view.len(), 2);
@@ -168,10 +206,14 @@ mod tests {
         h.traffic_rates = [rate(42, Some(40_000), Some(100))].into_iter().collect();
         let pinned = Arc::new(h.clone());
         let mut view = None;
-        Observation::update(&mut view, Some(pinned.clone()));
+        Observation::update(Subject::Peers, &mut view, Some(pinned.clone()));
         h.connections = Default::default();
         h.observed_at = h.observed_at.map(|at| at + Duration::from_secs(2));
-        assert!(Observation::update(&mut view, Some(Arc::new(h.clone()))));
+        assert!(Observation::update(
+            Subject::Peers,
+            &mut view,
+            Some(Arc::new(h.clone()))
+        ));
         let recent = view.as_ref().unwrap();
         assert_eq!(recent.connected_count(), 0);
         assert_eq!(recent.len(), 1);
@@ -181,13 +223,17 @@ mod tests {
         h.connections = [socket(99)].into_iter().collect();
         h.traffic_rates = [rate(42, Some(30_000), None)].into_iter().collect();
         let new = Arc::new(h);
-        assert!(Observation::update(&mut view, Some(new.clone())));
+        assert!(Observation::update(
+            Subject::Peers,
+            &mut view,
+            Some(new.clone())
+        ));
         assert_eq!(view.as_ref().unwrap().connected_count(), 1);
         let row = view.as_ref().unwrap().row(0).unwrap();
         assert_eq!(row.receive_bytes_per_second, Some(3000.));
         assert_eq!(row.send_bytes_per_second, None);
         assert_eq!(row.rtt_ms, Some(12.));
-        assert!(!Observation::update(&mut view, Some(new)));
+        assert!(!Observation::update(Subject::Peers, &mut view, Some(new)));
         assert_eq!(pinned.connections.get(&[42; 32]).unwrap().id, 1);
         assert_eq!(
             pinned
@@ -204,20 +250,109 @@ mod tests {
         let mut h = synthetic_health();
         let mut view = None;
         h.traffic_rates = [rate(42, Some(100), Some(0))].into_iter().collect();
-        assert!(Observation::update(&mut view, Some(Arc::new(h.clone()))));
+        assert!(Observation::update(
+            Subject::Peers,
+            &mut view,
+            Some(Arc::new(h.clone()))
+        ));
         h.store.serving_snapshot = true;
         h.observed_at = h.observed_at.map(|at| at + Duration::from_secs(1));
-        assert!(!Observation::update(&mut view, Some(Arc::new(h.clone()))));
+        assert!(!Observation::update(
+            Subject::Peers,
+            &mut view,
+            Some(Arc::new(h.clone()))
+        ));
         let at = view.as_ref().unwrap().sampled_at;
         h.observed_at = h.started_at;
-        assert!(!Observation::update(&mut view, Some(Arc::new(h.clone()))));
+        assert!(!Observation::update(
+            Subject::Peers,
+            &mut view,
+            Some(Arc::new(h.clone()))
+        ));
         assert_eq!(view.as_ref().unwrap().sampled_at, at);
         h.observed_at = Some(at + Duration::from_secs(10));
         h.traffic_rates = Default::default();
-        assert!(Observation::update(&mut view, Some(Arc::new(h.clone()))));
+        assert!(Observation::update(
+            Subject::Peers,
+            &mut view,
+            Some(Arc::new(h.clone()))
+        ));
         assert_eq!(view.as_ref().unwrap().len(), 0);
         h.observed_at = None;
-        assert!(Observation::update(&mut view, Some(Arc::new(h))));
+        assert!(Observation::update(
+            Subject::Peers,
+            &mut view,
+            Some(Arc::new(h))
+        ));
+        assert!(view.is_none());
+    }
+
+    #[test]
+    fn collection_rows_follow_only_visible_received_payload_and_active_membership() {
+        use triblespace_net::health::{CollectionBytes, CollectionHealth};
+        let root = crate::CollectionHandle::new([3; 32]);
+        let hidden = crate::CollectionHandle::new([7; 32]);
+        let visible = [hex::encode(root.raw)];
+        let subject = Subject::Collections(&visible);
+        let mut h = synthetic_health();
+        h.collections = [root, hidden]
+            .map(|collection| CollectionHealth {
+                collection,
+                local_frontier: None,
+                last_local_change_at: None,
+                peers: Default::default(),
+            })
+            .into_iter()
+            .collect();
+        let mut view = None;
+        assert!(Observation::update(
+            subject,
+            &mut view,
+            Some(Arc::new(h.clone()))
+        ));
+        assert_eq!(view.as_ref().unwrap().collection_receive_rate(&root), None);
+        h.received_payload.window_ns = 10_000_000_000;
+        assert!(Observation::update(
+            subject,
+            &mut view,
+            Some(Arc::new(h.clone()))
+        ));
+        assert_eq!(
+            view.as_ref().unwrap().collection_receive_rate(&root),
+            Some(0.)
+        );
+        h.received_payload.unattributed_bytes = 100_000_000;
+        h.received_payload.collections = [CollectionBytes {
+            collection: hidden,
+            bytes: 550_000,
+        }]
+        .into_iter()
+        .collect();
+        h.traffic_rates = [rate(42, Some(1_000_000), None)].into_iter().collect();
+        assert!(!Observation::update(
+            subject,
+            &mut view,
+            Some(Arc::new(h.clone()))
+        ));
+        h.received_payload.collections = [CollectionBytes {
+            collection: root,
+            bytes: 25_000_000,
+        }]
+        .into_iter()
+        .collect();
+        assert!(Observation::update(
+            subject,
+            &mut view,
+            Some(Arc::new(h.clone()))
+        ));
+        assert_eq!(
+            view.as_ref().unwrap().collection_receive_rate(&root),
+            Some(2_500_000.)
+        );
+        h.collections = Default::default();
+        assert!(Observation::update(subject, &mut view, Some(Arc::new(h))));
+        assert_eq!(view.as_ref().unwrap().collection_receive_rate(&root), None);
+        assert!(Observation::update(subject, &mut view, None));
         assert!(view.is_none());
     }
 }

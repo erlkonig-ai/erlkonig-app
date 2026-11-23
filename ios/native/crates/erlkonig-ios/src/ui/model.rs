@@ -18,20 +18,18 @@ use std::{
 pub(super) enum Screen {
     Crown,
     Collections,
-    Storage,
-    Sync,
+    Peers,
 }
 impl Screen {
     pub fn from_index(index: isize) -> Self {
         match index {
             1 => Self::Collections,
-            2 => Self::Storage,
-            3 => Self::Sync,
+            2 => Self::Peers,
             _ => Self::Crown,
         }
     }
     pub fn list(self) -> bool {
-        matches!(self, Self::Collections | Self::Storage)
+        self == Self::Collections
     }
 }
 
@@ -276,7 +274,7 @@ impl Model {
         if self.screen.list() && !screen.list() {
             self.invalidate_window();
         }
-        if screen != Screen::Sync {
+        if screen == Screen::Crown {
             self.peer_reader = None;
             self.peer_view = None;
         }
@@ -290,7 +288,7 @@ impl Model {
         self.table_epoch += 1;
     }
     fn sync_storage(&mut self) {
-        let active = self.foreground && self.screen == Screen::Storage;
+        let active = self.foreground && self.screen == Screen::Collections;
         if self.storage_active == active {
             return;
         }
@@ -688,12 +686,12 @@ impl Model {
             let old = &self.status;
             let list_changed = next.list_snapshot != old.list_snapshot;
             let dirty = match self.screen {
-                Screen::Storage => {
+                Screen::Collections => {
                     !Arc::ptr_eq(&next.storage, &old.storage)
                         || next.composition.as_ref().map(Arc::as_ptr)
                             != old.composition.as_ref().map(Arc::as_ptr)
                 }
-                Screen::Sync => next.activity_serial != old.activity_serial,
+                Screen::Peers => next.activity_serial != old.activity_serial,
                 _ => false,
             };
             if dirty
@@ -721,7 +719,7 @@ impl Model {
                 }
             }
         }
-        if self.screen == Screen::Sync && self.foreground && !self.visual() {
+        if self.screen != Screen::Crown && self.foreground && !self.visual() {
             let mut root = self.peer_reader.as_ref().and_then(|r| r.snapshot());
             let mut changed = false;
             if root.is_none() {
@@ -734,7 +732,12 @@ impl Model {
                     self.peer_reader = reader;
                 }
             }
-            if crate::network::Observation::update(&mut self.peer_view, root) || changed {
+            let subject = if self.screen == Screen::Collections {
+                crate::network::Subject::Collections(&self.visible_roots)
+            } else {
+                crate::network::Subject::Peers
+            };
+            if crate::network::Observation::update(subject, &mut self.peer_view, root) || changed {
                 self.table_epoch += 1;
             }
         }
@@ -814,6 +817,17 @@ impl Model {
     }
     pub fn fresh_network(&self) -> bool {
         self.peer_observation().is_some_and(|n| n.age_ms() <= 5000)
+    }
+    pub fn collection_rate_label(&self, handle: &crate::CollectionHandle) -> String {
+        let rate = self.peer_observation().and_then(|n| n.collection_receive_rate(handle));
+        let reading = match rate {
+            None => "—".into(),
+            Some(0.) => "0 MB/s".into(),
+            Some(v) if v < 10_000. => "<0.01 MB/s".into(),
+            Some(v) => format!("{:.2} MB/s", v / 1_000_000.),
+        };
+        let age = if rate.is_some() && !self.fresh_network() { " · last measured" } else { "" };
+        format!("Sync payload ↓ {reading}{age}")
     }
     pub fn phase(&self) -> String {
         let s = &self.status;

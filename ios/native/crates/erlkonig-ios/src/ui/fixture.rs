@@ -40,7 +40,7 @@ impl Fixture {
         let rows: Vec<_> = (1..=n)
             .map(|i| {
                 let root = format!("{i:064x}");
-                let selected = i == 1;
+                let selected = i == 1 || (i == 2 && has("--collection-payload-fixture"));
                 let conflicted = i == 3;
                 Row {
                     handle: crate::parse_handle(&root).expect("32 byte fixture root"),
@@ -132,9 +132,23 @@ impl Fixture {
             });
         }
         let peer_observation = has("--sync-fixture").then(|| {
-            use triblespace_net::health::{ConnectionHealth, PeerRate};
+            use triblespace_net::health::{CollectionBytes, CollectionHealth, ConnectionHealth, PeerRate};
             use triblespace_net::transport::TrafficStats;
             let mut snapshot = crate::network::synthetic_health();
+            if has("--collection-payload-fixture") {
+                snapshot.collections = rows.iter().take(2).map(|row| CollectionHealth {
+                    collection: row.handle,
+                    local_frontier: None,
+                    last_local_change_at: None,
+                    peers: Default::default(),
+                }).collect();
+                snapshot.received_payload.window_ns = 10_000_000_000;
+                snapshot.received_payload.unattributed_bytes = 44_000_000;
+                snapshot.received_payload.collections = rows.first().map(|row| CollectionBytes {
+                    collection: row.handle,
+                    bytes: 27_500_000,
+                }).into_iter().collect();
+            }
             if !has("--sync-fixture-empty") {
                 snapshot.connections = [
                     ConnectionHealth {
@@ -178,7 +192,7 @@ impl Fixture {
                 .collect();
             }
             let mut sampled = None;
-            Observation::update(&mut sampled, Some(Arc::new(snapshot)));
+            Observation::update(crate::network::Subject::Peers, &mut sampled, Some(Arc::new(snapshot)));
             sampled.expect("fixture has a host timestamp")
         });
         Self {

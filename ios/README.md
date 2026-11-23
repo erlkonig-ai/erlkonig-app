@@ -2,7 +2,9 @@
 
 The foreground replica runs a native TribleSpace store inside the app sandbox. It displays collections, storage and passive connection statistics. The user selects which readable collections to replicate. Rust creates the UIKit scene, native controls and collection views. Xcode links the Rust static library through the process entry point in `app/main.c`.
 
-While Sync is visible, it reads the current peer's immutable health snapshot directly. Each row shows the host's trailing 10-second receive and send rates for an authenticated peer, including time disconnected. The heading counts current connections. A recently disconnected peer stays in the list until its window expires. RTT comes from the current connection.
+Swipe from the crown to Collections to select a replica, view its direct record progress and local storage, and see its incoming sync payload in MB/s. The rate covers measured collection-scoped payload over a trailing 10-second window. Hash-only transfers and uploads have no per-collection attribution. A dash indicates an unavailable measurement.
+
+Swipe again to Peers to see current connections. Each row reads the host’s immutable health snapshot for an authenticated peer’s trailing 10-second receive and send rates, including time disconnected. A recently disconnected peer stays in the list until its window expires. RTT comes from the current connection.
 
 ## Build the simulator app
 

@@ -53,7 +53,7 @@ objc2-ui-kit = { version = "=0.3.2", default-features = false, features = [
     "UIAccessibilityConstants", "UIAccessibilityCustomAction", "UIAccessibilityIdentification", "UIApplication", "UIBezierPath",
     "UIButton", "UIColor", "UIContentConfiguration", "UIContentSizeCategoryAdjusting", "UIControl",
     "UICornerConfiguration", "UICornerRadius", "UIDevice", "UIFont", "UIFontDescriptor", "UIGeometry", "UIGestureRecognizer", "UIInterface", "UILabel",
-    "UIListContentConfiguration", "UIPasteboard", "UIProgressView", "UIResponder", "UIScene",
+    "UIImage", "UIImageView", "UIListContentConfiguration", "UIPasteboard", "UIProgressView", "UIResponder", "UIScene",
     "UISceneConfiguration", "UISceneOptions", "UISceneSession", "UIScreen", "UIScrollView",
     "UIStackView", "UIPanGestureRecognizer", "UISwipeGestureRecognizer", "UISwitch",
     "UITableView", "UITableViewCell", "UITableViewController", "UIView", "UIViewController",
