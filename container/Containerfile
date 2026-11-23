@@ -1,0 +1,30 @@
+ARG BUILDPLATFORM
+FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS build
+WORKDIR /build/erlkonig
+RUN apt-get update && apt-get install -y --no-install-recommends cmake python3 && rm -rf /var/lib/apt/lists/*
+COPY ci/source-inputs.json ci/source-inputs.json
+COPY ci/overlays ci/overlays
+COPY scripts/ci/release_inputs.py scripts/ci/soma_input.py scripts/ci/
+RUN python3 scripts/ci/release_inputs.py --app /build/erlkonig --fetch-development-sources
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates crates
+COPY scripts/accept/fixture.rs scripts/accept/fixture.rs
+COPY scripts/linux/render-icons.rs scripts/linux/render-icons.rs
+COPY ios/native ios/native
+COPY plugin plugin
+ARG CARGO_BUILD_JOBS=4
+ARG ERLKONIG_ARCH
+COPY container/compile.sh /build/compile.sh
+RUN /bin/sh /build/compile.sh "$ERLKONIG_ARCH"
+
+FROM docker.io/library/debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /build/bin/erlkonig /usr/local/bin/erlkonig
+COPY LICENSE-APACHE LICENSE-MIT Cargo.lock ci/source-inputs.json /usr/share/doc/erlkonig/
+COPY notices /usr/share/doc/erlkonig/notices
+RUN erlkonig --version && install -d -m 0700 -o 10001 -g 10001 /var/lib/erlkonig
+ENV HOME=/var/lib/erlkonig
+USER 10001:10001
+VOLUME ["/var/lib/erlkonig"]
+ENTRYPOINT ["/usr/local/bin/erlkonig"]
+CMD ["serve", "--data-dir", "/var/lib/erlkonig"]

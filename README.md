@@ -12,6 +12,9 @@ Build with `cargo build --locked -p erlkonig-mac` on macOS or
 `cargo test --locked -p faculties-erp -p erlkonig-core -p erlkonig-app -p erlkonig-cli`.
 Toolchain and platform requirements are recorded in `ci/source-inputs.json`.
 
+[Run the headless owner in a rootless Podman pod](container/README.md) to give
+a sandboxed AI client access to a dedicated node.
+
 The desktop shells share their UI and backend with the crates in this workspace.
 Desktop packaging targets macOS ARM64 and Linux x86-64 and ARM64.
 The [Rust iOS client](ios/README.md) runs a foreground replica with
