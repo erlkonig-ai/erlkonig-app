@@ -141,6 +141,7 @@ impl Fixture {
                 attachments: &[],
             },
             (epoch, epoch).try_to_inline().unwrap(),
+            secrets::record::Delivery::Own,
         )
         .unwrap();
         let denied_secret = sealed.secret;
@@ -178,6 +179,7 @@ impl Fixture {
                 attachments: &[],
             },
             (epoch, epoch).try_to_inline().unwrap(),
+            secrets::record::Delivery::Own,
         )
         .unwrap();
         let foreign_id = foreign.secret;
