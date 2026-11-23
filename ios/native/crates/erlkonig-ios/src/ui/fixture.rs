@@ -112,7 +112,10 @@ impl Fixture {
                 },
                 observed_bytes: 100,
                 activity_serial: 0,
-                records_per_second: None,
+                records_per_second: has("--replay-rate-fixture").then(|| crate::ReplayRate {
+                    records_per_second: 1234,
+                    measured_at: std::time::Instant::now(),
+                }),
             });
         }
         if has("--collections-fixture-network") {

@@ -8,6 +8,82 @@ use triblespace_core::{
 };
 
 #[test]
+fn replay_heading_keeps_the_native_prefix_and_the_real_measurement_age() {
+    let mut model = Model::new(ModelSource::Error(String::new()));
+    model.status = Status::default();
+    model.activity_serial = 3;
+    model.status.ready = true;
+    let mut progress = crate::ReplayProgress {
+        prefix_bytes: 2_000_000_000, observed_bytes: 6_800_000_000,
+        activity_serial: 3, records_per_second: None,
+    };
+    model.status.replay_progress = Some(progress);
+    assert_eq!(model.phase(), "Reading local data · 2.0 GB of 6.8 GB");
+    assert_eq!(model.progress(), Some((2_000_000_000, 6_800_000_000)));
+    model.status.replay_progress.as_mut().unwrap().prefix_bytes = 6_799_999_984;
+    assert_eq!(model.phase(), "Reading local data · 6.8 GB of 6.8 GB · 16 B left");
+    progress.records_per_second = Some(crate::ReplayRate { records_per_second: 0, measured_at: Instant::now() });
+    model.status.replay_progress = Some(progress);
+    assert_eq!(model.phase(), "Reading local data · 2.0 GB of 6.8 GB\n0 local pile records/s");
+    progress.prefix_bytes = 3_000_000_000;
+    progress.records_per_second = Some(crate::ReplayRate {
+        records_per_second: 4200, measured_at: Instant::now() - Duration::from_secs(8),
+    });
+    model.status.replay_progress = Some(progress);
+    assert_eq!(model.phase(), "Reading local data · 3.0 GB of 6.8 GB\n4200 local pile records/s · measured 8 s ago");
+    model.set_active(false);
+    assert_eq!(model.phase(), "Paused");
+    model.set_active(true);
+    model.activity_serial = 4; // A new foreground request has no observations yet.
+    assert_eq!(model.phase(), "Reading local data");
+    assert_eq!(model.progress(), None);
+}
+
+#[test]
+fn eof_is_visible_while_preparation_holds_back_choices_and_network_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (key, mut pile) = open_local(dir.path()).unwrap();
+    crate::collections::start_discovery(&mut pile, &key).unwrap();
+    pile.close().unwrap();
+
+    let (command, commands) = mpsc::channel();
+    let (entered, waiting) = mpsc::channel();
+    let (release, blocked) = mpsc::channel();
+    let status = Arc::new(std::sync::Mutex::new(Status::default()));
+    let sessions = Arc::new(arc_swap::ArcSwapOption::empty());
+    let replica = Replica { command, activity_serial: 0.into(), status: status.clone(), peer: sessions.clone() };
+    replica.command.send(crate::Command::BeforePreparation(Box::new(move |_| {
+        entered.send(()).unwrap();
+        let _ = blocked.recv_timeout(Duration::from_secs(10));
+    }))).unwrap();
+    let mut model = Model::new(ModelSource::Error(String::new()));
+    model.activity_serial = replica.set_active(true);
+    model.replica = Some(replica);
+    model.set_screen(Screen::Sync);
+    let root = dir.path().to_owned();
+    let worker = std::thread::Builder::new().stack_size(crate::WORKER_STACK_BYTES)
+        .spawn(move || crate::worker(root, commands, status, sessions)).unwrap();
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    model.tick();
+    let cut = model.status.replay_progress.unwrap();
+    assert_eq!(cut.prefix_bytes, cut.observed_bytes);
+    assert!(cut.prefix_bytes > 0);
+    assert_eq!(model.phase(), format!("Preparing local collections · {} read", bytes(cut.prefix_bytes)));
+    assert!(!model.accepts_intent() && !model.can_choose());
+    assert!(model.peer_observation().is_none());
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while model.phase() != "Listening" {
+        assert!(Instant::now() < deadline);
+        model.tick();
+        std::thread::yield_now();
+    }
+    assert!(model.can_choose());
+    drop(model);
+    worker.join().unwrap();
+}
+
+#[test]
 fn sync_reads_the_peer_while_the_status_writer_and_first_durable_turn_are_blocked() {
     let dir = tempfile::tempdir().unwrap();
     let (key, mut pile) = open_local(dir.path()).unwrap();

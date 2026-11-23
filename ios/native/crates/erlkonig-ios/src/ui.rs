@@ -488,9 +488,9 @@ impl Phone {
                 .map(|(t, f)| {
                     format!(
                         "iPhone     {} of {} used\n{} available",
-                        cells::bytes(t - f),
-                        cells::bytes(t),
-                        cells::bytes(f)
+                        model::bytes(t - f),
+                        model::bytes(t),
+                        model::bytes(f)
                     )
                 })
                 .unwrap_or_else(|| "iPhone     Capacity unavailable".into());

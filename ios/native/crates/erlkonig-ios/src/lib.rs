@@ -251,6 +251,8 @@ enum Command {
     BeforeForeground(Box<dyn FnOnce(&Pile, &Arc<Mutex<Status>>) + Send>),
     #[cfg(test)]
     BeforeFirstPeerTurn(Box<dyn FnOnce(&Arc<Mutex<Status>>) + Send>),
+    #[cfg(test)]
+    BeforePreparation(Box<dyn FnOnce(&Arc<Mutex<Status>>) + Send>),
     Stop,
 }
 pub struct Replica {
@@ -448,6 +450,8 @@ fn worker_with_cleanup(
         let mut before_foreground: Option<Box<dyn FnOnce(&Pile, &Arc<Mutex<Status>>) + Send>> = None;
         #[cfg(test)]
         let mut before_peer_turn: Option<Box<dyn FnOnce(&Arc<Mutex<Status>>) + Send>> = None;
+        #[cfg(test)]
+        let mut before_preparation: Option<Box<dyn FnOnce(&Arc<Mutex<Status>>) + Send>> = None;
         let mut snapshot_requested = true;
         let mut opening_published = Instant::now();
         let mut replay_meter = ReplayMeter::default();
@@ -524,6 +528,11 @@ fn worker_with_cleanup(
                 #[cfg(test)]
                 Ok(Command::BeforeFirstPeerTurn(checkpoint)) => {
                     before_peer_turn = Some(checkpoint);
+                    continue;
+                }
+                #[cfg(test)]
+                Ok(Command::BeforePreparation(checkpoint)) => {
+                    before_preparation = Some(checkpoint);
                     continue;
                 }
                 #[cfg(test)]
@@ -671,6 +680,24 @@ fn worker_with_cleanup(
                         if complete {
                             replay_meter = ReplayMeter::default();
                         }
+                        let offer_prefix = |s: &mut Status| {
+                            if s.replay_progress.map(|old| old.prefix_bytes) != Some(progress.prefix_bytes) {
+                                s.storage = Arc::default();
+                            }
+                            s.replay_progress = Some(progress);
+                            s.offer_snapshot(&snapshot, key.verifying_key(), complete);
+                        };
+                        let reached_eof = complete && !replay_complete;
+                        if reached_eof {
+                            // The pile has reached EOF. Selection and admission checks
+                            // below must finish before actions or foreground are ready.
+                            publish(&status, |s| {
+                                offer_prefix(s);
+                                s.replay_complete = false;
+                            });
+                            #[cfg(test)]
+                            if let Some(checkpoint) = before_preparation.take() { checkpoint(&status); }
+                        }
                         let (selected, sync) = if complete {
                             let selected = selected_in(&snapshot, &key)?;
                             (selected.len(), Some(sync_progress(&snapshot, &key, &selected)?))
@@ -679,11 +706,8 @@ fn worker_with_cleanup(
                         };
                         let listening = complete && collections::listening_in(&snapshot, key.verifying_key())?;
                         publish(&status, |s| {
-                            if s.replay_progress.map(|old| old.prefix_bytes)
-                                != Some(progress.prefix_bytes) { s.storage = Arc::default(); }
-                            s.replay_progress = Some(progress);
+                            if !reached_eof { offer_prefix(s); }
                             s.sync_progress = sync;
-                            s.offer_snapshot(&snapshot, key.verifying_key(), complete);
                             if !complete { s.composition = None; }
                             s.replay_complete = complete;
                             if complete && active { s.activity_serial = requested_activity; }

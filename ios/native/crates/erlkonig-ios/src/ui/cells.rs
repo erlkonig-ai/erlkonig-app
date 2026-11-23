@@ -1,7 +1,7 @@
 use super::{
     Phone,
     art::{collection_color, other_used, rect, rgb},
-    model::{Model, Screen},
+    model::{Model, Screen, bytes},
 };
 use crate::collections::Row;
 use block2::RcBlock;
@@ -11,20 +11,6 @@ use objc2_foundation::{NSArray, NSIndexPath, NSString};
 use objc2_ui_kit::*;
 use std::ptr::NonNull;
 
-pub(super) fn bytes(n: u64) -> String {
-    let (unit, scale) = if n >= 1_000_000_000_000 {
-        ("TB", 1e12)
-    } else if n >= 1_000_000_000 {
-        ("GB", 1e9)
-    } else if n >= 1_000_000 {
-        ("MB", 1e6)
-    } else if n >= 1000 {
-        ("kB", 1e3)
-    } else {
-        return format!("{n} B");
-    };
-    format!("{:.1} {unit}", n as f64 / scale)
-}
 fn rate(v: Option<f64>) -> String {
     match v.filter(|v| v.is_finite() && *v >= 0.) {
         None => "—".into(),

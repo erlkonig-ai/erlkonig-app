@@ -49,6 +49,21 @@ struct PageRead {
     readers: Vec<(usize, CollectionPages)>,
 }
 
+pub(super) fn bytes(n: u64) -> String {
+    let (unit, scale) = if n >= 1_000_000_000_000 {
+        ("TB", 1e12)
+    } else if n >= 1_000_000_000 {
+        ("GB", 1e9)
+    } else if n >= 1_000_000 {
+        ("MB", 1e6)
+    } else if n >= 1000 {
+        ("kB", 1e3)
+    } else {
+        return format!("{n} B");
+    };
+    format!("{:.1} {unit}", n as f64 / scale)
+}
+
 pub(super) struct Model {
     pub status: Status,
     replica: Option<Replica>,
@@ -771,12 +786,13 @@ impl Model {
             self.table_epoch += 1;
         }
     }
+    fn current_replay(&self) -> Option<crate::ReplayProgress> {
+        self.status.replay_progress
+            .filter(|r| self.visual() || r.activity_serial == self.activity_serial)
+    }
     pub fn replaying(&self) -> bool {
         !self.status.replay_complete
-            || self
-                .status
-                .replay_progress
-                .is_some_and(|r| r.prefix_bytes < r.observed_bytes)
+            || self.current_replay().is_some_and(|r| r.prefix_bytes < r.observed_bytes)
     }
     pub fn progress(&self) -> Option<(u64, u64)> {
         let s = &self.status;
@@ -784,9 +800,7 @@ impl Model {
             return None;
         }
         if self.replaying() {
-            return s
-                .replay_progress
-                .map(|p| (p.prefix_bytes, p.observed_bytes));
+            return self.current_replay().map(|p| (p.prefix_bytes, p.observed_bytes));
         }
         s.sync_progress
             .filter(|p| p.unknown_roots == 0 && p.direct_present < p.records)
@@ -823,9 +837,7 @@ impl Model {
                 format!("{count} · observed over 5 s ago")
             };
         }
-        let replay = s
-            .replay_progress
-            .filter(|r| self.visual() || r.activity_serial == self.activity_serial);
+        let replay = self.current_replay();
         if !self.acknowledged() && replay.is_none() {
             return if s.replay_complete {
                 "Resuming"
@@ -835,22 +847,26 @@ impl Model {
             .into();
         }
         if !s.ready || !s.replay_complete {
-            if let Some(r) = replay.and_then(|r| r.records_per_second) {
-                return if r.measured_at.elapsed() > Duration::from_secs(5) {
-                    format!(
-                        "Reading local data · last {} local pile records/s · waiting for an update",
-                        r.records_per_second
-                    )
-                } else {
-                    format!(
-                        "Reading local data · {} local pile records/s",
-                        r.records_per_second
-                    )
-                };
+            let Some(progress) = replay else { return "Reading local data".into(); };
+            if s.list_snapshot.as_ref().is_some_and(|view| view.complete) {
+                return format!("Preparing local collections · {} read", bytes(progress.prefix_bytes));
             }
-            return "Reading local data".into();
+            let prefix = bytes(progress.prefix_bytes);
+            let total = bytes(progress.observed_bytes);
+            let mut heading = format!("Reading local data · {prefix} of {total}");
+            if prefix == total && progress.prefix_bytes < progress.observed_bytes {
+                heading.push_str(&format!(" · {} left", bytes(progress.observed_bytes - progress.prefix_bytes)));
+            }
+            if let Some(rate) = progress.records_per_second {
+                let age = rate.measured_at.elapsed();
+                heading.push_str(&format!("\n{} local pile records/s", rate.records_per_second));
+                if age > Duration::from_secs(5) {
+                    heading.push_str(&format!(" · measured {} s ago", age.as_secs()));
+                }
+            }
+            return heading;
         }
-        if s.running && (s.listening || s.selected > 0) {
+        if !self.local_only && (s.listening || s.selected > 0) {
             "Starting network"
         } else if s.running {
             "Network idle"
