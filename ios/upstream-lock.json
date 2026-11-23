@@ -4,7 +4,7 @@
     "url": "https://codeload.github.com/erlkonig-ai/triblespace/tar.gz/3555fa7192cdc6ba25e2eb093ff74c52273b3215",
     "archive_sha256": "29c5621755bfa073d59e35b47155911478691ab2e19eee20cad1146ddfad8f7e",
     "patch": "triblespace-mobile.patch",
-    "tree_sha256": "104fcbd2f90aedcee2e2889c6cf1cf87b8f4c78f421e38266dfb9cce8920639a"
+    "tree_sha256": "f147852fc33d6329b580df62c14a53add00e244abc5a1bf0a6f3dfa90108f15e"
   },
   {
     "name": "jerky",

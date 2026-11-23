@@ -1,10 +1,13 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
  
  ## [Unreleased]
  
++- Passive peer health reports incoming collection-sync body bytes per second.
++  Exact-blob transfers made without a collection are accounted separately.
++
 +- A peer can hand out a passive health reader. Both it and `Peer::health()`
 +  return the current immutable observation without taking the producer lock.
 +- Per-peer traffic rates average observed upload and download over ten seconds,
@@ -2312,7 +2315,14 @@ diff --git a/triblespace-net/src/collection_delta.rs b/triblespace-net/src/colle
 diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.rs
 --- a/triblespace-net/src/connection.rs
 +++ b/triblespace-net/src/connection.rs
-@@ -272,6 +272,8 @@ struct Shared<T: Transport, S> {
+@@ -266,12 +266,15 @@ struct Shared<T: Transport, S> {
+     sequence: AtomicU64,
+     next_id: AtomicU64,
+     table: Mutex<Table<T::Conn>>,
++    payload: Mutex<crate::health::PayloadWindow>,
+     /// The walks task, once it runs: it takes the `walk/1` streams peers
+     /// open.
+     walks: OnceLock<WalksHandle>,
  }
  
  struct Table<C> {
@@ -2321,7 +2331,7 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
      /// Every live connection, by local id.
      connections: HashMap<u64, Entry<C>>,
      /// The connection each peer's streams are opened on.
-@@ -527,6 +529,9 @@ impl<C: Conn> Conn for Connection<C> {
+@@ -527,6 +530,9 @@ impl<C: Conn> Conn for Connection<C> {
          self.conn.remote_id()
      }
  
@@ -2331,7 +2341,15 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
      async fn open_bi(&self) -> anyhow::Result<(Self::SendHalf, Self::RecvHalf)> {
          let state = self.state();
          let permit = state
-@@ -665,6 +670,7 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
+@@ -658,6 +664,7 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
+         let now = crate::clock::epoch_now().to_duration_since_j1900();
+         Self {
+             shared: Arc::new(Shared {
++                payload: Mutex::new(crate::health::PayloadWindow::new(crate::clock::mono_now())),
+                 transport,
+                 service,
+                 requests: Arc::new(Semaphore::new(MAX_REQUESTS_GLOBAL)),
+@@ -665,6 +672,7 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
                  sequence: AtomicU64::new(now.total_nanoseconds() as u64),
                  next_id: AtomicU64::new(0),
                  table: Mutex::new(Table {
@@ -2339,7 +2357,7 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
                      connections: HashMap::new(),
                      current: HashMap::new(),
                      dials: HashMap::new(),
-@@ -689,6 +695,50 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
+@@ -689,6 +697,58 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
          self.shared.table.lock().unwrap().current(peer)
      }
  
@@ -2387,10 +2405,18 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
 +        (now, ranked, table.traffic.rates(now))
 +    }
 +
++    pub(crate) fn note_payload(&self, collection: Option<triblespace_core::collection::CollectionHandle>, bytes: usize) {
++        self.shared.payload.lock().unwrap().receive(crate::clock::mono_now(), collection, bytes);
++    }
++
++    pub(crate) fn observed_payload(&self) -> crate::health::ReceivedPayload {
++        self.shared.payload.lock().unwrap().sample(crate::clock::mono_now())
++    }
++
      /// Whether `peer` has a connection streams can be opened on.
      pub(crate) fn is_connected(&self, peer: PeerId) -> bool {
          let table = self.shared.table.lock().unwrap();
-@@ -770,10 +820,9 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
+@@ -770,10 +830,9 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
              return;
          }
          let removed = self.shared.table.lock().unwrap().remove(connection.state());
@@ -2404,7 +2430,7 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
          }
      }
  }
-@@ -796,7 +845,25 @@ impl<T: Transport, S> Drop for DialWaiter<'_, T, S> {
+@@ -796,7 +855,25 @@ impl<T: Transport, S> Drop for DialWaiter<'_, T, S> {
      }
  }
  
@@ -2430,7 +2456,7 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
      fn current(&self, peer: PeerId) -> Option<Connection<C>> {
          let entry = self.connections.get(self.current.get(&peer)?)?;
          Some(Connection::new(entry.conn.clone(), entry.state.clone()))
-@@ -869,18 +936,18 @@ impl<C: Conn> Table<C> {
+@@ -869,18 +946,18 @@ impl<C: Conn> Table<C> {
          }
      }
  
@@ -2453,7 +2479,7 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
          let candidates = || {
              self.connections.values().filter(|entry| {
                  entry.state.dialled == state.dialled
-@@ -901,12 +968,20 @@ impl<C: Conn> Table<C> {
+@@ -901,12 +978,20 @@ impl<C: Conn> Table<C> {
                  )
              })?
              .clone();
@@ -2476,7 +2502,7 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
      fn state(&self, peer: PeerId, dialled: bool) -> Arc<State> {
          let id = self.next_id.fetch_add(1, Ordering::Relaxed);
          State::new(id, peer, self.transport.local_id(), dialled)
-@@ -958,8 +1033,12 @@ impl<T: Transport, S: Service> Shared<T, S> {
+@@ -958,8 +1043,12 @@ impl<T: Transport, S: Service> Shared<T, S> {
  
      /// Hold a connection and start its accept loop.
      fn register(self: &Arc<Self>, conn: T::Conn, state: Arc<State>) -> tokio::task::JoinHandle<()> {
@@ -2489,7 +2515,7 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
              table.connections.insert(
                  state.id,
                  Entry {
-@@ -974,7 +1053,8 @@ impl<T: Transport, S: Service> Shared<T, S> {
+@@ -974,7 +1063,8 @@ impl<T: Transport, S: Service> Shared<T, S> {
          };
          if let Some(evicted) = evicted {
              debug!(target: "triblespace_net::handoff", "connection limit reached; evicting the least recently used");
@@ -2499,7 +2525,7 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
          }
          let span = info_span!("connection", peer = %hex::encode(&state.peer[..4]));
          tokio::spawn(accept_loop(Arc::downgrade(self), conn, state).instrument(span))
-@@ -1044,7 +1124,10 @@ async fn accept_loop<T: Transport, S: Service>(
+@@ -1044,7 +1134,10 @@ async fn accept_loop<T: Transport, S: Service>(
      }
      state.closed.store(true, Ordering::SeqCst);
      if let Some(table) = shared.upgrade() {
@@ -2511,7 +2537,7 @@ diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.
          if state.announced.load(Ordering::SeqCst) {
              // The walks cancel this connection's exchanges, leaving a
              // replacement's walks and peer state intact.
-@@ -1411,14 +1494,93 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
+@@ -1411,14 +1504,93 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
          .map_err(|error| anyhow::anyhow!("send recon/1 frame: {error}"))
  }
  
@@ -2859,6 +2885,17 @@ diff --git a/triblespace-net/src/grants.rs b/triblespace-net/src/grants.rs
                  GrantHealth {
                      resource,
                      local: index.summary(resource),
+@@ -1836,7 +1836,9 @@ async fn fetch_blobs<T: Transport, S: Service>(
+             let Some(connection) = connections.current(*source) else {
+                 continue;
+             };
+-            let fetch = op_get_blob_with_limit(&connection, local, &handle, METADATA_BLOB_BYTES);
++            let fetch = op_get_blob_with_limit(&connection, local, &handle, METADATA_BLOB_BYTES, |bytes| {
++                connections.note_payload(None, bytes);
++            });
+             let fetched = tokio::time::timeout(FETCH_DEADLINE, fetch).await;
+             if let Ok(Ok(Some(blob))) = fetched {
+                 land(&admissions, std::iter::once(NetEvent::Blob(blob))).await;
 diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
 --- a/triblespace-net/src/health.rs
 +++ b/triblespace-net/src/health.rs
@@ -2871,7 +2908,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
  use std::time::Duration;
  
  use iroh_base::EndpointId;
-@@ -22,6 +22,12 @@ use crate::patch_repair::PatchSummary;
+@@ -22,6 +22,15 @@ use crate::patch_repair::PatchSummary;
  use crate::transport::PeerId;
  use crate::walk::WalkKind;
  
@@ -2880,11 +2917,14 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
 +mod traffic_window;
 +pub use traffic_window::PeerRate;
 +pub(crate) use traffic_window::TrafficWindow;
++mod payload;
++pub use payload::{CollectionBytes, ReceivedPayload};
++pub(crate) use payload::PayloadWindow;
 +
  /// Hard per-active-collection bound on retained pairwise runtime evidence.
  pub const MAX_HEALTH_PEERS_PER_COLLECTION: usize = 128;
  
-@@ -194,7 +200,7 @@ pub struct CollectionHealth {
+@@ -194,7 +203,7 @@ pub struct CollectionHealth {
      pub local_frontier: Option<RepairFrontier>,
      pub last_local_change_at: Option<Mono>,
      /// Recent observations only, not a roster or a list of all holders.
@@ -2893,7 +2933,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
  }
  
  /// One collection's peering with one key, on one connection, as this side
-@@ -202,6 +208,8 @@ pub struct CollectionHealth {
+@@ -202,6 +211,8 @@ pub struct CollectionHealth {
  /// can appear twice.
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
  pub struct PeeringHealth {
@@ -2902,7 +2942,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
      pub collection: CollectionHandle,
      pub peer: PeerId,
      /// This side asked for the peering: the peer is one of its asked-for
-@@ -319,6 +327,15 @@ pub enum PairState {
+@@ -319,6 +330,15 @@ pub enum PairState {
      },
  }
  
@@ -2918,7 +2958,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
  /// An immutable copy of bounded evidence recorded at actual runtime events.
  /// Sampling this value cannot keep a dead host fresh.
  #[derive(Clone, Debug, Eq, PartialEq)]
-@@ -327,22 +344,26 @@ pub struct HealthSnapshot {
+@@ -327,22 +347,28 @@ pub struct HealthSnapshot {
      pub started_at: Option<Mono>,
      /// Written only by the host loop, never by a status reader or store refresh.
      pub observed_at: Option<Mono>,
@@ -2926,6 +2966,8 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
 +    pub connections: HealthRows<32, ConnectionHealth>,
 +    /// Current and recently disconnected peers' ten-second traffic observations.
 +    pub traffic_rates: HealthRows<32, PeerRate>,
++    /// Application payload received on collection walks and exact-blob streams.
++    pub received_payload: ReceivedPayload,
      pub store: StoreHealth,
      /// Exactly the locally active interest set, including unavailable views.
 -    pub collections: Vec<CollectionHealth>,
@@ -2949,7 +2991,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
  }
  
  /// What this side holds of the grants over one resource R, and what each
-@@ -352,7 +373,7 @@ pub struct GrantHealth {
+@@ -352,7 +378,7 @@ pub struct GrantHealth {
      pub resource: CollectionHandle,
      /// Root and count of R's grants in the grant index here.
      pub local: PatchSummary,
@@ -2958,7 +3000,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
  }
  
  /// One connected peer's statement about R's grants: its standing listing,
-@@ -380,6 +401,31 @@ fn fresh(at: Option<Mono>, now: Mono, max_age: Duration) -> bool {
+@@ -380,7 +406,42 @@ fn fresh(at: Option<Mono>, now: Mono, max_age: Duration) -> bool {
      at.is_some_and(|at| at <= now && now.duration_since(at) <= max_age)
  }
  
@@ -2988,9 +3030,20 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
 +}
 +
  impl HealthSnapshot {
++    /// Incoming record and blob body bytes/s attributable to this active
++    /// collection. A running host observes zero during idle time. Before the
++    /// first complete sample, and for inactive collections, there is no rate.
++    pub fn collection_receive_bytes_per_second(&self, collection: &CollectionHandle) -> Option<f64> {
++        self.collections.get(&collection.raw)?;
++        let payload = &self.received_payload;
++        let bytes = payload.collections.get(&collection.raw).map_or(0, |r| r.bytes);
++        (payload.window_ns > 0).then(|| bytes as f64 * 1e9 / payload.window_ns as f64)
++    }
++
      pub fn is_fresh(&self, now: Mono, max_age: Duration) -> bool {
          fresh(self.observed_at, now, max_age)
-@@ -412,10 +458,7 @@ impl HealthSnapshot {
+     }
+@@ -412,10 +473,7 @@ impl HealthSnapshot {
          {
              return PairState::Unknown;
          }
@@ -3002,7 +3055,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          else {
              return PairState::Unknown;
          };
-@@ -430,10 +473,10 @@ impl HealthSnapshot {
+@@ -430,10 +488,10 @@ impl HealthSnapshot {
          if !fresh(pair.last_event_at(), now, max_age) {
              return PairState::Unknown;
          }
@@ -3015,7 +3068,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
              .and_then(|listing| listing.listed);
          let pushes = peering.sends
              && (listed.is_none()
-@@ -452,31 +495,96 @@ impl HealthSnapshot {
+@@ -452,31 +510,98 @@ impl HealthSnapshot {
      }
  }
  
@@ -3063,6 +3116,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
              observed_at: None,
 +            connections: Default::default(),
 +            traffic_rates: Default::default(),
++            received_payload: Default::default(),
              store: StoreHealth::default(),
 -            collections: Vec::new(),
 +            collections: Default::default(),
@@ -3110,6 +3164,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
 +        // only examines the snapshot's scalar fields.
 +        if !next.connections.same_root(&current.connections)
 +            || !next.traffic_rates.same_root(&current.traffic_rates)
++            || !next.received_payload.collections.same_root(&current.received_payload.collections)
 +            || !next.collections.same_root(&current.collections)
 +            || !next.peerings.same_root(&current.peerings)
 +            || !next.grants.same_root(&current.grants)
@@ -3121,7 +3176,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
      }
  
      pub(crate) fn begin_blob_serve(&self) -> BlobServeGuard {
-@@ -495,33 +603,29 @@ impl Health {
+@@ -495,33 +620,29 @@ impl Health {
          update: impl FnOnce(&mut PeerHealth),
      ) {
          self.update(|health| {
@@ -3176,7 +3231,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          });
      }
  }
-@@ -563,6 +667,9 @@ impl Drop for BlobServeGuard {
+@@ -563,6 +684,9 @@ impl Drop for BlobServeGuard {
      }
  }
  
@@ -3186,7 +3241,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
  #[cfg(test)]
  mod tests {
      use super::*;
-@@ -621,13 +728,14 @@ mod tests {
+@@ -621,13 +745,14 @@ mod tests {
              health.observed_at = Some(now);
              health.store.serving_snapshot = true;
              health.store.last_snapshot_observed_at = Some(now);
@@ -3204,7 +3259,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
                  collection,
                  peer,
                  asked: true,
-@@ -637,14 +745,14 @@ mod tests {
+@@ -637,14 +762,14 @@ mod tests {
                  refused_by_me: false,
                  refused_by_them: false,
              });
@@ -3221,7 +3276,36 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
              });
          });
          (health, collection, peer, now)
-@@ -680,8 +788,8 @@ mod tests {
+@@ -652,6 +777,28 @@ mod tests {
+ 
+     /// Both record trees of `frontier` pushed and confirmed, and receives
+     /// landed.
++    #[test]
++    fn collection_payload_is_unknown_before_observation_and_zero_for_an_idle_active_root() {
++        let (health, collection, _, _) = fixture();
++        let inactive = CollectionHandle::new([250; 32]);
++        let pending = health.snapshot();
++        assert_eq!(pending.collection_receive_bytes_per_second(&collection), None);
++        health.update(|snapshot| {
++            snapshot.received_payload.window_ns = 10_000_000_000;
++            snapshot.received_payload.unattributed_bytes = 99_000;
++        });
++        let idle = health.snapshot();
++        assert_eq!(idle.collection_receive_bytes_per_second(&collection), Some(0.0));
++        assert_eq!(idle.collection_receive_bytes_per_second(&inactive), None);
++        health.update(|snapshot| {
++            snapshot.received_payload.collections.set(&collection.raw, CollectionBytes {
++                collection, bytes: 10_000_000,
++            });
++        });
++        assert_eq!(health.snapshot().collection_receive_bytes_per_second(&collection), Some(1_000_000.0));
++        assert_eq!(idle.collection_receive_bytes_per_second(&collection), Some(0.0));
++    }
++
+     fn settle(health: &Health, collection: CollectionHandle, peer: PeerId, now: Mono) {
+         health.with_peer(collection, peer, |pair| {
+             let frontier = frontier(5, 1);
+@@ -680,8 +827,8 @@ mod tests {
                      peer,
                      listed,
                      ..Default::default()
@@ -3232,7 +3316,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          });
      }
  
-@@ -748,7 +856,7 @@ mod tests {
+@@ -748,7 +895,7 @@ mod tests {
                  receives: true
              }
          );
@@ -3241,7 +3325,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          assert_eq!(
              health.snapshot().pair(collection, peer, now, AGE),
              PairState::Behind {
-@@ -756,7 +864,7 @@ mod tests {
+@@ -756,7 +903,7 @@ mod tests {
                  receives: false
              }
          );
@@ -3250,7 +3334,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          listing(&health, collection, peer, local, Some(local));
          assert_eq!(
              health.snapshot().pair(collection, peer, now, AGE),
-@@ -767,7 +875,7 @@ mod tests {
+@@ -767,7 +914,7 @@ mod tests {
      #[test]
      fn receive_only_completion_isolated_by_foundation_kind() {
          let (health, collection, peer, now) = fixture();
@@ -3259,7 +3343,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          let f = frontier(5, 1);
          health.with_peer(collection, peer, |pair| {
              pair.received(now, WalkKind::Derive, None, false);
-@@ -791,7 +899,7 @@ mod tests {
+@@ -791,7 +938,7 @@ mod tests {
      #[test]
      fn receive_completion_freshness_and_disconnect_do_not_reuse_old_roots() {
          let (health, collection, peer, now) = fixture();
@@ -3268,7 +3352,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          settle(&health, collection, peer, now);
          let later = now + AGE + Duration::from_secs(1);
          health.update(|sample| {
-@@ -807,13 +915,13 @@ mod tests {
+@@ -807,13 +954,13 @@ mod tests {
              pair.received(later, WalkKind::Derive, Some(frontier(6, 2).derives), true);
          });
          assert_eq!(health.snapshot().pair(collection, peer, later, AGE), PairState::Current);
@@ -3287,7 +3371,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          assert_eq!(health.snapshot().pair(collection, peer, later, AGE),
              PairState::Behind { pushes: false, receives: true });
      }
-@@ -856,7 +964,7 @@ mod tests {
+@@ -856,7 +1003,7 @@ mod tests {
      fn a_direction_is_behind_until_its_last_end_settles_the_frontier() {
          let (health, collection, peer, now) = fixture();
          settle(&health, collection, peer, now);
@@ -3296,7 +3380,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          assert_eq!(
              health.snapshot().pair(collection, peer, now, AGE),
              PairState::Behind {
-@@ -883,7 +991,7 @@ mod tests {
+@@ -883,7 +1030,7 @@ mod tests {
                  receives: true
              }
          );
@@ -3305,7 +3389,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          assert_eq!((pair.pushes.ok, pair.pushes.failed), (3, 1));
          assert_eq!((pair.receives.ok, pair.receives.failed), (2, 1));
          assert_eq!(pair.confirmed.commits, Some(frontier(6, 2).commits));
-@@ -892,14 +1000,14 @@ mod tests {
+@@ -892,14 +1039,14 @@ mod tests {
  
          // A direction the peering does not have is never behind.
          health.update(|health| {
@@ -3323,7 +3407,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          assert_eq!(
              health.snapshot().pair(collection, peer, now, AGE),
              PairState::Unknown
-@@ -911,7 +1019,7 @@ mod tests {
+@@ -911,7 +1058,7 @@ mod tests {
          let (health, collection, peer, now) = fixture();
          settle(&health, collection, peer, now);
          health.update(|health| {
@@ -3332,7 +3416,7 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
              health.store.serving_snapshot = false;
          });
          let snapshot = health.snapshot();
-@@ -954,10 +1062,10 @@ mod tests {
+@@ -954,10 +1101,10 @@ mod tests {
              });
          }
          assert_eq!(
@@ -3345,6 +3429,160 @@ diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
          health.with_peer(collection, [8; 32], |_| {
              panic!("retired observation recreated")
          });
+diff --git a/triblespace-net/src/health/payload.rs b/triblespace-net/src/health/payload.rs
+new file mode 100644
+--- /dev/null
++++ b/triblespace-net/src/health/payload.rs
+@@ -0,0 +1,149 @@
++use std::collections::VecDeque;
++
++use super::traffic_window::{BIN, WINDOW};
++use super::{CollectionHandle, HealthRows, Mono, RowKey};
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct CollectionBytes {
++    pub collection: CollectionHandle,
++    pub bytes: u128,
++}
++
++impl RowKey<32> for CollectionBytes {
++    fn row_key(&self) -> [u8; 32] {
++        self.collection.raw
++    }
++}
++
++/// Incoming body bytes over the latest completed 100 ms boundary, up to ten
++/// seconds. Blobs requested by bare hash have no collection attribution.
++#[derive(Clone, Debug, Default, Eq, PartialEq)]
++pub struct ReceivedPayload {
++    pub window_ns: u64,
++    pub collections: HealthRows<32, CollectionBytes>,
++    pub unattributed_bytes: u128,
++}
++
++impl ReceivedPayload {
++    fn adjust(&mut self, collection: Option<CollectionHandle>, bytes: u128, add: bool) {
++        let change = |old| if add { old + bytes } else { old - bytes };
++        if let Some(collection) = collection {
++            let bytes = change(self.collections.get(&collection.raw).map_or(0, |r| r.bytes));
++            if bytes == 0 {
++                self.collections.remove(&collection.raw);
++            } else {
++                self.collections
++                    .set(&collection.raw, CollectionBytes { collection, bytes });
++            }
++        } else {
++            self.unattributed_bytes = change(self.unattributed_bytes);
++        }
++    }
++
++    fn apply(&mut self, bin: &ReceivedPayload, add: bool) {
++        for row in &bin.collections {
++            self.adjust(Some(row.collection), row.bytes, add);
++        }
++        self.adjust(None, bin.unattributed_bytes, add);
++    }
++}
++
++/// Only occupied bins are retained. A burst is added and expired once. The
++/// host's ordinary polls between boundaries only clone the published roots.
++pub(crate) struct PayloadWindow {
++    origin: Mono,
++    pending: Option<(u64, ReceivedPayload)>,
++    complete: VecDeque<(u64, ReceivedPayload)>,
++    sum: ReceivedPayload,
++}
++
++impl PayloadWindow {
++    pub(crate) fn new(origin: Mono) -> Self {
++        Self {
++            origin,
++            pending: None,
++            complete: VecDeque::new(),
++            sum: ReceivedPayload::default(),
++        }
++    }
++
++    fn advance(&mut self, now: Mono) -> u64 {
++        let elapsed = now
++            .duration_since(self.origin)
++            .as_nanos()
++            .min(u64::MAX as u128) as u64;
++        let end = elapsed / BIN * BIN;
++        let lower = end.saturating_sub(WINDOW);
++        while self.complete.front().is_some_and(|(at, _)| *at <= lower) {
++            let (_, expired) = self.complete.pop_front().unwrap();
++            self.sum.apply(&expired, false);
++        }
++        if self.pending.as_ref().is_some_and(|(at, _)| *at <= end) {
++            let (at, pending) = self.pending.take().unwrap();
++            if at > lower {
++                self.sum.apply(&pending, true);
++                self.complete.push_back((at, pending));
++            }
++        }
++        self.sum.window_ns = end.min(WINDOW);
++        end
++    }
++
++    pub(crate) fn receive(
++        &mut self,
++        now: Mono,
++        collection: Option<CollectionHandle>,
++        bytes: usize,
++    ) {
++        if bytes == 0 {
++            return;
++        }
++        let end = self.advance(now);
++        let (_, bin) = self
++            .pending
++            .get_or_insert_with(|| (end.saturating_add(BIN), ReceivedPayload::default()));
++        bin.adjust(collection, bytes as u128, true);
++    }
++
++    pub(crate) fn sample(&mut self, now: Mono) -> ReceivedPayload {
++        self.advance(now);
++        self.sum.clone()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::Duration;
++
++    #[test]
++    fn sparse_sources_share_the_elapsed_window_and_expire_independently() {
++        let origin = crate::clock::mono_now();
++        let t = |ms| origin + Duration::from_millis(ms);
++        let mut window = PayloadWindow::new(origin);
++        let a = CollectionHandle::new([1; 32]);
++        let b = CollectionHandle::new([2; 32]);
++        window.receive(t(2), Some(a), 4_000_000);
++        window.receive(t(40), Some(a), 6_000_000);
++        window.receive(t(50), None, 24);
++        assert_eq!(window.sample(t(99)).window_ns, 0);
++        let first = window.sample(t(100));
++        assert_eq!(first.window_ns, 100_000_000);
++        assert_eq!(first.collections.get(&a.raw).unwrap().bytes, 10_000_000);
++        window.receive(t(5600), Some(b), 33);
++        let ten = window.sample(t(10_000));
++        assert_eq!(ten.window_ns, WINDOW);
++        assert_eq!(ten.collections.get(&a.raw).unwrap().bytes, 10_000_000);
++        assert_eq!(ten.unattributed_bytes, 24);
++        assert!(
++            ten.collections
++                .same_root(&window.sample(t(10_050)).collections)
++        );
++        let next = window.sample(t(10_100));
++        assert!(next.collections.get(&a.raw).is_none());
++        assert_eq!(next.unattributed_bytes, 0);
++        assert_eq!(next.collections.get(&b.raw).unwrap().bytes, 33);
++        assert!(first.collections.get(&b.raw).is_none());
++        assert!(window.sample(t(30_000)).collections.is_empty());
++    }
++}
 diff --git a/triblespace-net/src/health/publication_tests.rs b/triblespace-net/src/health/publication_tests.rs
 new file mode 100644
 --- /dev/null
@@ -3801,8 +4039,8 @@ new file mode 100644
 +use std::collections::VecDeque;
 +use triblespace_core::patch::{Entry, IdentitySchema, PATCH};
 +
-+const WINDOW: u64 = 10_000_000_000;
-+const BIN: u64 = 100_000_000;
++pub(super) const WINDOW: u64 = 10_000_000_000;
++pub(super) const BIN: u64 = 100_000_000;
 +
 +/// Bytes observed over the elapsed portion of a ten-second wall-time window.
 +/// Once ten seconds are available, observations use the latest completed
@@ -4214,12 +4452,13 @@ new file mode 100644
 diff --git a/triblespace-net/src/health_record.rs b/triblespace-net/src/health_record.rs
 --- a/triblespace-net/src/health_record.rs
 +++ b/triblespace-net/src/health_record.rs
-@@ -548,17 +548,19 @@ mod tests {
+@@ -548,17 +548,20 @@ mod tests {
              node: iroh_base::SecretKey::from_bytes(&[5; 32]).public().into(),
              started_at: Some(at),
              observed_at: Some(at),
 +            connections: Default::default(),
 +            traffic_rates: Default::default(),
++            received_payload: Default::default(),
              store: crate::health::StoreHealth {
                  last_snapshot_observed_at: Some(at),
                  serving_snapshot: true,
@@ -4238,7 +4477,7 @@ diff --git a/triblespace-net/src/health_record.rs b/triblespace-net/src/health_r
          }
      }
  
-@@ -612,13 +614,14 @@ mod tests {
+@@ -612,13 +615,14 @@ mod tests {
              commits: PatchSummary::new(Some([5; 32]), 10).unwrap(),
              derives: PatchSummary::new(None, 0).unwrap(),
          };
@@ -4256,7 +4495,7 @@ diff --git a/triblespace-net/src/health_record.rs b/triblespace-net/src/health_r
              collection,
              peer: remote_key,
              asked: true,
-@@ -630,14 +633,14 @@ mod tests {
+@@ -630,14 +634,14 @@ mod tests {
          });
          // Both sides hold the same two grants over C.
          let agreed = PatchSummary::new(Some([6; 32]), 2).unwrap();
@@ -4273,7 +4512,7 @@ diff --git a/triblespace-net/src/health_record.rs b/triblespace-net/src/health_r
          });
          let health = Health::new(sample.node);
          health.update(|value| *value = sample);
-@@ -683,7 +686,7 @@ mod tests {
+@@ -683,7 +687,7 @@ mod tests {
              pair.received(at, WalkKind::Commit, None, true);
              pair.pushed(now, WalkKind::Commit, frontier.commits, false);
          });
@@ -4282,7 +4521,7 @@ diff --git a/triblespace-net/src/health_record.rs b/triblespace-net/src/health_r
          let condition = collection_condition(&health, now);
          assert_eq!(condition.state, State::Stalled);
          assert!(condition.alert);
-@@ -734,8 +737,8 @@ mod tests {
+@@ -734,8 +738,8 @@ mod tests {
              health.update(|sample| {
                  sample.observed_at = Some(now);
                  sample.store.last_snapshot_observed_at = Some(now);
@@ -4293,7 +4532,7 @@ diff --git a/triblespace-net/src/health_record.rs b/triblespace-net/src/health_r
              });
              // The push that ends now pinned the tree before this write.
              health.with_peer(collection, remote_key, |pair| {
-@@ -827,8 +830,8 @@ mod tests {
+@@ -827,8 +831,8 @@ mod tests {
                      peer: remote_key,
                      listed: Some(listed),
                      ..Default::default()
@@ -4409,19 +4648,32 @@ diff --git a/triblespace-net/src/host.rs b/triblespace-net/src/host.rs
      tokio::spawn(async move {
          while let Some(accepted) = incoming.recv().await {
              debug!(
-@@ -1490,8 +1488,11 @@ async fn host_loop<T: Transport, R>(
+@@ -1490,8 +1488,13 @@ async fn host_loop<T: Transport, R>(
          }
  
          let progress = publisher.progress();
 +        let (observed_at, connections, traffic_rates) = observed_connections.observe_traffic();
++        let payload = observed_connections.observed_payload();
          wiring.health.update(|health| {
 -            health.observed_at = Some(crate::clock::mono_now());
 +            health.connections.reconcile(connections);
 +            health.traffic_rates = traffic_rates;
++            health.received_payload = payload;
 +            health.observed_at = Some(observed_at);
              let publication = &mut health.publication;
              publication.resident = progress.resident;
              publication.startup_pending = progress.startup_pending;
+@@ -1713,7 +1716,9 @@ where
+         let connection = self.connections.connect(peer).await?;
+         let response = tokio::time::timeout(
+             OP_DEADLINE,
+-            op_get_blob_with_limit(&connection, self.my_id, &hash, max_bytes),
++            op_get_blob_with_limit(&connection, self.my_id, &hash, max_bytes, |bytes| {
++                self.connections.note_payload(None, bytes);
++            }),
+         )
+         .await
+         .map_err(|_| anyhow::anyhow!("exact blob provider request deadline exceeded"))?;
 diff --git a/triblespace-net/src/host/acquisition_tests/exact_h_diagnostics.rs b/triblespace-net/src/host/acquisition_tests/exact_h_diagnostics.rs
 --- a/triblespace-net/src/host/acquisition_tests/exact_h_diagnostics.rs
 +++ b/triblespace-net/src/host/acquisition_tests/exact_h_diagnostics.rs
@@ -4696,6 +4948,118 @@ diff --git a/triblespace-net/src/peering.rs b/triblespace-net/src/peering.rs
              }
  
              fn peered(&self, collection: CollectionHandle) -> bool {
+diff --git a/triblespace-net/src/protocol.rs b/triblespace-net/src/protocol.rs
+--- a/triblespace-net/src/protocol.rs
++++ b/triblespace-net/src/protocol.rs
+@@ -274,7 +274,7 @@ pub async fn op_get_blob<C: Conn>(
+     requester: PeerId,
+     hash: &RawHash,
+ ) -> Result<Option<Blob<UnknownBlob>>> {
+-    op_get_blob_with_limit(conn, requester, hash, MAX_EXACT_BLOB_BYTES).await
++    op_get_blob_with_limit(conn, requester, hash, MAX_EXACT_BLOB_BYTES, |_| {}).await
+ }
+ 
+ /// A local acquisition-policy limit, checked before receiving the body. It
+@@ -284,6 +284,7 @@ pub(crate) async fn op_get_blob_with_limit<C: Conn>(
+     requester: PeerId,
+     hash: &RawHash,
+     max_bytes: u64,
++    received: impl FnMut(usize),
+ ) -> Result<Option<Blob<UnknownBlob>>> {
+     let provider = conn.remote_id();
+     let (mut send, mut recv) = conn
+@@ -291,7 +292,7 @@ pub(crate) async fn op_get_blob_with_limit<C: Conn>(
+         .await
+         .map_err(|error| anyhow!("open_bi: {error}"))?;
+     send_u8(&mut send, TAG_BLOB).await?;
+-    fetch_get_blob_stream_with_limit(&mut send, &mut recv, requester, provider, hash, max_bytes)
++    fetch_get_blob_stream_with_limit(&mut send, &mut recv, requester, provider, hash, max_bytes, received)
+         .await
+ }
+ 
+@@ -307,7 +308,7 @@ where
+     W: AsyncWrite + Unpin,
+     R: AsyncRead + Unpin,
+ {
+-    fetch_get_blob_stream_with_limit(send, recv, requester, provider, hash, MAX_EXACT_BLOB_BYTES)
++    fetch_get_blob_stream_with_limit(send, recv, requester, provider, hash, MAX_EXACT_BLOB_BYTES, |_| {})
+         .await
+ }
+ 
+@@ -318,6 +319,7 @@ pub(crate) async fn fetch_get_blob_stream_with_limit<W, R>(
+     provider: PeerId,
+     hash: &RawHash,
+     max_bytes: u64,
++    received: impl FnMut(usize),
+ ) -> Result<Option<Blob<UnknownBlob>>>
+ where
+     W: AsyncWrite + Unpin,
+@@ -346,7 +348,7 @@ where
+     send.shutdown()
+         .await
+         .map_err(|error| anyhow!("finish: {error}"))?;
+-    let Some(bytes) = recv_blob_response_with_limit(recv, max_bytes).await? else {
++    let Some(bytes) = recv_blob_response_with_limit(recv, max_bytes, received).await? else {
+         return Ok(None);
+     };
+     // Hash once at ingress, then carry Blob's cached handle through local
+@@ -553,12 +555,13 @@ async fn require_request_eof<R: AsyncRead + Unpin>(recv: &mut R) -> Result<()> {
+ 
+ #[cfg(test)]
+ async fn recv_blob_response<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Option<Bytes>> {
+-    recv_blob_response_with_limit(recv, MAX_EXACT_BLOB_BYTES).await
++    recv_blob_response_with_limit(recv, MAX_EXACT_BLOB_BYTES, |_| {}).await
+ }
+ 
+ async fn recv_blob_response_with_limit<R: AsyncRead + Unpin>(
+     recv: &mut R,
+     max_bytes: u64,
++    received: impl FnMut(usize),
+ ) -> Result<Option<Bytes>> {
+     let len = recv_u64_be(recv).await?;
+     if len == u64::MAX {
+@@ -572,14 +575,20 @@ async fn recv_blob_response_with_limit<R: AsyncRead + Unpin>(
+     }
+     let len = usize::try_from(len)
+         .map_err(|_| anyhow!("blob response length does not fit this address space"))?;
+-    let data = recv_exact_blob_body(recv, len).await?;
++    let data = receive_blob_body(recv, len, received).await?;
+     require_response_eof(recv).await?;
+     Ok(Some(data))
+ }
+ 
+-pub(crate) async fn recv_exact_blob_body<R: AsyncRead + Unpin>(
++#[cfg(test)]
++pub(crate) async fn recv_exact_blob_body<R: AsyncRead + Unpin>(recv: &mut R, len: usize) -> Result<Bytes> {
++    receive_blob_body(recv, len, |_| {}).await
++}
++
++async fn receive_blob_body<R: AsyncRead + Unpin>(
+     recv: &mut R,
+     len: usize,
++    mut received: impl FnMut(usize),
+ ) -> Result<Bytes> {
+     if len as u64 > MAX_EXACT_BLOB_BYTES {
+         return Err(anyhow!(
+@@ -652,6 +661,9 @@ pub(crate) async fn recv_exact_blob_body<R: AsyncRead + Unpin>(
+             Poll::Ready(Ok(chunk.len()))
+         })
+         .await?;
++        // Staged body bytes, outside the shared scratch lock. Later failure
++        // does not undo a transfer that actually took place.
++        received(take);
+         remaining -= take;
+         if remaining != 0 {
+             // Bound each ready-reader turn to one chunk and give cancellation
+@@ -1208,7 +1220,7 @@ mod tests {
+         let mut limited = response.as_slice();
+         let mut ordinary = response.as_slice();
+         let (rejected, exact) = tokio::join!(
+-            recv_blob_response_with_limit(&mut limited, crate::host::METADATA_BLOB_BYTES),
++            recv_blob_response_with_limit(&mut limited, crate::host::METADATA_BLOB_BYTES, |_| {}),
+             recv_blob_response(&mut ordinary),
+         );
+         assert!(rejected.is_err());
 diff --git a/triblespace-net/src/provider/btree_directory.rs b/triblespace-net/src/provider/btree_directory.rs
 --- a/triblespace-net/src/provider/btree_directory.rs
 +++ b/triblespace-net/src/provider/btree_directory.rs
@@ -6201,7 +6565,59 @@ diff --git a/triblespace-net/src/walk.rs b/triblespace-net/src/walk.rs
                  }
              }
          });
-@@ -2469,11 +2471,11 @@ pub(crate) mod tests {
+@@ -1494,6 +1496,7 @@ where
+ async fn fetch_blob<T: Transport, S: Service>(
+     connections: ConnectionTable<T, S>,
+     peer: PeerId,
++    collection: CollectionHandle,
+     handle: RawHash,
+ ) -> Option<Blob<UnknownBlob>> {
+     let connection = connections.current(peer)?;
+@@ -1509,6 +1512,7 @@ async fn fetch_blob<T: Transport, S: Service>(
+         provider,
+         &handle,
+         MAX_EXACT_BLOB_BYTES,
++        |bytes| connections.note_payload(Some(collection), bytes),
+     )
+         .await
+         .ok()
+@@ -1620,6 +1624,16 @@ impl<T: Transport, S, R> Driver<T, S, R> {
+     }
+ }
+ 
++impl<T: Transport, S: Service, R> Driver<T, S, R> {
++    fn note_record_payload(&self, frame: &Frame) {
++        if matches!(self.kind, WalkKind::Commit | WalkKind::Derive)
++            && let Frame::Value { bytes, .. } = frame
++        {
++            self.connections.note_payload(Some(self.collection), bytes.len());
++        }
++    }
++}
++
+ /// A blob fetch's result, as a driver hears it.
+ type Fetched = (RawHash, Option<Blob<UnknownBlob>>);
+ 
+@@ -1729,6 +1743,7 @@ where
+                     // the next publish wait, and every reader queued behind
+                     // that writer blocked its worker thread.
+                     let snapshot = driver.snapshots.borrow().clone();
++                    driver.note_record_payload(&frame);
+                     exchange.on_frame(frame, snapshot)
+                 }
+                 Some(Err(code)) => {
+@@ -1768,8 +1783,9 @@ where
+                     let connections = driver.connections.clone();
+                     let fetches = fetches.clone();
+                     let peer = driver.peer;
++                    let collection = driver.collection;
+                     tokio::spawn(async move {
+-                        let blob = fetch_blob(connections, peer, handle).await;
++                        let blob = fetch_blob(connections, peer, collection, handle).await;
+                         let _ = fetches.send((handle, blob));
+                     });
+                 }
+@@ -2469,11 +2485,11 @@ pub(crate) mod tests {
                  self.active.insert(&PatchEntry::new(&collection.raw));
                  self.select(collection, true);
                  self.health.update(|health| {
@@ -6215,7 +6631,7 @@ diff --git a/triblespace-net/src/walk.rs b/triblespace-net/src/walk.rs
                      })
                  });
                  self.observe();
-@@ -2712,7 +2714,8 @@ pub(crate) mod tests {
+@@ -2712,7 +2728,8 @@ pub(crate) mod tests {
          assert!(node.walks.sends(peer, &pinned, reader));
          assert!(node.walks.receives(peer, &pinned, reader));
          node.health.update(|health| {
@@ -6225,7 +6641,7 @@ diff --git a/triblespace-net/src/walk.rs b/triblespace-net/src/walk.rs
                  collection,
                  peer,
                  asked: false,
-@@ -2726,8 +2729,8 @@ pub(crate) mod tests {
+@@ -2726,8 +2743,8 @@ pub(crate) mod tests {
          assert!(!node.walks.sends(peer, &pinned, reader));
          assert!(node.walks.receives(peer, &pinned, reader));
          node.health.update(|health| {
@@ -6236,3 +6652,109 @@ diff --git a/triblespace-net/src/walk.rs b/triblespace-net/src/walk.rs
          });
          assert!(node.walks.sends(peer, &pinned, reader));
          assert!(!node.walks.receives(peer, &pinned, reader));
+@@ -4838,6 +4855,36 @@ pub(crate) mod tests {
+             (send, recv, async move { reset(&reset_code).await })
+         }
+ 
++        #[tokio::test(start_paused = true)]
++        async fn full_walk_meters_the_transferred_body_once_and_skips_a_resident_reference() {
++            let net = SimNet::new(0x3A26, SimConfig::default());
++            let (sender, collection, root, handles, mut node) =
++                holding(&net, (70, 71), &[7, 8], Duration::ZERO, 1 << 18);
++            // The same immutable body is already present from a different
++            // source, but its membership in this collection is still missing.
++            let shared = Blob::<UnknownBlob>::new(Bytes::from_source(vec![8u8; 1 << 20]));
++            assert_eq!(shared.get_handle().raw, handles[1]);
++            node.insert(vec![NetEvent::Blob(shared)]);
++            node.observe();
++            let receiver = Hosted::new(node, &net);
++            let _connection = sender.table.connect(receiver.peer).await.unwrap();
++            let health = sender.exchange(receiver.peer, collection, WalkKind::References).await;
++            assert!(health.pushes.last_ok, "{health:?}");
++            assert!(holds(&receiver.lander.node.lock().unwrap(), collection, root, &handles));
++            // Health uses the host's monotonic clock, independent of paused
++            // Tokio time. Wait just until the staged bytes have been published.
++            let deadline = std::time::Instant::now() + Duration::from_secs(2);
++            loop {
++                let payload = receiver.table.observed_payload();
++                if payload.collections.get(&collection.raw).is_some_and(|row| row.bytes == 1 << 20) {
++                    assert_eq!(payload.unattributed_bytes, 0);
++                    break;
++                }
++                assert!(std::time::Instant::now() < deadline, "{payload:?}");
++                std::thread::sleep(Duration::from_millis(5));
++            }
++        }
++
+         /// A references exchange whose one held blob takes longer than the
+         /// walk deadline to transfer still lands: the fetch is held to
+         /// progress between chunks, not to a deadline for the whole blob,
+diff --git a/triblespace-net/src/walk_cached.rs b/triblespace-net/src/walk_cached.rs
+--- a/triblespace-net/src/walk_cached.rs
++++ b/triblespace-net/src/walk_cached.rs
+@@ -121,6 +121,7 @@ where
+                     heard_at = tokio::time::Instant::now();
+                     // The guard drops here, not after on_frame: see walk.rs.
+                     let snapshot = driver.snapshots.borrow().clone();
++                    driver.note_record_payload(&frame);
+                     exchange.on_frame(frame, snapshot)
+                 }
+                 Ok(Some(Ok(None))) => {
+@@ -197,8 +198,9 @@ where
+                     let connections = driver.connections.clone();
+                     let fetches = fetches.clone();
+                     let peer = driver.peer;
++                    let collection = driver.collection;
+                     tokio::spawn(async move {
+-                        let blob = fetch_blob(connections, peer, handle).await;
++                        let blob = fetch_blob(connections, peer, collection, handle).await;
+                         let _ = fetches.send((handle, blob));
+                     });
+                 }
+diff --git a/triblespace-net/tests/sim_collection_host.rs b/triblespace-net/tests/sim_collection_host.rs
+--- a/triblespace-net/tests/sim_collection_host.rs
++++ b/triblespace-net/tests/sim_collection_host.rs
+@@ -338,7 +338,7 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
+                 .unwrap()
+         );
+         // The recipient sees it was granted C, which it does not sync yet.
+-        assert_eq!(recipient.health().named_unselected, [collection.handle()]);
++        assert!(recipient.health().named_unselected.iter().copied().eq([collection.handle()]));
+         // Selecting C makes the recipient ask the issuer, a key of C's grant
+         // chain, to peer for it.
+         select(&mut recipient.store(), &recipient_key, collection.handle());
+diff --git a/triblespace-net/tests/sim_grant_gossip.rs b/triblespace-net/tests/sim_grant_gossip.rs
+--- a/triblespace-net/tests/sim_grant_gossip.rs
++++ b/triblespace-net/tests/sim_grant_gossip.rs
+@@ -386,8 +386,9 @@ fn grant_peer(
+ ) -> Option<GrantPeerHealth> {
+     grant_health(peer, resource)?
+         .peers
+-        .into_iter()
++        .iter()
+         .find(|listing| listing.peer == other)
++        .cloned()
+ }
+ 
+ /// The test's delivery definition, as Secrets binds one: an action and a
+@@ -1761,7 +1762,7 @@ fn a_new_grantee_behind_a_full_neighbour_set_receives_its_grant() {
+                 &mut hosts.iter_mut().collect::<Vec<_>>(),
+                 30,
+                 "N sees it was granted C",
+-                |hosts| hosts.last().unwrap().health().named_unselected == [collection],
++                |hosts| hosts.last().unwrap().health().named_unselected.iter().copied().eq([collection]),
+             )
+             .await;
+             assert!(asked(&hosts[0]) >= 5, "seed {seed}: the regular neighbours stay");
+diff --git a/triblespace-net/tests/sim_peering.rs b/triblespace-net/tests/sim_peering.rs
+--- a/triblespace-net/tests/sim_peering.rs
++++ b/triblespace-net/tests/sim_peering.rs
+@@ -171,7 +171,7 @@ async fn until(
+ }
+ 
+ fn peerings(peer: &Peer<MemoryRepo>) -> Vec<PeeringHealth> {
+-    peer.health().peerings.clone()
++    peer.health().peerings.iter().cloned().collect()
+ }
+ 
+ /// `root` grants `subject` the `action` on `collection`.
