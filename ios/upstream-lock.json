@@ -1,0 +1,35 @@
+[
+  {
+    "name": "triblespace-rs",
+    "url": "https://codeload.github.com/erlkonig-ai/triblespace/tar.gz/3555fa7192cdc6ba25e2eb093ff74c52273b3215",
+    "archive_sha256": "29c5621755bfa073d59e35b47155911478691ab2e19eee20cad1146ddfad8f7e",
+    "patch": "triblespace-mobile.patch",
+    "tree_sha256": "3e0d9e2399b6ddf3151c146a07353e1af3f598096f10af2c2efdb4f97639821a"
+  },
+  {
+    "name": "jerky",
+    "url": "https://codeload.github.com/erlkonig-ai/jerky/tar.gz/94453322b83ff67fa4384ab49cd0685c43a9bb4b",
+    "archive_sha256": "e3f1e2ab48041a76cb4ac7863fad79c2407fb104b1318e04c549d20310f14cb5",
+    "tree_sha256": "d11fa021fe5d7d6ba1741a6c5bd2299482fbd81e21891c3c4398a9c4c286c8ef"
+  },
+  {
+    "name": "anybytes",
+    "url": "https://codeload.github.com/erlkonig-ai/anybytes/tar.gz/55f1a2a1e63797b35b7a59f74b720017beb984c3",
+    "archive_sha256": "9b9ae6321eaa4656f19edcd196d8d88c3a935df0c48898311322a7e68d674826",
+    "tree_sha256": "dd869a78c2c0a6583b2e420e4404ea8f87def86511c0d36d5ede1b9d1c48e2ed"
+  },
+  {
+    "name": "net-tools",
+    "url": "https://codeload.github.com/erlkonig-ai/net-tools/tar.gz/10ab7b328809103be74f6ca24258249715fae52b",
+    "archive_sha256": "ea4a4b0a36a628ea2a0ddfffcfb115a877e8fd5274d1d618e22e8a26ac41850f",
+    "patch": "netwatch-ios.patch",
+    "tree_sha256": "ea9ddb994ccb52b7df1e2be7b706af69bb6985122528d9871b65ac579ac48e6a"
+  },
+  {
+    "name": "netdev",
+    "url": "https://static.crates.io/crates/netdev/netdev-0.45.1.crate",
+    "archive_sha256": "096c44b66a9b09b99b4dd36b1c295ff3a492039ccecaf55466bd6ddcdba59968",
+    "patch": "netdev-ios.patch",
+    "tree_sha256": "fbd734cad7b3c4435099e765e6fca61f74ea83fbbdb153e5654217cc04b8ceaa"
+  }
+]

@@ -1,0 +1,4043 @@
+diff --git a/triblespace-core/src/collection.rs b/triblespace-core/src/collection.rs
+--- a/triblespace-core/src/collection.rs
++++ b/triblespace-core/src/collection.rs
+@@ -73,6 +73,8 @@ pub mod ownership;
+ /// Immutable collection-local READ and WRITE authorization ceilings.
+ pub mod policy;
+ pub mod records;
++pub mod record_patch;
++pub mod record_counts;
+ /// Attached mappings registered by the algorithm id their descriptors name.
+ pub mod registration;
+ /// Which collections the pile syncs, in its own configuration collection.
+diff --git a/triblespace-core/src/collection/collection_delta_batch_tests.rs b/triblespace-core/src/collection/collection_delta_batch_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/triblespace-core/src/collection/collection_delta_batch_tests.rs
+@@ -0,0 +1,171 @@
++//! Exact batch-operation controls against ordinary canonical construction.
++use super::*;
++use ed25519_dalek::SigningKey;
++use std::convert::Infallible;
++use crate::collection::{
++    CollectionCommit, CollectionData, CollectionMerge, empty_metadata_handle,
++};
++
++struct Delta {
++    collection: CollectionHandle,
++    added: Vec<CollectionRecord>,
++    removed: Vec<CollectionRecord>,
++}
++
++impl CollectionRead for Delta {
++    type RecordsError = Infallible;
++    type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
++    fn records(&self) -> Result<Self::RecordIter<'_>, Infallible> {
++        panic!("batch update must use exact selector delta")
++    }
++    fn collections(&self) -> Result<Vec<CollectionHandle>, Infallible> {
++        panic!("no global enumeration")
++    }
++    fn select_record_changes(
++        &self,
++        previous: &Self,
++        selectors: &BTreeSet<CollectionRecordSelector>,
++    ) -> Result<(Vec<CollectionRecord>, Vec<CollectionRecord>), Infallible> {
++        assert_eq!(self.collection, previous.collection);
++        assert_eq!(
++            selectors,
++            &BTreeSet::from([CollectionRecordSelector::Foundations(self.collection)])
++        );
++        Ok((self.added.clone(), self.removed.clone()))
++    }
++}
++
++fn record(collection: CollectionHandle, n: u64) -> CollectionRecord {
++    CollectionRecord::Commit(CollectionCommit::sign(
++        &SigningKey::from_bytes(&[47; 32]),
++        collection,
++        CollectionData::new(*blake3::hash(&n.to_be_bytes()).as_bytes()),
++        empty_metadata_handle(),
++    ))
++}
++
++#[test]
++fn batch_matches_native_oracle_for_add_remove_overlap_duplicates_and_old_pin() {
++    let collection = CollectionHandle::new([48; 32]);
++    let all: Vec<_> = (0..320).map(|n| record(collection, n)).collect();
++    let prior = canonical_records(collection, all[..256].iter().copied()).unwrap();
++    let pinned = prior.clone();
++    let before = Delta {
++        collection,
++        added: vec![],
++        removed: vec![],
++    };
++    // Duplicate additions, existing additions, absent removal, and remove+add
++    // overlap retain the old per-record remove-then-add semantics.
++    let mut added = all[256..].to_vec();
++    added.extend([all[0], all[300], all[100]]);
++    let mut removed = all[..64].to_vec();
++    removed.extend([all[0], all[300]]);
++    let after = Delta {
++        collection,
++        added,
++        removed,
++    };
++    let next = update_collection_record_patch(&after, &before, &prior).unwrap();
++    let expected =
++        canonical_records(collection, all[64..].iter().copied().chain([all[0]])).unwrap();
++    assert_eq!(next.summaries(), expected.summaries());
++    assert_eq!(
++        next.records().collect::<Vec<_>>(),
++        expected.records().collect::<Vec<_>>()
++    );
++    assert_eq!(pinned.summaries(), prior.summaries());
++    assert!(
++        all[..256]
++            .iter()
++            .all(|r| pinned.get(r.fingerprint()) == Some(*r))
++    );
++    let same = update_collection_record_patch(&before, &before, &prior).unwrap();
++    assert_eq!(same.summaries(), prior.summaries());
++    let clear = Delta {
++        collection,
++        added: vec![],
++        removed: all[..256].to_vec(),
++    };
++    assert!(
++        update_collection_record_patch(&clear, &before, &prior)
++            .unwrap()
++            .is_empty()
++    );
++}
++
++#[test]
++fn batch_keeps_wrong_collection_and_nonfoundation_rejections() {
++    let collection = CollectionHandle::new([49; 32]);
++    let before = Delta {
++        collection,
++        added: vec![],
++        removed: vec![],
++    };
++    let prior = canonical_records(collection, [] as [CollectionRecord; 0]).unwrap();
++    let wrong = Delta {
++        collection,
++        added: vec![record(CollectionHandle::new([50; 32]), 1)],
++        removed: vec![],
++    };
++    assert!(matches!(
++        update_collection_record_patch(&wrong, &before, &prior),
++        Err(CollectionRecordPatchError::Evidence(
++            CollectionDeltaError::WrongCollection
++        ))
++    ));
++    let merge = CollectionRecord::Merge(
++        CollectionMerge::sign(
++            &SigningKey::from_bytes(&[47; 32]),
++            collection,
++            (1..=8).map(|byte| CollectionData::new([byte; 32])),
++            CollectionData::new([3; 32]),
++        )
++        .unwrap(),
++    );
++    for added in [false, true] {
++        let delta = Delta {
++            collection,
++            added: if added { vec![merge] } else { vec![] },
++            removed: if added { vec![] } else { vec![merge] },
++        };
++        assert!(matches!(
++            update_collection_record_patch(&delta, &before, &prior),
++            Err(CollectionRecordPatchError::Evidence(
++                CollectionDeltaError::NotReplicated
++            ))
++        ));
++    }
++}
++
++#[test]
++fn batch_does_not_let_key_equality_hide_conflicting_attached_values() {
++    let collection = CollectionHandle::new([51; 32]);
++    let a = record(collection, 1);
++    let b = record(collection, 2);
++    let before = Delta {
++        collection,
++        added: vec![],
++        removed: vec![],
++    };
++    // Deliberately invalid valued index models a fingerprint collision without
++    // requiring a cryptographic collision or changing record fingerprints.
++    let mut prior = canonical_records(collection, [] as [CollectionRecord; 0]).unwrap();
++    prior
++        .commits
++        .insert(&PatchEntry::with_value(&a.fingerprint().raw(), CollectionRecordView::from(b).as_commit().unwrap().clone()));
++    for adding in [false, true] {
++        let delta = Delta {
++            collection,
++            added: if adding { vec![a] } else { vec![] },
++            removed: if adding { vec![] } else { vec![a] },
++        };
++        assert!(
++            matches!(update_collection_record_patch(&delta, &before, &prior), Err(CollectionRecordPatchError::Evidence(CollectionDeltaError::FingerprintCollision(key))) if key == a.fingerprint())
++        );
++    }
++    // The same insertion helper guards a batch-local map, before native union.
++    assert!(
++        matches!(insert_record(collection, &mut prior, a), Err(CollectionDeltaError::FingerprintCollision(key)) if key == a.fingerprint())
++    );
++}
+diff --git a/triblespace-core/src/collection/covered.rs b/triblespace-core/src/collection/covered.rs
+--- a/triblespace-core/src/collection/covered.rs
++++ b/triblespace-core/src/collection/covered.rs
+@@ -46,6 +46,8 @@ use crate::repo::{
+     StoreDependencies, StoreSnapshot, WantRead, WantRequest, WantStore,
+ };
+ 
++use super::record_counts::RecordCountStatus;
++use super::record_patch::CollectionRecordPatch;
+ use super::coverage::{Coverage, CoverageIndex, StoreWriters};
+ use super::held::{HeldBlobs, HeldIndex, HeldRead, HeldSource, HeldStore, HeldView, HeldWork};
+ use super::{
+@@ -273,6 +275,7 @@ where
+             inner: now,
+             memo,
+             held,
++            replay_complete: whole,
+         }
+     }
+ }
+@@ -461,6 +464,7 @@ pub struct CoveredSnapshot<T> {
+     memo: std::sync::Arc<std::sync::Mutex<Memo>>,
+     /// The held sets fixed when this snapshot was taken.
+     held: std::sync::Arc<HeldView>,
++    replay_complete: bool,
+ }
+ 
+ impl<T: std::fmt::Debug> std::fmt::Debug for CoveredSnapshot<T> {
+@@ -475,7 +479,8 @@ impl<T: std::fmt::Debug> std::fmt::Debug for CoveredSnapshot<T> {
+ 
+ impl<T: PartialEq> PartialEq for CoveredSnapshot<T> {
+     fn eq(&self, other: &Self) -> bool {
+-        if self.inner != other.inner || self.held != other.held {
++        if self.inner != other.inner || self.held != other.held
++            || self.replay_complete != other.replay_complete {
+             return false;
+         }
+         // Clones share the memo; locking it twice would wait on ourselves.
+@@ -677,6 +682,18 @@ impl<T: BlobChildren> BlobChildren for CoveredSnapshot<T> {
+ }
+ 
+ impl<T: CollectionRead> CollectionRead for CoveredSnapshot<T> {
++    fn record_count_status(&self, root: CollectionHandle) -> RecordCountStatus {
++        match self.inner.record_count_status(root) {
++            RecordCountStatus::Ready { counts, .. } => RecordCountStatus::Ready { counts, replay_complete: self.replay_complete },
++            RecordCountStatus::Untracked { .. } => RecordCountStatus::Untracked { replay_complete: self.replay_complete },
++            failed @ RecordCountStatus::Failed(_) => failed,
++        }
++    }
++
++    fn cached_record_patch(&self, root: CollectionHandle) -> Option<&CollectionRecordPatch> {
++        self.inner.cached_record_patch(root)
++    }
++
+     type RecordsError = T::RecordsError;
+     type RecordIter<'a>
+         = T::RecordIter<'a>
+diff --git a/triblespace-core/src/collection/observed_store.rs b/triblespace-core/src/collection/observed_store.rs
+--- a/triblespace-core/src/collection/observed_store.rs
++++ b/triblespace-core/src/collection/observed_store.rs
+@@ -273,6 +273,20 @@ impl<R: CoverageRead> CoverageRead for ObservedStore<R> {
+ }
+ 
+ impl<R: CollectionRead> CollectionRead for ObservedStore<R> {
++    fn record_count_status(&self, root: CollectionHandle) -> super::record_counts::RecordCountStatus {
++        let mut tracker = self.tracker.lock().expect("store dependency tracker is not poisoned");
++        tracker.records.insert(CollectionRecordSelector::Foundations(root));
++        // Counts consult indexed presence, including references missing now.
++        tracker.all_blobs = true;
++        drop(tracker);
++        self.inner.record_count_status(root)
++    }
++    fn cached_record_patch(&self, root: CollectionHandle) -> Option<&super::record_patch::CollectionRecordPatch> {
++        self.tracker.lock().expect("store dependency tracker is not poisoned")
++            .records.insert(CollectionRecordSelector::Foundations(root));
++        self.inner.cached_record_patch(root)
++    }
++
+     type RecordsError = R::RecordsError;
+     type RecordIter<'a>
+         = R::RecordIter<'a>
+diff --git a/triblespace-core/src/collection/record_counts.rs b/triblespace-core/src/collection/record_counts.rs
+new file mode 100644
+--- /dev/null
++++ b/triblespace-core/src/collection/record_counts.rs
+@@ -0,0 +1,131 @@
++//! Exact native counts maintained at the same frame boundary as pile replay.
++//!
++//! Canonical foundation views share their mapped bytes with the occurrence
++//! index. Only missing direct references need reverse routes: native pile
++//! lineages are append-only, so the first indexed blob consumes its routes.
++//! No UI scope, worker, cold seed, or count publication scheduler is involved.
++
++use std::sync::Arc;
++use crate::patch::{Entry, IdentitySchema, PATCH};
++use super::{CollectionHandle, CollectionRecordView};
++use super::record_patch::{CollectionRecordPatch, insert_record};
++
++type Raw = [u8; 32];
++mod dependency {
++    crate::key_segmentation!(Segments, 96, [32, 32, 32]);
++    crate::key_schema!(Schema, Segments, 96, [0, 1, 2]);
++}
++type Missing = PATCH<96, dependency::Schema>;
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct DirectCounts {
++    /// Distinct canonical COMMIT/DERIVE assertions, not produced members.
++    pub records: u64,
++    /// Assertions whose directly named blobs are indexed locally.
++    pub direct_present: u64,
++}
++
++/// Counts refer to this exact immutable observation, including replay prefixes.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum RecordCountStatus {
++    /// A generic backend without native counts; scoped canonical fallback is allowed.
++    Untracked { replay_complete: bool },
++    Ready { counts: DirectCounts, replay_complete: bool },
++    Failed(Arc<str>),
++}
++
++#[derive(Clone, Debug)]
++struct Root {
++    records: CollectionRecordPatch,
++    direct_present: u64,
++    error: Option<Arc<str>>,
++}
++impl Root {
++    fn new(root: CollectionHandle) -> Self {
++        Self { records: CollectionRecordPatch::empty(root), direct_present: 0, error: None }
++    }
++    fn references(&self, id: &Raw) -> Vec<Raw> {
++        if let Some(record) = self.records.commits().get(id) {
++            vec![record.collection().raw, record.data().raw, record.metadata().raw]
++        } else if let Some(record) = self.records.derives().get(id) {
++            // The source locator is not a blob handle.
++            vec![record.target().raw, record.output().raw]
++        } else { Vec::new() }
++    }
++}
++
++/// Derived native index, cloned with the other persistent pile roots.
++#[derive(Clone, Debug, Default)]
++pub(crate) struct RecordCountIndex {
++    roots: PATCH<32, IdentitySchema, Root>,
++    missing: Missing,
++}
++impl RecordCountIndex {
++    pub(crate) fn status(&self, root: CollectionHandle) -> RecordCountStatus {
++        let counts = match self.roots.get(&root.raw) {
++            Some(state) => {
++                if let Some(error) = &state.error { return RecordCountStatus::Failed(Arc::clone(error)); }
++                DirectCounts { records: state.records.len(), direct_present: state.direct_present }
++            }
++            None => DirectCounts::default(),
++        };
++        RecordCountStatus::Ready { counts, replay_complete: true }
++    }
++    pub(crate) fn records(&self, root: CollectionHandle) -> Option<&CollectionRecordPatch> {
++        let state = self.roots.get(&root.raw)?;
++        if state.error.is_some() { None } else { Some(&state.records) }
++    }
++    /// Called only for decoded native COMMIT/DERIVE bodies. Root-local
++    /// canonical failure never changes whether another root can be observed.
++    pub(crate) fn record(&mut self, record: CollectionRecordView, contains: impl Fn(&Raw) -> bool) {
++        let root = record.collection();
++        let mut state = self.roots.get(&root.raw).cloned().unwrap_or_else(|| Root::new(root));
++        if state.error.is_some() { return; }
++        let before = state.records.len();
++        let id = record.fingerprint().raw();
++        match insert_record(root, &mut state.records, record.with_native_fingerprint(id)) {
++            Err(error) => state.error = Some(Arc::from(error.to_string())),
++            Ok(()) if state.records.len() != before => {
++                let mut present = true;
++                for blob in state.references(&id) {
++                    if contains(&blob) { continue; }
++                    present = false;
++                    let mut key = [0; 96];
++                    key[..32].copy_from_slice(&blob);
++                    key[32..64].copy_from_slice(&root.raw);
++                    key[64..].copy_from_slice(&id);
++                    self.missing.insert(&Entry::new(&key));
++                }
++                if present { state.direct_present += 1; }
++            }
++            Ok(()) => {} // Duplicate frame, including identical reference aliases.
++        }
++        self.roots.replace(&Entry::with_value(&root.raw, state));
++    }
++    /// Called only on the first indexed occurrence of this blob, after it is
++    /// present in the native blob index. Finish its fanout before publishing
++    /// the frame boundary; the fanout is not a hard-latency-bounded operation.
++    pub(crate) fn blob(&mut self, blob: Raw, contains: impl Fn(&Raw) -> bool) {
++        while let Some(root) = self.missing.first_infix_range(&blob, &[0; 32], &[255; 32]) {
++            let mut prefix = [0; 64];
++            prefix[..32].copy_from_slice(&blob);
++            prefix[32..].copy_from_slice(&root);
++            let mut state = self.roots.get(&root).expect("route has canonical root").clone();
++            while let Some(id) = self.missing.first_infix_range(&prefix, &[0; 32], &[255; 32]) {
++                let mut key = [0; 96];
++                key[..64].copy_from_slice(&prefix);
++                key[64..].copy_from_slice(&id);
++                self.missing.remove(&key);
++                if state.error.is_none() && state.references(&id).iter().all(&contains) {
++                    // This was the last missing direct blob. All earlier
++                    // arrivals already consumed their routes, so M changes once.
++                    state.direct_present += 1;
++                }
++            }
++            self.roots.replace(&Entry::with_value(&root, state));
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/triblespace-core/src/collection/record_counts/tests.rs b/triblespace-core/src/collection/record_counts/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/triblespace-core/src/collection/record_counts/tests.rs
+@@ -0,0 +1,78 @@
++use super::*;
++use std::collections::BTreeSet;
++use crate::collection::{CollectionCommit, CollectionDerive, CollectionRecord, SourceLocator};
++use crate::inline::Inline;
++use ed25519_dalek::SigningKey;
++
++fn commit(root: CollectionHandle, author: u8, data: u8) -> CollectionRecordView {
++    CollectionRecord::Commit(CollectionCommit::sign(&SigningKey::from_bytes(&[author; 32]),
++        root, Inline::new([data; 32]), Inline::new([4; 32]))).into()
++}
++fn ready(n: u64, m: u64) -> RecordCountStatus {
++    RecordCountStatus::Ready { counts: DirectCounts { records: n, direct_present: m }, replay_complete: true }
++}
++#[test]
++fn duplicate_assertions_aliases_and_missing_routes_are_consumed_once() {
++    let root = Inline::new([1; 32]);
++    let mut index = RecordCountIndex::default();
++    let mut blobs = BTreeSet::from([[1; 32]]);
++    let a = commit(root, 7, 3);
++    index.record(a.clone(), |b| blobs.contains(b));
++    index.record(a, |b| blobs.contains(b));
++    index.record(commit(root, 8, 3), |b| blobs.contains(b));
++    index.record(commit(root, 9, 4), |b| blobs.contains(b)); // data == metadata
++    index.record(CollectionRecord::Derive(CollectionDerive::sign(&SigningKey::from_bytes(&[10; 32]),
++        root, SourceLocator::of([99; 32]), Inline::new([3; 32]))).into(), |b| blobs.contains(b));
++    assert_eq!(index.status(root), ready(4, 0));
++    assert_eq!(index.missing.len(), 6);
++    let old = index.clone();
++    blobs.insert([3; 32]);
++    index.blob([3; 32], |b| blobs.contains(b));
++    assert_eq!(index.status(root), ready(4, 1)); // source locator isn't a blob
++    assert_eq!(index.missing.len(), 3);
++    index.blob([3; 32], |b| blobs.contains(b));
++    assert_eq!(index.status(root), ready(4, 1));
++    blobs.insert([4; 32]);
++    index.blob([4; 32], |b| blobs.contains(b));
++    assert_eq!(index.status(root), ready(4, 4));
++    assert_eq!(index.missing.len(), 0);
++    assert_eq!(old.status(root), ready(4, 0));
++    assert_eq!(old.missing.len(), 6);
++}
++#[test]
++fn blobs_before_records_need_no_reverse_routes_and_empty_roots_are_exact() {
++    let root = Inline::new([1; 32]);
++    let mut index = RecordCountIndex::default();
++    assert_eq!(index.status(root), ready(0, 0));
++    index.record(commit(root, 7, 3), |_| true);
++    assert_eq!(index.status(root), ready(1, 1));
++    assert!(index.missing.is_empty());
++}
++#[test]
++fn canonical_collision_is_root_local_and_preserves_previous_snapshot() {
++    let bad = Inline::new([1; 32]);
++    let healthy = Inline::new([2; 32]);
++    let mut index = RecordCountIndex::default();
++    let first = commit(bad, 7, 3);
++    let fingerprint = first.fingerprint().raw();
++    index.record(first, |_| true);
++    let old = index.clone();
++    index.record(commit(bad, 8, 3).with_native_fingerprint(fingerprint), |_| true);
++    index.record(commit(healthy, 9, 3), |_| true);
++    assert!(matches!(index.status(bad), RecordCountStatus::Failed(_)));
++    assert!(index.records(bad).is_none());
++    assert_eq!(index.status(healthy), ready(1, 1));
++    assert_eq!(old.status(bad), ready(1, 1));
++}
++#[test]
++fn shared_missing_blob_updates_every_root_without_retaining_resident_routes() {
++    let mut index = RecordCountIndex::default();
++    for n in 1..=64 {
++        let root = Inline::new([n; 32]);
++        index.record(commit(root, n, 100), |b| *b != [100; 32]);
++    }
++    assert_eq!(index.missing.len(), 64);
++    index.blob([100; 32], |_| true);
++    for n in 1..=64 { assert_eq!(index.status(Inline::new([n; 32])), ready(1, 1)); }
++    assert_eq!(index.missing.len(), 0);
++}
+diff --git a/triblespace-core/src/collection/record_patch.rs b/triblespace-core/src/collection/record_patch.rs
+new file mode 100644
+--- /dev/null
++++ b/triblespace-core/src/collection/record_patch.rs
+@@ -0,0 +1,649 @@
++//! Policy-independent collection-record delta mechanics.
++//!
++//! This module owns only the immutable evidence boundary: strict framing,
++//! intrinsic collection matching, ingress signature verification, canonical
++//! fingerprint ordering, and bounded `current - previous` selection. It deliberately
++//! does not resolve referenced blobs or decide READ/WRITE policy.
++//!
++//! Only foundations replicate: a collection's COMMITs and DERIVEs. A MERGE is
++//! the signing host's own lattice node; it never enters a record PATCH, is
++//! never encoded for a peer, and a peer's MERGE is refused on decode.
++
++use std::collections::BTreeSet;
++use std::error::Error;
++use std::fmt;
++use anybytes::View;
++
++use crate::collection::{
++    CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordView, CollectionRecordFingerprint,
++    CollectionRecordSelector, RecordDecodeError, RecordViewChanges, EncodedCommit, EncodedDerive,
++};
++use crate::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
++
++use crate::patch::PatchSummary;
++
++/// Two canonical per-kind PATCH roots naming one exact collection.
++#[derive(Clone, Debug)]
++pub struct CollectionRecordPatch {
++    collection: CollectionHandle,
++    commits: PATCH<32, IdentitySchema, View<EncodedCommit>, Blake3Merkle>,
++    derives: PATCH<32, IdentitySchema, View<EncodedDerive>, Blake3Merkle>,
++}
++
++impl CollectionRecordPatch {
++    /// Exact collection named by every record in this PATCH.
++    pub const fn collection(&self) -> CollectionHandle {
++        self.collection
++    }
++
++    /// Independent COMMIT and DERIVE summaries, never a synthetic union root.
++    pub fn summaries(&self) -> [PatchSummary; 2] {
++        [PatchSummary::from_patch(&self.commits), PatchSummary::from_patch(&self.derives)]
++    }
++
++    /// Number of canonical records in this collection overlay.
++    pub fn len(&self) -> u64 {
++        self.commits.len() + self.derives.len()
++    }
++
++    /// Whether this collection overlay has no known records.
++    pub fn is_empty(&self) -> bool {
++        self.commits.is_empty() && self.derives.is_empty()
++    }
++
++    /// Test oracle only: production readers use kind-directed typed access.
++    #[cfg(test)]
++    pub fn get(&self, fingerprint: CollectionRecordFingerprint) -> Option<CollectionRecord> {
++        self.commits.get(&fingerprint.raw()).map(|v| CollectionRecord::Commit(v.to_record().unwrap()))
++            .or_else(|| self.derives.get(&fingerprint.raw()).map(|v| CollectionRecord::Derive(v.to_record().unwrap())))
++    }
++
++    /// The immutable COMMIT fingerprint-to-body relation.
++    pub fn commits(&self) -> &PATCH<32, IdentitySchema, View<EncodedCommit>, Blake3Merkle> {
++        &self.commits
++    }
++
++    /// The immutable DERIVE fingerprint-to-body relation.
++    pub fn derives(&self) -> &PATCH<32, IdentitySchema, View<EncodedDerive>, Blake3Merkle> {
++        &self.derives
++    }
++
++    /// Test oracle; semantic decoding is deliberately absent from serving.
++    #[cfg(test)]
++    pub fn records(&self) -> impl Iterator<Item = CollectionRecord> + '_ {
++        let mut commits = self.commits.iter_ordered().peekable();
++        let mut derives = self.derives.iter_ordered().peekable();
++        std::iter::from_fn(move || {
++            let key = match (commits.peek(), derives.peek()) {
++                (Some(c), Some(d)) if c <= d => commits.next(),
++                (Some(_), Some(_)) | (None, Some(_)) => derives.next(),
++                (Some(_), None) => commits.next(),
++                (None, None) => None,
++            }?;
++            self.get(CollectionRecordFingerprint::from_raw(*key))
++        })
++    }
++
++    pub(crate) fn empty(collection: CollectionHandle) -> Self {
++        Self { collection, commits: PATCH::new(), derives: PATCH::new() }
++    }
++
++    /// Exact bytes are checked before PATCH's key-only equality can shortcut.
++    fn matches(&self, fingerprint: CollectionRecordFingerprint, record: &CollectionRecordView) -> Option<bool> {
++        let key = fingerprint.raw();
++        if let Some(existing) = self.commits.get(&key) {
++            return Some(record.as_commit().is_some_and(|v| v.body_bytes() == existing.body_bytes()));
++        }
++        self.derives.get(&key).map(|existing| record.as_derive().is_some_and(|v| v.body_bytes() == existing.body_bytes()))
++    }
++}
++
++/// Failure while constructing an exact per-collection record PATCH.
++#[derive(Debug)]
++pub enum CollectionRecordPatchError<E> {
++    Store(E),
++    Evidence(CollectionDeltaError),
++}
++
++impl<E: fmt::Display> fmt::Display for CollectionRecordPatchError<E> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Store(error) => write!(f, "select collection records: {error}"),
++            Self::Evidence(error) => error.fmt(f),
++        }
++    }
++}
++
++impl<E> Error for CollectionRecordPatchError<E>
++where
++    E: Error + 'static,
++{
++    fn source(&self) -> Option<&(dyn Error + 'static)> {
++        match self {
++            Self::Store(error) => Some(error),
++            Self::Evidence(error) => Some(error),
++        }
++    }
++}
++
++/// Failure at the sparse immutable-evidence boundary.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub enum CollectionDeltaError {
++    Decode(RecordDecodeError),
++    WrongCollection,
++    /// Not a foundation (a MERGE is the signing host's own lattice node):
++    /// it never replicates.
++    NotReplicated,
++    FingerprintCollision(CollectionRecordFingerprint),
++}
++
++impl fmt::Display for CollectionDeltaError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Decode(error) => write!(f, "decode collection record: {error}"),
++            Self::WrongCollection => write!(f, "record names another collection"),
++            Self::NotReplicated => write!(f, "only COMMIT and DERIVE records replicate"),
++            Self::FingerprintCollision(fingerprint) => {
++                write!(
++                    f,
++                    "distinct records share full-width fingerprint {fingerprint}"
++                )
++            }
++        }
++    }
++}
++
++impl Error for CollectionDeltaError {
++    fn source(&self) -> Option<&(dyn Error + 'static)> {
++        match self {
++            Self::Decode(error) => Some(error),
++            _ => None,
++        }
++    }
++}
++
++impl From<RecordDecodeError> for CollectionDeltaError {
++    fn from(error: RecordDecodeError) -> Self {
++        Self::Decode(error)
++    }
++}
++
++/// Build the exact valued PATCH of one collection's foundations through their
++/// selector.
++///
++/// This is the sole collection-overlay construction path: it never asks the
++/// caller for the store's global record stream. Backends remain free to answer
++/// the selector from a secondary index or another sparse representation.
++pub fn collection_record_patch<R>(
++    snapshot: &R,
++    collection: CollectionHandle,
++) -> Result<CollectionRecordPatch, CollectionRecordPatchError<R::RecordsError>>
++where
++    R: CollectionRead,
++{
++    if let Some(cached) = snapshot.cached_record_patch(collection) { return Ok(cached.clone()); }
++    let selectors = BTreeSet::from([CollectionRecordSelector::Foundations(collection)]);
++    let records = snapshot
++        .select_record_views(&selectors)
++        .map_err(CollectionRecordPatchError::Store)?;
++    canonical_records(collection, records).map_err(CollectionRecordPatchError::Evidence)
++}
++
++/// Advance the PATCH built from `previous` using selected append evidence or
++/// exact semantic changes; rebuild when physical sources are incomparable.
++/// `prior` must describe that previous snapshot and
++/// retains its unchanged persistent Merkle subtrees; no old record body is
++/// rehashed simply because another record arrived in its collection.
++pub fn update_collection_record_patch<R>(
++    current: &R,
++    previous: &R,
++    prior: &CollectionRecordPatch,
++) -> Result<CollectionRecordPatch, CollectionRecordPatchError<R::RecordsError>>
++where
++    R: CollectionRead,
++{
++    let expected = prior.collection;
++    if let Some(cached) = current.cached_record_patch(expected) { return Ok(cached.clone()); }
++    let selectors = BTreeSet::from([CollectionRecordSelector::Foundations(expected)]);
++    let changes = current
++        .select_record_view_changes(previous, &selectors)
++        .map_err(CollectionRecordPatchError::Store)?;
++    let (added, removed) = match changes {
++        RecordViewChanges::Append(added) => (added, Vec::new()),
++        RecordViewChanges::Delta { added, removed } => (added, removed),
++        RecordViewChanges::Rebuild => return collection_record_patch(current, expected),
++    };
++    // Operation-local deltas: edit the retained Merkle trie once per batch,
++    // rather than rehashing its wide ancestors after every changed record.
++    // PATCH equality only observes keys, so validate attached values before
++    // either structural operation can short-circuit an equal subtree.
++    let mut removals = CollectionRecordPatch::empty(expected);
++    for record in removed {
++        validate_view(expected, &record).map_err(CollectionRecordPatchError::Evidence)?;
++        let fingerprint = record.fingerprint();
++        if let Some(matches) = prior.matches(fingerprint, &record) {
++            if !matches {
++                return Err(CollectionRecordPatchError::Evidence(
++                    CollectionDeltaError::FingerprintCollision(fingerprint),
++                ));
++            }
++            insert_fingerprinted_record(&mut removals, record, fingerprint)
++                .map_err(CollectionRecordPatchError::Evidence)?;
++        }
++    }
++    let mut next = prior.clone();
++    next.commits = next.commits.difference(&removals.commits);
++    next.derives = next.derives.difference(&removals.derives);
++    let mut additions = CollectionRecordPatch::empty(expected);
++    for record in added {
++        validate_view(expected, &record).map_err(CollectionRecordPatchError::Evidence)?;
++        let fingerprint = record.fingerprint();
++        if next.matches(fingerprint, &record) == Some(false) {
++            return Err(CollectionRecordPatchError::Evidence(
++                CollectionDeltaError::FingerprintCollision(fingerprint),
++            ));
++        }
++        // Checks duplicates/collisions within this batch independently of the
++        // retained tree. Actual values, not placeholders, enter the delta.
++        insert_fingerprinted_record(&mut additions, record, fingerprint)
++            .map_err(CollectionRecordPatchError::Evidence)?;
++    }
++    next.commits.union(additions.commits);
++    next.derives.union(additions.derives);
++    Ok(next)
++}
++
++/// Encode one trusted local record after checking its intrinsic collection.
++/// Signatures are not re-verified on output. WRITE authorization is absent: it
++/// governs derived admission, not whether canonical inert evidence may exist.
++pub fn encode_record(
++    expected: CollectionHandle,
++    record: CollectionRecord,
++) -> Result<Vec<u8>, CollectionDeltaError> {
++    validate_record(expected, record)?;
++    Ok(record.to_bytes())
++}
++
++/// Strictly decode one complete self-tagged record for an implicit collection
++/// overlay. Trailing bytes, noncanonical MERGE inputs, unknown tags, wrong
++/// collections, invalid signatures and MERGE records fail before insertion.
++pub fn decode_record(
++    expected: CollectionHandle,
++    bytes: &[u8],
++) -> Result<CollectionRecord, CollectionDeltaError> {
++    let record = CollectionRecord::from_bytes(bytes)?;
++    validate_record(expected, record)?;
++    Ok(record)
++}
++
++fn validate_record(
++    expected: CollectionHandle,
++    record: CollectionRecord,
++) -> Result<(), CollectionDeltaError> {
++    if record.collection() != expected {
++        return Err(CollectionDeltaError::WrongCollection);
++    }
++    // Foundations are named positively, so a record kind added later is
++    // refused until it is listed here.
++    if !matches!(
++        record,
++        CollectionRecord::Commit(_) | CollectionRecord::Derive(_)
++    ) {
++        return Err(CollectionDeltaError::NotReplicated);
++    }
++    Ok(())
++}
++
++fn validate_view(expected: CollectionHandle, record: &CollectionRecordView) -> Result<(), CollectionDeltaError> {
++    if record.collection() != expected { return Err(CollectionDeltaError::WrongCollection); }
++    if !record.is_foundation() { return Err(CollectionDeltaError::NotReplicated); }
++    Ok(())
++}
++
++fn canonical_records<R: Into<CollectionRecordView>>(
++    expected: CollectionHandle,
++    records: impl IntoIterator<Item = R>,
++) -> Result<CollectionRecordPatch, CollectionDeltaError> {
++    let mut canonical = CollectionRecordPatch::empty(expected);
++    for record in records {
++        insert_record(expected, &mut canonical, record)?;
++    }
++    Ok(canonical)
++}
++
++pub(crate) fn insert_record(
++    expected: CollectionHandle,
++    canonical: &mut CollectionRecordPatch,
++    record: impl Into<CollectionRecordView>,
++) -> Result<(), CollectionDeltaError> {
++    let record = record.into();
++    validate_view(expected, &record)?;
++    let fingerprint = record.fingerprint();
++    insert_fingerprinted_record(canonical, record, fingerprint)
++}
++
++// The caller validated the collection/kind and computed this fingerprint for
++// this exact view. Incremental membership checks and batch insertion reuse it.
++fn insert_fingerprinted_record(
++    canonical: &mut CollectionRecordPatch,
++    record: CollectionRecordView,
++    fingerprint: CollectionRecordFingerprint,
++) -> Result<(), CollectionDeltaError> {
++    let key = fingerprint.raw();
++    if let Some(matches) = canonical.matches(fingerprint, &record) {
++        if !matches {
++            return Err(CollectionDeltaError::FingerprintCollision(fingerprint));
++        }
++        return Ok(());
++    }
++    if let Some(value) = record.as_commit() {
++        canonical.commits.insert(&PatchEntry::with_value(&key, value.clone()));
++    } else if let Some(value) = record.as_derive() {
++        canonical.derives.insert(&PatchEntry::with_value(&key, value.clone()));
++    } else {
++        unreachable!("validate_view admits only foundations");
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++#[path = "collection_delta_batch_tests.rs"]
++mod batch_tests;
++
++
++#[cfg(test)]
++mod tests {
++    use std::cell::Cell;
++    use std::convert::Infallible;
++
++    use ed25519_dalek::SigningKey;
++    use crate::collection::{
++        CollectionCommit, CollectionData, CollectionDerive,
++        CollectionMerge, empty_metadata_handle,
++    };
++    use crate::inline::Inline;
++
++    use super::*;
++
++    fn collection(byte: u8) -> CollectionHandle {
++        Inline::new([byte; 32])
++    }
++
++    fn data(byte: u8) -> CollectionData {
++        Inline::new([byte; 32])
++    }
++
++    fn records(expected: CollectionHandle) -> [CollectionRecord; 3] {
++        [
++            CollectionRecord::Commit(CollectionCommit::sign(
++                &SigningKey::from_bytes(&[7; 32]),
++                expected,
++                data(1),
++                empty_metadata_handle(),
++            )),
++            CollectionRecord::Merge(
++                CollectionMerge::sign(
++                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
++                    expected,
++                    [2, 3, 5, 6, 7, 8, 9, 10].map(data),
++                    data(4),
++                )
++                .unwrap(),
++            ),
++            CollectionRecord::Derive(CollectionDerive::sign(
++                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
++                expected,
++                crate::collection::SourceLocator::of(data(4).raw),
++                data(5),
++            )),
++        ]
++    }
++
++    fn foundations(expected: CollectionHandle) -> [CollectionRecord; 2] {
++        let [commit, _, derive] = records(expected);
++        [commit, derive]
++    }
++
++    #[test]
++    fn foundation_records_roundtrip_for_the_implicit_collection() {
++        let expected = collection(1);
++        for record in foundations(expected) {
++            let bytes = encode_record(expected, record).unwrap();
++            assert_eq!(decode_record(expected, &bytes).unwrap(), record);
++        }
++    }
++
++    #[test]
++    fn merge_records_are_never_encoded_decoded_or_patched() {
++        let expected = collection(1);
++        let merge = records(expected)[1];
++        assert_eq!(
++            encode_record(expected, merge),
++            Err(CollectionDeltaError::NotReplicated)
++        );
++        assert_eq!(
++            decode_record(expected, &merge.to_bytes()),
++            Err(CollectionDeltaError::NotReplicated)
++        );
++        assert!(matches!(
++            canonical_records(expected, records(expected)),
++            Err(CollectionDeltaError::NotReplicated)
++        ));
++    }
++
++    #[test]
++    fn map_records_are_never_encoded_decoded_or_patched() {
++        use crate::collection::CollectionMap;
++        let expected = collection(1);
++        let map = CollectionRecord::Map(CollectionMap::sign(
++            &SigningKey::from_bytes(&[7; 32]),
++            expected,
++            data(1),
++            data(6),
++        ));
++        // The bytes decode as a MAP: the refusal is the replication rule,
++        // not a decoding failure.
++        assert_eq!(CollectionRecord::from_bytes(&map.to_bytes()).unwrap(), map);
++        assert_eq!(
++            encode_record(expected, map),
++            Err(CollectionDeltaError::NotReplicated)
++        );
++        assert_eq!(
++            decode_record(expected, &map.to_bytes()),
++            Err(CollectionDeltaError::NotReplicated)
++        );
++        let [commit, derive] = foundations(expected);
++        assert!(matches!(
++            canonical_records(expected, [commit, map, derive]),
++            Err(CollectionDeltaError::NotReplicated)
++        ));
++    }
++
++    #[test]
++    fn framing_collection_and_signatures_fail_before_admission() {
++        let expected = collection(1);
++        let commit = records(expected)[0];
++        let bytes = encode_record(expected, commit).unwrap();
++
++        assert_eq!(
++            decode_record(collection(2), &bytes),
++            Err(CollectionDeltaError::WrongCollection)
++        );
++        for record in records(expected) {
++            // Signature checks precede the replication rule, so a tampered
++            // MERGE fails as a decode error too.
++            let mut tampered = record.to_bytes();
++            *tampered.last_mut().unwrap() ^= 1;
++            assert!(matches!(
++                decode_record(expected, &tampered),
++                Err(CollectionDeltaError::Decode(
++                    RecordDecodeError::Verification(_)
++                ))
++            ));
++        }
++        let mut trailing = bytes.clone();
++        trailing.push(0);
++        assert!(matches!(
++            decode_record(expected, &trailing),
++            Err(CollectionDeltaError::Decode(_))
++        ));
++        assert!(decode_record(expected, &bytes[..bytes.len() - 1]).is_err());
++        assert!(decode_record(expected, &[99]).is_err());
++    }
++
++    #[test]
++    fn trusted_local_index_and_outbound_encoding_do_not_reverify() {
++        use crate::collection::CollectionStore;
++        use crate::repo::pile::{Pile, PileRecordContent, PileRecords};
++
++        let expected = collection(1);
++        let record = records(expected)[2];
++        let file = tempfile::NamedTempFile::new().unwrap();
++        let mut pile = Pile::open(file.path()).unwrap();
++        pile.insert(record).unwrap();
++        pile.close().unwrap();
++        let physical = PileRecords::open(file.path())
++            .unwrap()
++            .next()
++            .unwrap()
++            .unwrap();
++        let mut bytes = std::fs::read(file.path()).unwrap();
++        bytes[physical.offset + 32 + record.to_bytes().len() - 2] ^= 1;
++        std::fs::write(file.path(), bytes).unwrap();
++        let physical = PileRecords::open(file.path())
++            .unwrap()
++            .next()
++            .unwrap()
++            .unwrap();
++        let PileRecordContent::Collection { record: evidence } = physical.content else {
++            panic!("native fixture is not a collection record");
++        };
++        assert!(evidence.verify_strict().is_err());
++        let patch = canonical_records(expected, [evidence]).unwrap();
++        let view = patch.derives().get(&evidence.fingerprint().raw()).unwrap();
++        assert_eq!(view.body_bytes(), &evidence.to_bytes());
++        let outbound = encode_record(expected, evidence).unwrap();
++        assert!(decode_record(expected, &outbound).is_err());
++    }
++
++    #[test]
++    fn derives_roundtrip_before_their_input_record_or_proofs_are_present() {
++        let signer = ed25519_dalek::SigningKey::from_bytes(&[43; 32]);
++        let source = collection(44);
++        let target = collection(45);
++        let commit = CollectionCommit::sign(&signer, source, data(46), empty_metadata_handle());
++        let derive = CollectionRecord::Derive(CollectionDerive::sign(
++            &signer,
++            target,
++            crate::collection::SourceLocator::of(commit.data().raw),
++            data(47),
++        ));
++        let bytes = encode_record(target, derive).unwrap();
++        let decoded = decode_record(target, &bytes).unwrap();
++        assert_eq!(decoded, derive);
++        // The record names the input PAYLOAD and nothing that has to arrive
++        // first. Which record produced that payload -- the commit here -- is
++        // a relation a reader recovers by content, so the derive travels
++        // alone and stays meaningful on the far side.
++        assert_eq!(canonical_records(target, [decoded]).unwrap().len(), 1);
++        let mut tampered = bytes;
++        // Every field is in the signature transcript, not an unauthenticated
++        // retrieval hint: flipping one bit of the output breaks the record.
++        tampered[2 * 32] ^= 1;
++        assert!(decode_record(target, &tampered).is_err());
++    }
++
++    #[test]
++    fn noncanonical_merge_inputs_fail_before_admission() {
++        let expected = collection(1);
++        let merge = CollectionMerge::sign(
++            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
++            expected,
++            [2, 3, 5, 6, 7, 8, 9, 10].map(data),
++            data(4),
++        )
++        .unwrap();
++        let mut bytes = merge.to_bytes();
++        // The inputs follow kind, collection, result and author.
++        bytes[128..160].fill(9);
++        bytes[160..192].fill(1);
++        assert!(matches!(
++            decode_record(expected, &bytes),
++            Err(CollectionDeltaError::Decode(
++                RecordDecodeError::NonCanonicalMergeInputs
++            ))
++        ));
++    }
++
++    #[test]
++    fn relay_roundtrip_preserves_the_embedded_commit_author() {
++        let expected = collection(1);
++        let commit = records(expected)[0];
++        let CollectionRecord::Commit(before) = commit else {
++            unreachable!()
++        };
++        let after = decode_record(expected, &encode_record(expected, commit).unwrap()).unwrap();
++        let CollectionRecord::Commit(after) = after else {
++            unreachable!()
++        };
++        assert_eq!(after.public_key(), before.public_key());
++        assert_eq!(after, before);
++    }
++
++    struct ExactSelectorStore {
++        expected: CollectionHandle,
++        selected: Vec<CollectionRecord>,
++        global_enumerations: Cell<usize>,
++        selections: Cell<usize>,
++    }
++
++    impl CollectionRead for ExactSelectorStore {
++        type RecordsError = Infallible;
++        type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
++
++        fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
++            self.global_enumerations
++                .set(self.global_enumerations.get() + 1);
++            Ok(Vec::new().into_iter())
++        }
++
++        fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
++            Ok(Vec::new())
++        }
++
++        fn select_records(
++            &self,
++            selectors: &BTreeSet<CollectionRecordSelector>,
++        ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
++            assert_eq!(
++                selectors,
++                &BTreeSet::from([CollectionRecordSelector::Foundations(self.expected)])
++            );
++            self.selections.set(self.selections.get() + 1);
++            Ok(self.selected.clone())
++        }
++    }
++
++    #[test]
++    fn overlay_patch_uses_only_the_foundations_selector() {
++        let expected = collection(1);
++        let selected = foundations(expected).to_vec();
++        let store = ExactSelectorStore {
++            expected,
++            selected: selected.clone(),
++            global_enumerations: Cell::new(0),
++            selections: Cell::new(0),
++        };
++
++        let overlay = collection_record_patch(&store, expected).unwrap();
++
++        assert_eq!(overlay.len(), selected.len() as u64);
++        assert!(
++            selected
++                .iter()
++                .all(|record| { overlay.get(record.fingerprint()) == Some(*record) })
++        );
++        assert_eq!(store.selections.get(), 1);
++        assert_eq!(store.global_enumerations.get(), 0);
++    }
++}
+diff --git a/triblespace-core/src/collection/store.rs b/triblespace-core/src/collection/store.rs
+--- a/triblespace-core/src/collection/store.rs
++++ b/triblespace-core/src/collection/store.rs
+@@ -157,6 +157,22 @@ pub(crate) fn selectors_match_record(
+ /// witnesses are references to other records, not ingress prerequisites:
+ /// a record may be persisted before its witnesses or WRITE proofs arrive.
+ pub trait CollectionRead {
++    /// Native owner-maintained counts for this exact observation. Untracked
++    /// permits an explicitly scoped reader to compute its own statistics;
++    /// Ready may describe an incomplete replay prefix; preserve its explicit
++    /// completion flag when presenting the exact counts. Native pile replay
++    /// completes the count index before publishing each frame boundary.
++    fn record_count_status(&self, _root: CollectionHandle) -> super::record_counts::RecordCountStatus {
++        super::record_counts::RecordCountStatus::Untracked { replay_complete: true }
++    }
++
++    /// Share an existing canonical projection when the native owner has
++    /// completed this observation. This never performs selection or grants
++    /// access; callers must already be authorized for the exact root.
++    fn cached_record_patch(&self, _root: CollectionHandle) -> Option<&super::record_patch::CollectionRecordPatch> {
++        None
++    }
++
+     /// Failure while enumerating stored records.
+     type RecordsError: Error + Debug + Send + Sync + 'static;
+     /// Borrowing iterator over one deterministic view of known records.
+@@ -347,6 +363,13 @@ impl<R> CollectionRead for &R
+ where
+     R: CollectionRead + ?Sized,
+ {
++    fn record_count_status(&self, root: CollectionHandle) -> super::record_counts::RecordCountStatus {
++        (**self).record_count_status(root)
++    }
++    fn cached_record_patch(&self, root: CollectionHandle) -> Option<&super::record_patch::CollectionRecordPatch> {
++        (**self).cached_record_patch(root)
++    }
++
+     type RecordsError = R::RecordsError;
+     type RecordIter<'a>
+         = R::RecordIter<'a>
+diff --git a/triblespace-core/src/patch.rs b/triblespace-core/src/patch.rs
+--- a/triblespace-core/src/patch.rs
++++ b/triblespace-core/src/patch.rs
+@@ -19,6 +19,8 @@ mod entry_tests;
+ pub mod bytetable;
+ mod entry;
+ mod leaf;
++mod summary;
++pub use summary::{PatchSummary, PatchSummaryError};
+ 
+ use arrayvec::ArrayVec;
+ 
+diff --git a/triblespace-core/src/patch/summary.rs b/triblespace-core/src/patch/summary.rs
+new file mode 100644
+--- /dev/null
++++ b/triblespace-core/src/patch/summary.rs
+@@ -0,0 +1,49 @@
++use super::{Blake3Merkle, IdentitySchema, PATCH};
++
++/// Canonical root and exact leaf count of one immutable PATCH snapshot.
++#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
++pub struct PatchSummary {
++    root: Option<[u8; 32]>,
++    leaf_count: u64,
++}
++
++impl PatchSummary {
++    /// Construct one summary, rejecting the only impossible empty/nonempty
++    /// combinations.
++    pub fn new(root: Option<[u8; 32]>, leaf_count: u64) -> Result<Self, PatchSummaryError> {
++        if root.is_none() != (leaf_count == 0) {
++            return Err(PatchSummaryError);
++        }
++        Ok(Self { root, leaf_count })
++    }
++
++    /// Summarize an immutable canonical BLAKE3 PATCH.
++    pub fn from_patch<const KEY_LEN: usize, V>(
++        patch: &PATCH<KEY_LEN, IdentitySchema, V, Blake3Merkle>,
++    ) -> Self {
++        Self {
++            root: patch.merkle_root(),
++            leaf_count: patch.len(),
++        }
++    }
++
++    /// Canonical Merkle root; `None` is the unique empty set.
++    pub const fn root(self) -> Option<[u8; 32]> {
++        self.root
++    }
++
++    /// Exact number of leaves committed by the root.
++    pub const fn leaf_count(self) -> u64 {
++        self.leaf_count
++    }
++}
++
++/// A root and count cannot disagree about whether a PATCH is empty.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct PatchSummaryError;
++impl std::fmt::Display for PatchSummaryError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("PATCH root and leaf count disagree")
++    }
++}
++impl std::error::Error for PatchSummaryError {}
+diff --git a/triblespace-core/src/repo/pile.rs b/triblespace-core/src/repo/pile.rs
+--- a/triblespace-core/src/repo/pile.rs
++++ b/triblespace-core/src/repo/pile.rs
+@@ -3007,6 +3007,7 @@ pub struct PileFile {
+     /// Exact fixed native record roots plus the disjoint variable-record
+     /// occurrence relation. Fixed records retain their original body bytes.
+     collection_records: CollectionRecordIndex,
++    record_counts: crate::collection::record_counts::RecordCountIndex,
+     /// Complete canonical proofs keyed by the BLAKE3 identity of exact bytes.
+     /// Each value owns its validated mmap-backed view, shared by snapshots and readers.
+     capability_proofs: CapabilityProofIndex,
+@@ -3077,6 +3078,7 @@ fn padding_for_blob(blob_size: usize) -> usize {
+ /// cloning and [`StoreSnapshot::changes_since`](super::StoreSnapshot::changes_since)
+ /// constant-time in the number of semantic components.
+ pub struct PileFileSnapshot {
++    replay_complete: bool,
+     record_origin: Arc<()>,
+     mmap: Arc<MmapRaw>,
+     covered_len: usize,
+@@ -3088,6 +3090,7 @@ pub struct PileFileSnapshot {
+     /// validation state inline and is shared across immutable snapshots.
+     blobs: PileBlobIndex,
+     collection_records: CollectionRecordIndex,
++    record_counts: crate::collection::record_counts::RecordCountIndex,
+     legacy_collection_headers: LegacyCollectionHeaderIndex,
+     retired_equations: CollectionOccurrenceIndex,
+     capability_proofs: CapabilityProofIndex,
+@@ -3122,6 +3125,7 @@ impl PileFileSnapshot {
+         opaque_records: usize,
+         blobs: PileBlobIndex,
+         collection_records: CollectionRecordIndex,
++        record_counts: crate::collection::record_counts::RecordCountIndex,
+         legacy_collection_headers: LegacyCollectionHeaderIndex,
+         retired_equations: CollectionOccurrenceIndex,
+         capability_proofs: CapabilityProofIndex,
+@@ -3129,12 +3133,14 @@ impl PileFileSnapshot {
+         retired_proof_frames: Arc<Vec<(usize, usize)>>,
+     ) -> Self {
+         Self {
++            replay_complete: false,
+             record_origin,
+             mmap,
+             covered_len,
+             opaque_records,
+             blobs,
+             collection_records,
++            record_counts,
+             legacy_collection_headers,
+             retired_equations,
+             capability_proofs,
+@@ -3536,7 +3542,9 @@ impl super::SnapshotSource for PileFile {
+ 
+     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+         self.refresh()?;
+-        Ok(self.snapshot_replayed())
++        let mut snapshot = self.snapshot_replayed();
++        snapshot.replay_complete = true;
++        Ok(snapshot)
+     }
+ }
+ 
+@@ -3544,7 +3552,9 @@ impl super::SnapshotStep for PileFile {
+     /// [`Self::refresh_step`], then [`Self::snapshot_replayed`].
+     fn snapshot_step(&mut self, max_bytes: u64) -> Result<(Self::Snapshot, bool), ReadError> {
+         let reached_end = self.refresh_step(max_bytes)?;
+-        Ok((self.snapshot_replayed(), reached_end))
++        let mut snapshot = self.snapshot_replayed();
++        snapshot.replay_complete = reached_end;
++        Ok((snapshot, reached_end))
+     }
+ }
+ 
+@@ -4026,6 +4036,7 @@ impl PileFile {
+             blobs: PileBlobIndex::new(),
+             branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
+             collection_records: CollectionRecordIndex::new(),
++            record_counts: Default::default(),
+             capability_proofs: CapabilityProofIndex::new(),
+             legacy_collection_headers: LegacyCollectionHeaderIndex::new(),
+             retired_equations: CollectionOccurrenceIndex::new(),
+@@ -4114,7 +4125,8 @@ impl PileFile {
+     /// A snapshot of exactly the records applied so far, without replaying
+     /// anything new. After [`Self::refresh_step`] it is a prefix of the file;
+     /// [`SnapshotSource::snapshot`](super::SnapshotSource::snapshot) is a full
+-    /// refresh followed by this.
++    /// refresh followed by this. This no-refresh observation makes no EOF
++    /// claim; `snapshot` and `snapshot_step` stamp their observed completion.
+     pub fn snapshot_replayed(&self) -> PileFileSnapshot {
+         PileFileSnapshot::new(
+             self.record_origin.clone(),
+@@ -4123,6 +4135,7 @@ impl PileFile {
+             self.opaque_records,
+             self.blobs.clone(),
+             self.collection_records.clone(),
++            self.record_counts.clone(),
+             self.legacy_collection_headers.clone(),
+             self.retired_equations.clone(),
+             self.capability_proofs.clone(),
+@@ -4225,6 +4238,7 @@ impl PileFile {
+         });
+         let applied = match record.content {
+             PileRecordContent::Blob { hash, .. } => {
++                let first_presence = !self.blobs.has_prefix(&hash.raw);
+                 let candidate = IndexEntry::new(start_offset);
+                 // Replay is an index construction path, not a payload
+                 // validation pass. One segmented relation retains every
+@@ -4234,6 +4248,9 @@ impl PileFile {
+                 let key = blob_occurrence_key(&hash.raw, candidate);
+                 self.blobs
+                     .insert(&Entry::with_value(&key, CachedValidation::default()));
++                if first_presence {
++                    self.record_counts.blob(hash.raw, |raw| self.blobs.has_prefix(raw));
++                }
+                 Applied::Blob { hash }
+             }
+             PileRecordContent::Branch { branch_id, head } => {
+@@ -4266,7 +4283,10 @@ impl PileFile {
+                             marker: slice[..16].try_into().expect("decoded frame marker"),
+                         });
+                     }
+-                    self.collection_records.insert_current_fixed(&record, start_offset, slice, &self.mmap)?;
++                    let view = self.collection_records.insert_current_fixed(&record, start_offset, slice, &self.mmap)?;
++                    if let Some(view) = view {
++                        self.record_counts.record(view, |raw| self.blobs.has_prefix(raw));
++                    }
+                 } else {
+                     // MERGE retains the occurrence path. The other kinds
+                     // never get an occurrence leaf in this relation.
+@@ -4576,6 +4596,7 @@ impl PileFile {
+             std::ptr::drop_in_place(&mut this.blobs);
+             std::ptr::drop_in_place(&mut this.branches);
+             std::ptr::drop_in_place(&mut this.collection_records);
++            std::ptr::drop_in_place(&mut this.record_counts);
+             std::ptr::drop_in_place(&mut this.capability_proofs);
+             std::ptr::drop_in_place(&mut this.legacy_collection_headers);
+             std::ptr::drop_in_place(&mut this.retired_equations);
+@@ -5137,6 +5158,18 @@ impl PileFileSnapshot {
+ }
+ 
+ impl CollectionRead for PileFileSnapshot {
++    fn record_count_status(&self, root: CollectionHandle) -> crate::collection::record_counts::RecordCountStatus {
++        match self.record_counts.status(root) {
++            crate::collection::record_counts::RecordCountStatus::Ready { counts, .. } =>
++                crate::collection::record_counts::RecordCountStatus::Ready { counts, replay_complete: self.replay_complete },
++            other => other,
++        }
++    }
++
++    fn cached_record_patch(&self, root: CollectionHandle) -> Option<&crate::collection::record_patch::CollectionRecordPatch> {
++        self.record_counts.records(root)
++    }
++
+     type RecordsError = ReadError;
+     type RecordIter<'a> = PileCollectionRecordIter;
+ 
+@@ -8473,6 +8506,39 @@ mod tests {
+         assert!(original_mapping.upgrade().is_none());
+     }
+ 
++    #[test]
++    fn native_count_index_releases_mappings_after_close_and_last_snapshot_or_canonical_pin() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = fresh_empty_pile_path(&dir, "count-index-close.pile");
++        let mut pile = PileFile::open(&path).unwrap();
++        let root = Inline::new([72; 32]);
++        let record = CollectionRecord::Commit(CollectionCommit::sign(
++            &SigningKey::from_bytes(&[71; 32]), root, Inline::new([73; 32]), Inline::new([74; 32]),
++        ));
++        pile.insert(record).unwrap();
++        let snapshot = pile.snapshot().unwrap();
++        assert_eq!(snapshot.record_count_status(root), crate::collection::record_counts::RecordCountStatus::Ready {
++            counts: crate::collection::record_counts::DirectCounts { records: 1, direct_present: 0 },
++            replay_complete: true,
++        });
++        let canonical = snapshot.cached_record_patch(root).unwrap().clone();
++        let mapping = Arc::downgrade(&pile.mmap);
++        pile.close().unwrap();
++        assert!(mapping.upgrade().is_some(), "immutable snapshot/canonical pins retain mapped bodies");
++        drop(snapshot);
++        assert!(mapping.upgrade().is_some(), "escaped canonical projection owns its view");
++        drop(canonical);
++        assert!(mapping.upgrade().is_none(), "ordinary close must release the count index, including missing routes");
++
++        let mut reopened = PileFile::open(&path).unwrap();
++        let replayed = reopened.snapshot().unwrap();
++        assert_eq!(replayed.cached_record_patch(root).unwrap().len(), 1);
++        drop(replayed);
++        let mapping = Arc::downgrade(&reopened.mmap);
++        reopened.close().unwrap();
++        assert!(mapping.upgrade().is_none(), "close without escaped pins releases all native index owners");
++    }
++
+     #[test]
+     fn close_for_process_exit_persists_and_releases_the_file() {
+         let dir = tempfile::tempdir().unwrap();
+diff --git a/triblespace-core/src/repo/pile/record_index.rs b/triblespace-core/src/repo/pile/record_index.rs
+--- a/triblespace-core/src/repo/pile/record_index.rs
++++ b/triblespace-core/src/repo/pile/record_index.rs
+@@ -210,13 +210,22 @@ impl CollectionRecordIndex {
+             maps: self.maps.into_iter_ordered(),
+         }
+     }
+-    pub(super) fn insert_current_fixed(&mut self, record: &CollectionRecord, offset: usize, frame: &[u8], mmap: &Arc<MmapRaw>) -> Result<(), ReadError> {
++    pub(super) fn insert_current_fixed(&mut self, record: &CollectionRecord, offset: usize, frame: &[u8], mmap: &Arc<MmapRaw>) -> Result<Option<CollectionRecordView>, ReadError> {
+         let body = &frame[FRAME_KIND_OFFSET..FRAME_KIND_OFFSET + 224];
+         let key = collection_record_key(record, offset);
+         match record {
+-            CollectionRecord::Commit(_) => checked_insert(&mut self.commits, &key, body, mmap),
+-            CollectionRecord::Derive(_) => checked_insert(&mut self.derives, &key, body, mmap),
+-            CollectionRecord::Map(_) => checked_insert(&mut self.maps, &key, body, mmap),
++            CollectionRecord::Commit(_) => {
++                checked_insert(&mut self.commits, &key, body, mmap)?;
++                Ok(Some(trusted_view(self.commits.get(&key).expect("inserted commit"))))
++            }
++            CollectionRecord::Derive(_) => {
++                checked_insert(&mut self.derives, &key, body, mmap)?;
++                Ok(Some(trusted_view(self.derives.get(&key).expect("inserted derive"))))
++            }
++            CollectionRecord::Map(_) => {
++                checked_insert(&mut self.maps, &key, body, mmap)?;
++                Ok(None)
++            }
+             CollectionRecord::Merge(_) => unreachable!("MERGE occurrence relation unchanged"),
+         }
+     }
+diff --git a/triblespace-net/src/collection_activation.rs b/triblespace-net/src/collection_activation.rs
+--- a/triblespace-net/src/collection_activation.rs
++++ b/triblespace-net/src/collection_activation.rs
+@@ -681,6 +681,7 @@ pub fn validate_authorization_evidence_proof(
+ 
+ #[cfg(test)]
+ mod tests {
++    use crate::collection_delta::RecordPatchTestExt;
+     // Canonical but deliberately uninserted COMMIT witnesses keep these
+     // physical-storage fixtures independent of ancestor arrival order.
+ 
+diff --git a/triblespace-net/src/collection_body_view_tests.rs b/triblespace-net/src/collection_body_view_tests.rs
+--- a/triblespace-net/src/collection_body_view_tests.rs
++++ b/triblespace-net/src/collection_body_view_tests.rs
+@@ -275,10 +275,6 @@ fn body_views_keep_kind_identity_and_reject_nonfoundation_eager_values() {
+     let map_view: CollectionRecordView = map.into();
+     assert!(!map_view.is_foundation());
+     assert!(Value::from_record_view(&map_view).is_none());
+-    assert!(matches!(
+-        canonical_records(c, [map_view]),
+-        Err(CollectionDeltaError::NotReplicated)
+-    ));
+     let mut foreign = view.to_bytes();
+     foreign[..32].copy_from_slice(&triblespace_core::collection::KIND_COLLECTION_DERIVE);
+     assert!(
+diff --git a/triblespace-net/src/collection_delta.rs b/triblespace-net/src/collection_delta.rs
+--- a/triblespace-net/src/collection_delta.rs
++++ b/triblespace-net/src/collection_delta.rs
+@@ -1,651 +1,32 @@
+-//! Policy-independent collection-record delta mechanics.
+-//!
+-//! This module owns only the immutable evidence boundary: strict framing,
+-//! intrinsic collection matching, ingress signature verification, canonical
+-//! fingerprint ordering, and bounded `current - previous` selection. It deliberately
+-//! does not resolve referenced blobs or decide READ/WRITE policy.
+-//!
+-//! Only foundations replicate: a collection's COMMITs and DERIVEs. A MERGE is
+-//! the signing host's own lattice node; it never enters a record PATCH, is
+-//! never encoded for a peer, and a peer's MERGE is refused on decode.
+-
+-use std::collections::BTreeSet;
+-use std::error::Error;
+-use std::fmt;
+-use anybytes::View;
+-
+-use triblespace_core::collection::{
+-    CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordView, CollectionRecordFingerprint,
+-    CollectionRecordSelector, RecordDecodeError, RecordViewChanges, EncodedCommit, EncodedDerive,
++//! Canonical foundation evidence shared with the native snapshot owner.
++pub use triblespace_core::collection::record_patch::{
++    CollectionDeltaError, CollectionRecordPatch, CollectionRecordPatchError,
++    collection_record_patch, update_collection_record_patch, encode_record, decode_record,
+ };
+-use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
+-
+-use crate::patch_repair::PatchSummary;
+-
+-/// Two canonical per-kind PATCH roots naming one exact collection.
+-#[derive(Clone, Debug)]
+-pub struct CollectionRecordPatch {
+-    collection: CollectionHandle,
+-    commits: PATCH<32, IdentitySchema, View<EncodedCommit>, Blake3Merkle>,
+-    derives: PATCH<32, IdentitySchema, View<EncodedDerive>, Blake3Merkle>,
+-}
+-
+-impl CollectionRecordPatch {
+-    /// Exact collection named by every record in this PATCH.
+-    pub const fn collection(&self) -> CollectionHandle {
+-        self.collection
+-    }
+-
+-    /// Independent COMMIT and DERIVE summaries, never a synthetic union root.
+-    pub fn summaries(&self) -> [PatchSummary; 2] {
+-        [PatchSummary::from_patch(&self.commits), PatchSummary::from_patch(&self.derives)]
+-    }
+-
+-    /// Number of canonical records in this collection overlay.
+-    pub fn len(&self) -> u64 {
+-        self.commits.len() + self.derives.len()
+-    }
+-
+-    /// Whether this collection overlay has no known records.
+-    pub fn is_empty(&self) -> bool {
+-        self.commits.is_empty() && self.derives.is_empty()
+-    }
+-
+-    /// Test oracle only: production readers use kind-directed typed access.
+-    #[cfg(test)]
+-    pub fn get(&self, fingerprint: CollectionRecordFingerprint) -> Option<CollectionRecord> {
+-        self.commits.get(&fingerprint.raw()).map(|v| CollectionRecord::Commit(v.to_record().unwrap()))
+-            .or_else(|| self.derives.get(&fingerprint.raw()).map(|v| CollectionRecord::Derive(v.to_record().unwrap())))
+-    }
+-
+-    /// The immutable COMMIT fingerprint-to-body relation.
+-    pub fn commits(&self) -> &PATCH<32, IdentitySchema, View<EncodedCommit>, Blake3Merkle> {
+-        &self.commits
+-    }
+-
+-    /// The immutable DERIVE fingerprint-to-body relation.
+-    pub fn derives(&self) -> &PATCH<32, IdentitySchema, View<EncodedDerive>, Blake3Merkle> {
+-        &self.derives
+-    }
+-
+-    /// Test oracle; semantic decoding is deliberately absent from serving.
+-    #[cfg(test)]
+-    pub fn records(&self) -> impl Iterator<Item = CollectionRecord> + '_ {
+-        let mut commits = self.commits.iter_ordered().peekable();
+-        let mut derives = self.derives.iter_ordered().peekable();
+-        std::iter::from_fn(move || {
+-            let key = match (commits.peek(), derives.peek()) {
+-                (Some(c), Some(d)) if c <= d => commits.next(),
+-                (Some(_), Some(_)) | (None, Some(_)) => derives.next(),
+-                (Some(_), None) => commits.next(),
+-                (None, None) => None,
+-            }?;
+-            self.get(CollectionRecordFingerprint::from_raw(*key))
+-        })
+-    }
+-
+-    fn empty(collection: CollectionHandle) -> Self {
+-        Self { collection, commits: PATCH::new(), derives: PATCH::new() }
+-    }
+-
+-    /// Exact bytes are checked before PATCH's key-only equality can shortcut.
+-    fn matches(&self, fingerprint: CollectionRecordFingerprint, record: &CollectionRecordView) -> Option<bool> {
+-        let key = fingerprint.raw();
+-        if let Some(existing) = self.commits.get(&key) {
+-            return Some(record.as_commit().is_some_and(|v| v.body_bytes() == existing.body_bytes()));
+-        }
+-        self.derives.get(&key).map(|existing| record.as_derive().is_some_and(|v| v.body_bytes() == existing.body_bytes()))
+-    }
+-}
+-
+-/// Failure while constructing an exact per-collection record PATCH.
+-#[derive(Debug)]
+-pub enum CollectionRecordPatchError<E> {
+-    Store(E),
+-    Evidence(CollectionDeltaError),
+-}
+-
+-impl<E: fmt::Display> fmt::Display for CollectionRecordPatchError<E> {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        match self {
+-            Self::Store(error) => write!(f, "select collection records: {error}"),
+-            Self::Evidence(error) => error.fmt(f),
+-        }
+-    }
+-}
+-
+-impl<E> Error for CollectionRecordPatchError<E>
+-where
+-    E: Error + 'static,
+-{
+-    fn source(&self) -> Option<&(dyn Error + 'static)> {
+-        match self {
+-            Self::Store(error) => Some(error),
+-            Self::Evidence(error) => Some(error),
+-        }
+-    }
+-}
+-
+-/// Failure at the sparse immutable-evidence boundary.
+-#[derive(Clone, Debug, Eq, PartialEq)]
+-pub enum CollectionDeltaError {
+-    Decode(RecordDecodeError),
+-    WrongCollection,
+-    /// Not a foundation (a MERGE is the signing host's own lattice node):
+-    /// it never replicates.
+-    NotReplicated,
+-    FingerprintCollision(CollectionRecordFingerprint),
+-}
+-
+-impl fmt::Display for CollectionDeltaError {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        match self {
+-            Self::Decode(error) => write!(f, "decode collection record: {error}"),
+-            Self::WrongCollection => write!(f, "record names another collection"),
+-            Self::NotReplicated => write!(f, "only COMMIT and DERIVE records replicate"),
+-            Self::FingerprintCollision(fingerprint) => {
+-                write!(
+-                    f,
+-                    "distinct records share full-width fingerprint {fingerprint}"
+-                )
+-            }
+-        }
+-    }
+-}
+-
+-impl Error for CollectionDeltaError {
+-    fn source(&self) -> Option<&(dyn Error + 'static)> {
+-        match self {
+-            Self::Decode(error) => Some(error),
+-            _ => None,
+-        }
+-    }
+-}
+-
+-impl From<RecordDecodeError> for CollectionDeltaError {
+-    fn from(error: RecordDecodeError) -> Self {
+-        Self::Decode(error)
+-    }
+-}
+-
+-/// Build the exact valued PATCH of one collection's foundations through their
+-/// selector.
+-///
+-/// This is the sole collection-overlay construction path: it never asks the
+-/// caller for the store's global record stream. Backends remain free to answer
+-/// the selector from a secondary index or another sparse representation.
+-pub fn collection_record_patch<R>(
+-    snapshot: &R,
+-    collection: CollectionHandle,
+-) -> Result<CollectionRecordPatch, CollectionRecordPatchError<R::RecordsError>>
+-where
+-    R: CollectionRead,
+-{
+-    let selectors = BTreeSet::from([CollectionRecordSelector::Foundations(collection)]);
+-    let records = snapshot
+-        .select_record_views(&selectors)
+-        .map_err(CollectionRecordPatchError::Store)?;
+-    canonical_records(collection, records).map_err(CollectionRecordPatchError::Evidence)
+-}
+-
+-/// Advance the PATCH built from `previous` using selected append evidence or
+-/// exact semantic changes; rebuild when physical sources are incomparable.
+-/// `prior` must describe that previous snapshot and
+-/// retains its unchanged persistent Merkle subtrees; no old record body is
+-/// rehashed simply because another record arrived in its collection.
+-pub fn update_collection_record_patch<R>(
+-    current: &R,
+-    previous: &R,
+-    prior: &CollectionRecordPatch,
+-) -> Result<CollectionRecordPatch, CollectionRecordPatchError<R::RecordsError>>
+-where
+-    R: CollectionRead,
+-{
+-    let expected = prior.collection;
+-    let selectors = BTreeSet::from([CollectionRecordSelector::Foundations(expected)]);
+-    let changes = current
+-        .select_record_view_changes(previous, &selectors)
+-        .map_err(CollectionRecordPatchError::Store)?;
+-    let (added, removed) = match changes {
+-        RecordViewChanges::Append(added) => (added, Vec::new()),
+-        RecordViewChanges::Delta { added, removed } => (added, removed),
+-        RecordViewChanges::Rebuild => return collection_record_patch(current, expected),
+-    };
+-    // Operation-local deltas: edit the retained Merkle trie once per batch,
+-    // rather than rehashing its wide ancestors after every changed record.
+-    // PATCH equality only observes keys, so validate attached values before
+-    // either structural operation can short-circuit an equal subtree.
+-    let mut removals = CollectionRecordPatch::empty(expected);
+-    for record in removed {
+-        validate_view(expected, &record).map_err(CollectionRecordPatchError::Evidence)?;
+-        let fingerprint = record.fingerprint();
+-        if let Some(matches) = prior.matches(fingerprint, &record) {
+-            if !matches {
+-                return Err(CollectionRecordPatchError::Evidence(
+-                    CollectionDeltaError::FingerprintCollision(fingerprint),
+-                ));
+-            }
+-            insert_fingerprinted_record(&mut removals, record, fingerprint)
+-                .map_err(CollectionRecordPatchError::Evidence)?;
+-        }
+-    }
+-    let mut next = prior.clone();
+-    next.commits = next.commits.difference(&removals.commits);
+-    next.derives = next.derives.difference(&removals.derives);
+-    let mut additions = CollectionRecordPatch::empty(expected);
+-    for record in added {
+-        validate_view(expected, &record).map_err(CollectionRecordPatchError::Evidence)?;
+-        let fingerprint = record.fingerprint();
+-        if next.matches(fingerprint, &record) == Some(false) {
+-            return Err(CollectionRecordPatchError::Evidence(
+-                CollectionDeltaError::FingerprintCollision(fingerprint),
+-            ));
+-        }
+-        // Checks duplicates/collisions within this batch independently of the
+-        // retained tree. Actual values, not placeholders, enter the delta.
+-        insert_fingerprinted_record(&mut additions, record, fingerprint)
+-            .map_err(CollectionRecordPatchError::Evidence)?;
+-    }
+-    next.commits.union(additions.commits);
+-    next.derives.union(additions.derives);
+-    Ok(next)
+-}
+-
+-/// Encode one trusted local record after checking its intrinsic collection.
+-/// Signatures are not re-verified on output. WRITE authorization is absent: it
+-/// governs derived admission, not whether canonical inert evidence may exist.
+-pub fn encode_record(
+-    expected: CollectionHandle,
+-    record: CollectionRecord,
+-) -> Result<Vec<u8>, CollectionDeltaError> {
+-    validate_record(expected, record)?;
+-    Ok(record.to_bytes())
+-}
+-
+-/// Strictly decode one complete self-tagged record for an implicit collection
+-/// overlay. Trailing bytes, noncanonical MERGE inputs, unknown tags, wrong
+-/// collections, invalid signatures and MERGE records fail before insertion.
+-pub fn decode_record(
+-    expected: CollectionHandle,
+-    bytes: &[u8],
+-) -> Result<CollectionRecord, CollectionDeltaError> {
+-    let record = CollectionRecord::from_bytes(bytes)?;
+-    validate_record(expected, record)?;
+-    Ok(record)
+-}
+-
+-fn validate_record(
+-    expected: CollectionHandle,
+-    record: CollectionRecord,
+-) -> Result<(), CollectionDeltaError> {
+-    if record.collection() != expected {
+-        return Err(CollectionDeltaError::WrongCollection);
+-    }
+-    // Foundations are named positively, so a record kind added later is
+-    // refused until it is listed here.
+-    if !matches!(
+-        record,
+-        CollectionRecord::Commit(_) | CollectionRecord::Derive(_)
+-    ) {
+-        return Err(CollectionDeltaError::NotReplicated);
+-    }
+-    Ok(())
+-}
+-
+-fn validate_view(expected: CollectionHandle, record: &CollectionRecordView) -> Result<(), CollectionDeltaError> {
+-    if record.collection() != expected { return Err(CollectionDeltaError::WrongCollection); }
+-    if !record.is_foundation() { return Err(CollectionDeltaError::NotReplicated); }
+-    Ok(())
+-}
+-
+-fn canonical_records<R: Into<CollectionRecordView>>(
+-    expected: CollectionHandle,
+-    records: impl IntoIterator<Item = R>,
+-) -> Result<CollectionRecordPatch, CollectionDeltaError> {
+-    let mut canonical = CollectionRecordPatch::empty(expected);
+-    for record in records {
+-        insert_record(expected, &mut canonical, record)?;
+-    }
+-    Ok(canonical)
+-}
+-
+-fn insert_record(
+-    expected: CollectionHandle,
+-    canonical: &mut CollectionRecordPatch,
+-    record: impl Into<CollectionRecordView>,
+-) -> Result<(), CollectionDeltaError> {
+-    let record = record.into();
+-    validate_view(expected, &record)?;
+-    let fingerprint = record.fingerprint();
+-    insert_fingerprinted_record(canonical, record, fingerprint)
+-}
+-
+-// The caller validated the collection/kind and computed this fingerprint for
+-// this exact view. Incremental membership checks and batch insertion reuse it.
+-fn insert_fingerprinted_record(
+-    canonical: &mut CollectionRecordPatch,
+-    record: CollectionRecordView,
+-    fingerprint: CollectionRecordFingerprint,
+-) -> Result<(), CollectionDeltaError> {
+-    let key = fingerprint.raw();
+-    if let Some(matches) = canonical.matches(fingerprint, &record) {
+-        if !matches {
+-            return Err(CollectionDeltaError::FingerprintCollision(fingerprint));
+-        }
+-        return Ok(());
+-    }
+-    if let Some(value) = record.as_commit() {
+-        canonical.commits.insert(&PatchEntry::with_value(&key, value.clone()));
+-    } else if let Some(value) = record.as_derive() {
+-        canonical.derives.insert(&PatchEntry::with_value(&key, value.clone()));
+-    } else {
+-        unreachable!("validate_view admits only foundations");
+-    }
+-    Ok(())
+-}
+ 
+ #[cfg(test)]
+-#[path = "collection_delta_batch_tests.rs"]
+-mod batch_tests;
+-
++use std::collections::BTreeSet;
++#[cfg(test)]
++use triblespace_core::collection::{CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordView, CollectionRecordSelector};
+ #[cfg(test)]
+ #[path = "collection_body_view_tests.rs"]
+ mod body_view_tests;
+ 
+ #[cfg(test)]
+-mod tests {
+-    use std::cell::Cell;
+-    use std::convert::Infallible;
+-
+-    use ed25519_dalek::SigningKey;
+-    use triblespace_core::collection::{
+-        CollectionCommit, CollectionData, CollectionDerive,
+-        CollectionMerge, empty_metadata_handle,
+-    };
+-    use triblespace_core::inline::Inline;
+-
+-    use super::*;
+-
+-    fn collection(byte: u8) -> CollectionHandle {
+-        Inline::new([byte; 32])
+-    }
+-
+-    fn data(byte: u8) -> CollectionData {
+-        Inline::new([byte; 32])
+-    }
+-
+-    fn records(expected: CollectionHandle) -> [CollectionRecord; 3] {
+-        [
+-            CollectionRecord::Commit(CollectionCommit::sign(
+-                &SigningKey::from_bytes(&[7; 32]),
+-                expected,
+-                data(1),
+-                empty_metadata_handle(),
+-            )),
+-            CollectionRecord::Merge(
+-                CollectionMerge::sign(
+-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+-                    expected,
+-                    [2, 3, 5, 6, 7, 8, 9, 10].map(data),
+-                    data(4),
+-                )
+-                .unwrap(),
+-            ),
+-            CollectionRecord::Derive(CollectionDerive::sign(
+-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+-                expected,
+-                triblespace_core::collection::SourceLocator::of(data(4).raw),
+-                data(5),
+-            )),
+-        ]
+-    }
+-
+-    fn foundations(expected: CollectionHandle) -> [CollectionRecord; 2] {
+-        let [commit, _, derive] = records(expected);
+-        [commit, derive]
+-    }
+-
+-    #[test]
+-    fn foundation_records_roundtrip_for_the_implicit_collection() {
+-        let expected = collection(1);
+-        for record in foundations(expected) {
+-            let bytes = encode_record(expected, record).unwrap();
+-            assert_eq!(decode_record(expected, &bytes).unwrap(), record);
+-        }
+-    }
+-
+-    #[test]
+-    fn merge_records_are_never_encoded_decoded_or_patched() {
+-        let expected = collection(1);
+-        let merge = records(expected)[1];
+-        assert_eq!(
+-            encode_record(expected, merge),
+-            Err(CollectionDeltaError::NotReplicated)
+-        );
+-        assert_eq!(
+-            decode_record(expected, &merge.to_bytes()),
+-            Err(CollectionDeltaError::NotReplicated)
+-        );
+-        assert!(matches!(
+-            canonical_records(expected, records(expected)),
+-            Err(CollectionDeltaError::NotReplicated)
+-        ));
+-    }
+-
+-    #[test]
+-    fn map_records_are_never_encoded_decoded_or_patched() {
+-        use triblespace_core::collection::CollectionMap;
+-        let expected = collection(1);
+-        let map = CollectionRecord::Map(CollectionMap::sign(
+-            &SigningKey::from_bytes(&[7; 32]),
+-            expected,
+-            data(1),
+-            data(6),
+-        ));
+-        // The bytes decode as a MAP: the refusal is the replication rule,
+-        // not a decoding failure.
+-        assert_eq!(CollectionRecord::from_bytes(&map.to_bytes()).unwrap(), map);
+-        assert_eq!(
+-            encode_record(expected, map),
+-            Err(CollectionDeltaError::NotReplicated)
+-        );
+-        assert_eq!(
+-            decode_record(expected, &map.to_bytes()),
+-            Err(CollectionDeltaError::NotReplicated)
+-        );
+-        let [commit, derive] = foundations(expected);
+-        assert!(matches!(
+-            canonical_records(expected, [commit, map, derive]),
+-            Err(CollectionDeltaError::NotReplicated)
+-        ));
+-    }
+-
+-    #[test]
+-    fn framing_collection_and_signatures_fail_before_admission() {
+-        let expected = collection(1);
+-        let commit = records(expected)[0];
+-        let bytes = encode_record(expected, commit).unwrap();
+-
+-        assert_eq!(
+-            decode_record(collection(2), &bytes),
+-            Err(CollectionDeltaError::WrongCollection)
+-        );
+-        for record in records(expected) {
+-            // Signature checks precede the replication rule, so a tampered
+-            // MERGE fails as a decode error too.
+-            let mut tampered = record.to_bytes();
+-            *tampered.last_mut().unwrap() ^= 1;
+-            assert!(matches!(
+-                decode_record(expected, &tampered),
+-                Err(CollectionDeltaError::Decode(
+-                    RecordDecodeError::Verification(_)
+-                ))
+-            ));
+-        }
+-        let mut trailing = bytes.clone();
+-        trailing.push(0);
+-        assert!(matches!(
+-            decode_record(expected, &trailing),
+-            Err(CollectionDeltaError::Decode(_))
+-        ));
+-        assert!(decode_record(expected, &bytes[..bytes.len() - 1]).is_err());
+-        assert!(decode_record(expected, &[99]).is_err());
+-    }
+-
+-    #[test]
+-    fn trusted_local_index_and_outbound_encoding_do_not_reverify() {
+-        use triblespace_core::collection::CollectionStore;
+-        use triblespace_core::repo::pile::{Pile, PileRecordContent, PileRecords};
+-
+-        let expected = collection(1);
+-        let record = records(expected)[2];
+-        let file = tempfile::NamedTempFile::new().unwrap();
+-        let mut pile = Pile::open(file.path()).unwrap();
+-        pile.insert(record).unwrap();
+-        pile.close().unwrap();
+-        let physical = PileRecords::open(file.path())
+-            .unwrap()
+-            .next()
+-            .unwrap()
+-            .unwrap();
+-        let mut bytes = std::fs::read(file.path()).unwrap();
+-        bytes[physical.offset + 32 + record.to_bytes().len() - 2] ^= 1;
+-        std::fs::write(file.path(), bytes).unwrap();
+-        let physical = PileRecords::open(file.path())
+-            .unwrap()
+-            .next()
+-            .unwrap()
+-            .unwrap();
+-        let PileRecordContent::Collection { record: evidence } = physical.content else {
+-            panic!("native fixture is not a collection record");
+-        };
+-        assert!(evidence.verify_strict().is_err());
+-        let patch = canonical_records(expected, [evidence]).unwrap();
+-        let view = patch.derives().get(&evidence.fingerprint().raw()).unwrap();
+-        assert_eq!(view.body_bytes(), &evidence.to_bytes());
+-        assert_eq!(crate::walk::Value::Derive(view.clone()).bytes(expected).unwrap(), evidence.to_bytes());
+-        let outbound = encode_record(expected, evidence).unwrap();
+-        assert!(decode_record(expected, &outbound).is_err());
+-    }
+-
+-    #[test]
+-    fn derives_roundtrip_before_their_input_record_or_proofs_are_present() {
+-        let signer = ed25519_dalek::SigningKey::from_bytes(&[43; 32]);
+-        let source = collection(44);
+-        let target = collection(45);
+-        let commit = CollectionCommit::sign(&signer, source, data(46), empty_metadata_handle());
+-        let derive = CollectionRecord::Derive(CollectionDerive::sign(
+-            &signer,
+-            target,
+-            triblespace_core::collection::SourceLocator::of(commit.data().raw),
+-            data(47),
+-        ));
+-        let bytes = encode_record(target, derive).unwrap();
+-        let decoded = decode_record(target, &bytes).unwrap();
+-        assert_eq!(decoded, derive);
+-        // The record names the input PAYLOAD and nothing that has to arrive
+-        // first. Which record produced that payload -- the commit here -- is
+-        // a relation a reader recovers by content, so the derive travels
+-        // alone and stays meaningful on the far side.
+-        assert_eq!(canonical_records(target, [decoded]).unwrap().len(), 1);
+-        let mut tampered = bytes;
+-        // Every field is in the signature transcript, not an unauthenticated
+-        // retrieval hint: flipping one bit of the output breaks the record.
+-        tampered[2 * 32] ^= 1;
+-        assert!(decode_record(target, &tampered).is_err());
+-    }
+-
+-    #[test]
+-    fn noncanonical_merge_inputs_fail_before_admission() {
+-        let expected = collection(1);
+-        let merge = CollectionMerge::sign(
+-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+-            expected,
+-            [2, 3, 5, 6, 7, 8, 9, 10].map(data),
+-            data(4),
+-        )
+-        .unwrap();
+-        let mut bytes = merge.to_bytes();
+-        // The inputs follow kind, collection, result and author.
+-        bytes[128..160].fill(9);
+-        bytes[160..192].fill(1);
+-        assert!(matches!(
+-            decode_record(expected, &bytes),
+-            Err(CollectionDeltaError::Decode(
+-                RecordDecodeError::NonCanonicalMergeInputs
+-            ))
+-        ));
+-    }
+-
+-    #[test]
+-    fn relay_roundtrip_preserves_the_embedded_commit_author() {
+-        let expected = collection(1);
+-        let commit = records(expected)[0];
+-        let CollectionRecord::Commit(before) = commit else {
+-            unreachable!()
+-        };
+-        let after = decode_record(expected, &encode_record(expected, commit).unwrap()).unwrap();
+-        let CollectionRecord::Commit(after) = after else {
+-            unreachable!()
+-        };
+-        assert_eq!(after.public_key(), before.public_key());
+-        assert_eq!(after, before);
+-    }
+-
+-    struct ExactSelectorStore {
+-        expected: CollectionHandle,
+-        selected: Vec<CollectionRecord>,
+-        global_enumerations: Cell<usize>,
+-        selections: Cell<usize>,
+-    }
+-
+-    impl CollectionRead for ExactSelectorStore {
+-        type RecordsError = Infallible;
+-        type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
+-
+-        fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+-            self.global_enumerations
+-                .set(self.global_enumerations.get() + 1);
+-            Ok(Vec::new().into_iter())
+-        }
+-
+-        fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
+-            Ok(Vec::new())
+-        }
+-
+-        fn select_records(
+-            &self,
+-            selectors: &BTreeSet<CollectionRecordSelector>,
+-        ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
+-            assert_eq!(
+-                selectors,
+-                &BTreeSet::from([CollectionRecordSelector::Foundations(self.expected)])
+-            );
+-            self.selections.set(self.selections.get() + 1);
+-            Ok(self.selected.clone())
+-        }
+-    }
+-
+-    #[test]
+-    fn overlay_patch_uses_only_the_foundations_selector() {
+-        let expected = collection(1);
+-        let selected = foundations(expected).to_vec();
+-        let store = ExactSelectorStore {
+-            expected,
+-            selected: selected.clone(),
+-            global_enumerations: Cell::new(0),
+-            selections: Cell::new(0),
+-        };
+-
+-        let overlay = collection_record_patch(&store, expected).unwrap();
+-
+-        assert_eq!(overlay.len(), selected.len() as u64);
+-        assert!(
+-            selected
+-                .iter()
+-                .all(|record| { overlay.get(record.fingerprint()) == Some(*record) })
+-        );
+-        assert_eq!(store.selections.get(), 1);
+-        assert_eq!(store.global_enumerations.get(), 0);
++pub(crate) trait RecordPatchTestExt {
++    fn get(&self, fingerprint: triblespace_core::collection::CollectionRecordFingerprint) -> Option<CollectionRecord>;
++    fn records(&self) -> impl Iterator<Item = CollectionRecord>;
++}
++#[cfg(test)]
++impl RecordPatchTestExt for CollectionRecordPatch {
++    fn get(&self, fingerprint: triblespace_core::collection::CollectionRecordFingerprint) -> Option<CollectionRecord> {
++        self.commits().get(&fingerprint.raw()).map(|v| CollectionRecord::Commit(v.to_record().unwrap()))
++            .or_else(|| self.derives().get(&fingerprint.raw()).map(|v| CollectionRecord::Derive(v.to_record().unwrap())))
++    }
++    fn records(&self) -> impl Iterator<Item = CollectionRecord> {
++        let mut records: Vec<_> = self.commits().iter().chain(self.derives().iter())
++            .map(|id| self.get(triblespace_core::collection::CollectionRecordFingerprint::from_raw(*id)).unwrap()).collect();
++        records.sort_by_key(CollectionRecord::fingerprint);
++        records.into_iter()
+     }
+ }
+diff --git a/triblespace-net/src/connection.rs b/triblespace-net/src/connection.rs
+--- a/triblespace-net/src/connection.rs
++++ b/triblespace-net/src/connection.rs
+@@ -527,6 +527,9 @@ impl<C: Conn> Conn for Connection<C> {
+         self.conn.remote_id()
+     }
+ 
++    fn is_closed(&self) -> bool { self.conn.is_closed() }
++    fn traffic_stats(&self) -> Option<crate::transport::TrafficStats> { self.conn.traffic_stats() }
++
+     async fn open_bi(&self) -> anyhow::Result<(Self::SendHalf, Self::RecvHalf)> {
+         let state = self.state();
+         let permit = state
+@@ -689,6 +692,13 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
+         self.shared.table.lock().unwrap().current(peer)
+     }
+ 
++    /// Current ranked connections only. Copy shallow handles under the table
++    /// lock, then read transport state outside it. No dial or stream is opened.
++    pub fn observations(&self) -> Vec<crate::health::ConnectionHealth> {
++        let entries = self.shared.table.lock().unwrap().current_entries();
++        observe_connections(entries)
++    }
++
+     /// Whether `peer` has a connection streams can be opened on.
+     pub(crate) fn is_connected(&self, peer: PeerId) -> bool {
+         let table = self.shared.table.lock().unwrap();
+@@ -796,7 +806,25 @@ impl<T: Transport, S> Drop for DialWaiter<'_, T, S> {
+     }
+ }
+ 
++fn observe_connections<C: Conn>(entries: Vec<Entry<C>>) -> Vec<crate::health::ConnectionHealth> {
++    let mut observations: Vec<_> = entries.into_iter().filter_map(|entry| {
++        if entry.state.retired.load(Ordering::SeqCst)
++            || entry.state.closed.load(Ordering::SeqCst) || entry.conn.is_closed() { return None; }
++        Some(crate::health::ConnectionHealth {
++            id: entry.state.id,
++            peer: entry.state.peer,
++            traffic: entry.conn.traffic_stats(),
++        })
++    }).collect();
++    observations.sort_by_key(|row| row.id);
++    observations
++}
++
+ impl<C: Conn> Table<C> {
++    fn current_entries(&self) -> Vec<Entry<C>> {
++        self.current.values().filter_map(|id| self.connections.get(id)).cloned().collect()
++    }
++
+     fn current(&self, peer: PeerId) -> Option<Connection<C>> {
+         let entry = self.connections.get(self.current.get(&peer)?)?;
+         Some(Connection::new(entry.conn.clone(), entry.state.clone()))
+@@ -1416,6 +1444,80 @@ mod tests {
+     use super::*;
+     use crate::transport::sim::SimConn;
+ 
++    #[derive(Clone)]
++    struct ObservedConn {
++        peer: PeerId,
++        closed: Arc<AtomicBool>,
++        metrics: Option<crate::transport::TrafficStats>,
++    }
++    impl Conn for ObservedConn {
++        type SendHalf = <SimConn as Conn>::SendHalf;
++        type RecvHalf = <SimConn as Conn>::RecvHalf;
++        fn remote_id(&self) -> PeerId { self.peer }
++        fn is_closed(&self) -> bool { self.closed.load(Ordering::SeqCst) }
++        fn traffic_stats(&self) -> Option<crate::transport::TrafficStats> { self.metrics }
++        async fn open_bi(&self) -> anyhow::Result<(Self::SendHalf, Self::RecvHalf)> {
++            panic!("observation must not open a stream")
++        }
++        async fn accept_bi(&self) -> Option<(Self::SendHalf, Self::RecvHalf)> {
++            panic!("observation must not accept a stream")
++        }
++        fn close(&self, _: u32, _: &[u8]) { panic!("observation must not close a connection") }
++    }
++
++    #[test]
++    fn connection_observations_exclude_pending_undecided_draining_and_closed() {
++        let mut table = Table::<ObservedConn> {
++            connections: HashMap::new(), current: HashMap::new(), dials: HashMap::new(),
++        };
++        let peer = [1; 32];
++        let _pending = table.dial([2; 32]);
++        let old = State::new(1, peer, [0; 32], true);
++        old.sequence.set(1).unwrap();
++        let conn = ObservedConn { peer, closed: Arc::new(AtomicBool::new(false)),
++            metrics: Some(crate::transport::TrafficStats {
++                received_bytes: 50, sent_bytes: 100, rtt: Some(Duration::from_millis(9)),
++            }) };
++        table.connections.insert(1, Entry { conn: conn.clone(), state: old.clone() });
++        assert!(observe_connections(table.current_entries()).is_empty(), "undecided connection leaked");
++        table.rank(&old);
++        let rows = observe_connections(table.current_entries());
++        assert_eq!(rows.len(), 1);
++        assert_eq!(rows[0].id, 1);
++        assert_eq!(rows[0].traffic, conn.metrics);
++        let replacement = State::new(2, peer, [0; 32], true);
++        replacement.sequence.set(2).unwrap();
++        table.connections.insert(2, Entry { conn: conn.clone(), state: replacement.clone() });
++        table.rank(&replacement);
++        assert!(old.retired.load(Ordering::SeqCst));
++        assert_eq!(table.connections.len(), 2); // Old connection still drains.
++        let rows = observe_connections(table.current_entries());
++        assert_eq!(rows.len(), 1);
++        assert_eq!(rows[0].id, 2, "reconnect reused the old counter identity");
++        conn.closed.store(true, Ordering::SeqCst);
++        assert!(observe_connections(table.current_entries()).is_empty(), "QUIC closure waits for table cleanup");
++        conn.closed.store(false, Ordering::SeqCst);
++        replacement.closed.store(true, Ordering::SeqCst);
++        assert!(observe_connections(table.current_entries()).is_empty());
++        table.remove(&replacement);
++        assert!(observe_connections(table.current_entries()).is_empty());
++    }
++
++    #[test]
++    fn connection_wrapper_forwards_optional_metrics_without_io() {
++        let conn = ObservedConn { peer: [3; 32], closed: Arc::new(AtomicBool::new(false)), metrics: None };
++        let state = State::new(7, conn.peer, [0; 32], true);
++        let wrapped = Connection::new(conn.clone(), state.clone());
++        assert!(wrapped.traffic_stats().is_none());
++        assert!(!wrapped.is_closed());
++        conn.closed.store(true, Ordering::SeqCst);
++        assert!(wrapped.is_closed());
++        let measured = ObservedConn { metrics: Some(crate::transport::TrafficStats {
++            received_bytes: 123, sent_bytes: 456, rtt: None,
++        }), ..conn };
++        assert_eq!(Connection::new(measured.clone(), state).traffic_stats(), measured.metrics);
++    }
++
+     #[test]
+     fn a_cancelled_old_waiter_cannot_remove_a_replacement_dial() {
+         let mut table = Table::<SimConn> {
+diff --git a/triblespace-net/src/exchange.rs b/triblespace-net/src/exchange.rs
+--- a/triblespace-net/src/exchange.rs
++++ b/triblespace-net/src/exchange.rs
+@@ -1894,7 +1894,7 @@ pub(crate) mod tests {
+     use crate::patch_repair::{PatchBranch, PatchChild, PatchNode};
+     use crate::walk::{node, summary};
+ 
+-    use crate::collection_delta::{decode_record, encode_record};
++    use crate::collection_delta::{RecordPatchTestExt, decode_record, encode_record};
+     use crate::walk::tests::walking::{Node, open};
+ 
+     #[test]
+diff --git a/triblespace-net/src/health.rs b/triblespace-net/src/health.rs
+--- a/triblespace-net/src/health.rs
++++ b/triblespace-net/src/health.rs
+@@ -319,6 +319,15 @@ pub enum PairState {
+     },
+ }
+ 
++/// One current, ranked, non-draining connection at the host observation.
++/// Ids are local to this host lifetime; closed connection totals are not retained.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ConnectionHealth {
++    pub id: u64,
++    pub peer: PeerId,
++    pub traffic: Option<crate::transport::TrafficStats>,
++}
++
+ /// An immutable copy of bounded evidence recorded at actual runtime events.
+ /// Sampling this value cannot keep a dead host fresh.
+ #[derive(Clone, Debug, Eq, PartialEq)]
+@@ -327,6 +336,7 @@ pub struct HealthSnapshot {
+     pub started_at: Option<Mono>,
+     /// Written only by the host loop, never by a status reader or store refresh.
+     pub observed_at: Option<Mono>,
++    pub connections: Vec<ConnectionHealth>,
+     pub store: StoreHealth,
+     /// Exactly the locally active interest set, including unavailable views.
+     pub collections: Vec<CollectionHealth>,
+@@ -461,6 +471,7 @@ impl Health {
+             node,
+             started_at: None,
+             observed_at: None,
++            connections: Vec::new(),
+             store: StoreHealth::default(),
+             collections: Vec::new(),
+             publication: PublicationHealth::default(),
+diff --git a/triblespace-net/src/health_record.rs b/triblespace-net/src/health_record.rs
+--- a/triblespace-net/src/health_record.rs
++++ b/triblespace-net/src/health_record.rs
+@@ -548,6 +548,7 @@ mod tests {
+             node: iroh_base::SecretKey::from_bytes(&[5; 32]).public().into(),
+             started_at: Some(at),
+             observed_at: Some(at),
++            connections: Vec::new(),
+             store: crate::health::StoreHealth {
+                 last_snapshot_observed_at: Some(at),
+                 serving_snapshot: true,
+diff --git a/triblespace-net/src/host.rs b/triblespace-net/src/host.rs
+--- a/triblespace-net/src/host.rs
++++ b/triblespace-net/src/host.rs
+@@ -1271,6 +1271,7 @@ async fn host_loop<T: Transport, R>(
+     });
+     let _ = wiring.cap_tx.send(Some(cap as Arc<dyn NetCapability>));
+ 
++    let observed_connections = connections.clone();
+     tokio::spawn(async move {
+         while let Some(accepted) = incoming.recv().await {
+             debug!(
+@@ -1490,7 +1491,9 @@ async fn host_loop<T: Transport, R>(
+         }
+ 
+         let progress = publisher.progress();
++        let connections = observed_connections.observations();
+         wiring.health.update(|health| {
++            health.connections = connections;
+             health.observed_at = Some(crate::clock::mono_now());
+             let publication = &mut health.publication;
+             publication.resident = progress.resident;
+diff --git a/triblespace-net/src/host/acquisition_tests/exact_h_diagnostics.rs b/triblespace-net/src/host/acquisition_tests/exact_h_diagnostics.rs
+--- a/triblespace-net/src/host/acquisition_tests/exact_h_diagnostics.rs
++++ b/triblespace-net/src/host/acquisition_tests/exact_h_diagnostics.rs
+@@ -384,6 +384,9 @@ impl Conn for TracedConn {
+         self.inner.remote_id()
+     }
+ 
++    fn is_closed(&self) -> bool { self.inner.is_closed() }
++    fn traffic_stats(&self) -> Option<crate::transport::TrafficStats> { self.inner.traffic_stats() }
++
+     async fn open_bi(&self) -> anyhow::Result<(Self::SendHalf, Self::RecvHalf)> {
+         let (send, recv) = self.inner.open_bi().await?;
+         let call = self.trace.open(self.remote_id());
+diff --git a/triblespace-net/src/host/acquisition_tests/request_backpressure.rs b/triblespace-net/src/host/acquisition_tests/request_backpressure.rs
+--- a/triblespace-net/src/host/acquisition_tests/request_backpressure.rs
++++ b/triblespace-net/src/host/acquisition_tests/request_backpressure.rs
+@@ -20,6 +20,9 @@ impl Conn for AcceptedConn {
+         self.inner.remote_id()
+     }
+ 
++    fn is_closed(&self) -> bool { self.inner.is_closed() }
++    fn traffic_stats(&self) -> Option<crate::transport::TrafficStats> { self.inner.traffic_stats() }
++
+     async fn open_bi(&self) -> anyhow::Result<(Self::SendHalf, Self::RecvHalf)> {
+         self.inner.open_bi().await
+     }
+diff --git a/triblespace-net/src/host/blob_inventory_tests.rs b/triblespace-net/src/host/blob_inventory_tests.rs
+--- a/triblespace-net/src/host/blob_inventory_tests.rs
++++ b/triblespace-net/src/host/blob_inventory_tests.rs
+@@ -8,6 +8,9 @@
+ //! held set here: what is resident joins as it is, what is not is fetched by
+ //! hash first.
+ 
++#[cfg(test)]
++use crate::collection_delta::RecordPatchTestExt;
++
+ use anybytes::Bytes;
+ use ed25519_dalek::{SigningKey, VerifyingKey};
+ use triblespace_core::blob::Blob;
+diff --git a/triblespace-net/src/host/directory_rpc_tests.rs b/triblespace-net/src/host/directory_rpc_tests.rs
+--- a/triblespace-net/src/host/directory_rpc_tests.rs
++++ b/triblespace-net/src/host/directory_rpc_tests.rs
+@@ -77,6 +77,8 @@ impl Conn for PipeConn {
+         self.handler.local_id
+     }
+ 
++    fn is_closed(&self) -> bool { false } // This fixture has no connection shutdown.
++
+     async fn open_bi(&self) -> anyhow::Result<(Pipe, Pipe)> {
+         let (request, serve_recv) = duplex(1 << 16);
+         let (serve_send, reply) = duplex(1 << 16);
+diff --git a/triblespace-net/src/host/observation_tests.rs b/triblespace-net/src/host/observation_tests.rs
+--- a/triblespace-net/src/host/observation_tests.rs
++++ b/triblespace-net/src/host/observation_tests.rs
+@@ -6,6 +6,9 @@
+ //! landing task publishes these observations as walks land, and the
+ //! connection table serves the latest one.
+ 
++#[cfg(test)]
++use crate::collection_delta::RecordPatchTestExt;
++
+ use std::collections::BTreeSet;
+ use std::error::Error;
+ use std::sync::Arc;
+diff --git a/triblespace-net/src/host/pool_tests.rs b/triblespace-net/src/host/pool_tests.rs
+--- a/triblespace-net/src/host/pool_tests.rs
++++ b/triblespace-net/src/host/pool_tests.rs
+@@ -110,6 +110,24 @@ async fn reads_reset<R: tokio::io::AsyncRead + Unpin>(recv: &mut R, code: u32) -
+     }
+ }
+ 
++#[tokio::test(start_paused = true)]
++async fn passive_connection_snapshot_tracks_live_sim_connection_without_dialing() {
++    let net = network(Duration::from_millis(1));
++    let client = Node::join(&net, &SigningKey::from_bytes(&[241; 32]));
++    let server = Node::join(&net, &SigningKey::from_bytes(&[242; 32]));
++    assert!(client.table.observations().is_empty());
++    assert_eq!(net.dial_count(client.peer, server.peer), 0);
++    let connection = tokio::time::timeout(Duration::from_secs(2), client.table.connect(server.peer)).await.unwrap().unwrap();
++    let first = client.table.observations();
++    assert_eq!(first.len(), 1);
++    assert_eq!(first[0].peer, server.peer);
++    assert!(first[0].traffic.is_none(), "simulator invented QUIC measurements");
++    assert_eq!(client.table.observations(), first);
++    assert_eq!(net.dial_count(client.peer, server.peer), 1, "sampling dialed a peer");
++    connection.close(0, b"fixture done");
++    assert!(client.table.observations().is_empty(), "closed transport survived until table cleanup");
++}
++
+ #[tokio::test(start_paused = true)]
+ async fn cancelled_unique_dials_leave_no_dials_behind() {
+     let net = network(Duration::from_secs(1));
+diff --git a/triblespace-net/src/lib.rs b/triblespace-net/src/lib.rs
+--- a/triblespace-net/src/lib.rs
++++ b/triblespace-net/src/lib.rs
+@@ -55,6 +55,7 @@ pub(crate) mod riblt_resume;
+ pub(crate) mod riblt_store;
+ pub(crate) mod routing;
+ pub(crate) mod schedule;
++pub mod storage_snapshot;
+ pub mod telemetry;
+ pub mod transport;
+ mod wake_schedule;
+diff --git a/triblespace-net/src/patch_repair.rs b/triblespace-net/src/patch_repair.rs
+--- a/triblespace-net/src/patch_repair.rs
++++ b/triblespace-net/src/patch_repair.rs
+@@ -12,43 +12,7 @@ use anyhow::{Result, anyhow, bail};
+ 
+ use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH, PatchHash};
+ 
+-/// Canonical root and exact leaf count of one immutable PATCH snapshot.
+-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+-pub struct PatchSummary {
+-    root: Option<[u8; 32]>,
+-    leaf_count: u64,
+-}
+-
+-impl PatchSummary {
+-    /// Construct one summary, rejecting the only impossible empty/nonempty
+-    /// combinations.
+-    pub fn new(root: Option<[u8; 32]>, leaf_count: u64) -> Result<Self> {
+-        if root.is_none() != (leaf_count == 0) {
+-            bail!("PATCH root and leaf count disagree");
+-        }
+-        Ok(Self { root, leaf_count })
+-    }
+-
+-    /// Summarize an immutable canonical BLAKE3 PATCH.
+-    pub fn from_patch<const KEY_LEN: usize, V>(
+-        patch: &PATCH<KEY_LEN, IdentitySchema, V, Blake3Merkle>,
+-    ) -> Self {
+-        Self {
+-            root: patch.merkle_root(),
+-            leaf_count: patch.len(),
+-        }
+-    }
+-
+-    /// Canonical Merkle root; `None` is the unique empty set.
+-    pub const fn root(self) -> Option<[u8; 32]> {
+-        self.root
+-    }
+-
+-    /// Exact number of leaves committed by the root.
+-    pub const fn leaf_count(self) -> u64 {
+-        self.leaf_count
+-    }
+-}
++pub use triblespace_core::patch::PatchSummary;
+ 
+ /// Exact locator for one node under a pinned PATCH summary.
+ #[derive(Clone, Debug, Eq, PartialEq)]
+diff --git a/triblespace-net/src/peer/reader_counts.rs b/triblespace-net/src/peer/reader_counts.rs
+--- a/triblespace-net/src/peer/reader_counts.rs
++++ b/triblespace-net/src/peer/reader_counts.rs
+@@ -236,6 +236,13 @@ impl<R: triblespace_core::collection::CoverageRead> triblespace_core::collection
+ }
+ 
+ impl<R: CollectionRead> CollectionRead for Counted<R> {
++    fn record_count_status(&self, root: triblespace_core::collection::CollectionHandle) -> triblespace_core::collection::record_counts::RecordCountStatus {
++        self.inner.record_count_status(root)
++    }
++    fn cached_record_patch(&self, root: triblespace_core::collection::CollectionHandle) -> Option<&triblespace_core::collection::record_patch::CollectionRecordPatch> {
++        self.inner.cached_record_patch(root)
++    }
++
+     type RecordsError = R::RecordsError;
+     type RecordIter<'a>
+         = R::RecordIter<'a>
+diff --git a/triblespace-net/src/provider/btree_directory.rs b/triblespace-net/src/provider/btree_directory.rs
+--- a/triblespace-net/src/provider/btree_directory.rs
++++ b/triblespace-net/src/provider/btree_directory.rs
+@@ -589,6 +589,7 @@ mod tests {
+         );
+     }
+ 
++    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+     #[repr(C)]
+     #[derive(Debug)]
+     struct Mallinfo2 {
+@@ -604,11 +605,13 @@ mod tests {
+         keepcost: usize,
+     }
+ 
++    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+     unsafe extern "C" {
+         fn mallinfo2() -> Mallinfo2;
+     }
+ 
+     /// glibc's in-use heap bytes across every arena, mmapped chunks included.
++    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+     fn in_use_bytes() -> usize {
+         // SAFETY: mallinfo2 takes no arguments and only reads allocator state.
+         let info = unsafe { mallinfo2() };
+@@ -626,6 +629,7 @@ mod tests {
+     /// deadline. After measuring, every lease expires and unrelated requests
+     /// prune until the directory is empty; the in-use bytes left then are
+     /// what the directory failed to give back.
++    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+     #[test]
+     #[ignore = "manual allocator measurement; glibc only"]
+     fn directory_bytes_per_membership_probe() {
+diff --git a/triblespace-net/src/reconcile.rs b/triblespace-net/src/reconcile.rs
+--- a/triblespace-net/src/reconcile.rs
++++ b/triblespace-net/src/reconcile.rs
+@@ -10,6 +10,9 @@
+ //! Optional shallow/full hydration is local acquisition policy over selected
+ //! structural records, not semantic admission or another Peer protocol.
+ 
++#[cfg(test)]
++use crate::collection_delta::RecordPatchTestExt;
++
+ use std::any::Any;
+ use std::collections::{BTreeSet, HashMap, HashSet};
+ use std::time::Duration;
+diff --git a/triblespace-net/src/storage_snapshot.rs b/triblespace-net/src/storage_snapshot.rs
+new file mode 100644
+--- /dev/null
++++ b/triblespace-net/src/storage_snapshot.rs
+@@ -0,0 +1,527 @@
++//! Incremental local storage statistics pinned to one immutable store snapshot.
++//!
++//! Scope is supplied by the caller after its own access checks. This module
++//! neither grants access nor selects/activates collections. Canonical records
++//! reuse the repair PATCH; held membership reuses the store's published PATCHs.
++//! Only derived aggregates and missing-reference routes are retained. No state
++//! is persisted, and no blob body is fetched or traversed here.
++use crate::collection_delta::{
++    CollectionRecordPatch, collection_record_patch, update_collection_record_patch,
++};
++use std::collections::BTreeSet;
++use std::fmt::Display;
++use triblespace_core::{
++    blob::encodings::UnknownBlob,
++    collection::{CollectionHandle, CollectionRead, HeldBlobs, HeldRead},
++    inline::{Inline, encodings::hash::Handle},
++    patch::{Entry, IdentitySchema, PATCH},
++    repo::{BlobStoreList, StoreChanges, StoreSnapshot},
++};
++
++type Raw = [u8; 32];
++type Handles = PATCH<32, IdentitySchema>;
++mod dependency {
++    triblespace_core::key_segmentation!(Segments, 64, [32, 32]);
++    triblespace_core::key_schema!(Schema, Segments, 64, [0, 1]);
++}
++type Waiting = PATCH<64, dependency::Schema>;
++fn pair(blob: Raw, record: Raw) -> [u8; 64] {
++    let mut key = [0; 64];
++    key[..32].copy_from_slice(&blob);
++    key[32..].copy_from_slice(&record);
++    key
++}
++fn handle(raw: Raw) -> Inline<Handle<UnknownBlob>> {
++    Inline::new(raw)
++}
++
++pub use triblespace_core::collection::record_counts::DirectCounts;
++use triblespace_core::collection::record_counts::RecordCountStatus;
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct StorageWork {
++    /// Canonical records whose direct references were examined in this advance.
++    pub records_checked: u64,
++    /// Added/removed held memberships visited, not the complete inventory.
++    pub held_memberships: u64,
++}
++#[derive(Clone)]
++struct Direct {
++    records: CollectionRecordPatch,
++    present: Handles,
++    waiting: Waiting,
++}
++impl Direct {
++    fn references(&self, id: &Raw) -> Vec<Raw> {
++        if let Some(record) = self.records.commits().get(id) {
++            vec![
++                record.collection().raw,
++                record.data().raw,
++                record.metadata().raw,
++            ]
++        } else if let Some(record) = self.records.derives().get(id) {
++            // The DERIVE source locator is not a blob reference.
++            vec![record.target().raw, record.output().raw]
++        } else {
++            Vec::new()
++        }
++    }
++    fn check<R: BlobStoreList>(
++        &mut self,
++        snapshot: &R,
++        id: Raw,
++        work: &mut StorageWork,
++    ) -> Result<(), String>
++    where
++        R::Err: Display,
++    {
++        work.records_checked += 1;
++        let mut present = true;
++        for blob in self.references(&id) {
++            let route = pair(blob, id);
++            if snapshot
++                .contains_blob(handle(blob))
++                .map_err(|e| e.to_string())?
++            {
++                self.waiting.remove(&route);
++            } else {
++                present = false;
++                self.waiting.insert(&Entry::new(&route));
++            }
++        }
++        if present {
++            self.present.insert(&Entry::new(&id));
++        } else {
++            self.present.remove(&id);
++        }
++        Ok(())
++    }
++    fn counts(&self) -> DirectCounts {
++        DirectCounts {
++            records: self.records.len(),
++            direct_present: self.present.len(),
++        }
++    }
++}
++#[derive(Clone)]
++struct Inventory {
++    held: HeldBlobs,
++    bytes: u64,
++}
++#[derive(Clone, Copy, Default)]
++struct Ownership {
++    count: u64,
++    // Reversible aggregate of the distinct collection handles. Only interpreted
++    // when count == 1, when it is exactly the sole owner, not a hash identity.
++    owner_xor: Raw,
++}
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct StorageComposition {
++    pub known_bytes: u64,
++    pub shared_bytes: u64,
++    pub known_inventories: usize,
++    pub unknown_inventories: usize,
++}
++
++/// An immutable observation and its derived statistics. Advancing returns a
++/// new value; old observations retain their original source and PATCH roots.
++#[derive(Clone)]
++pub struct StorageSnapshot<R> {
++    snapshot: R,
++    direct: PATCH<32, IdentitySchema, Direct>,
++    count_statuses: PATCH<32, IdentitySchema, RecordCountStatus>,
++    inventories: PATCH<32, IdentitySchema, Inventory>,
++    ownership: PATCH<32, IdentitySchema, Ownership>,
++    exclusive: PATCH<32, IdentitySchema, u64>,
++    composition: StorageComposition,
++    work: StorageWork,
++}
++impl<R> StorageSnapshot<R>
++where
++    R: StoreSnapshot + CollectionRead + BlobStoreList + HeldRead,
++    R::RecordsError: Display,
++    R::Err: Display,
++{
++    /// Build or advance requested record statistics and the exact inventory
++    /// scope. An empty scope is empty, not permission to discover other roots.
++    /// Initial construction visits selected records/inventories once. Warm
++    /// construction uses canonical record and held-set differences.
++    pub fn observe(
++        snapshot: R,
++        record_roots: &[CollectionHandle],
++        inventory_roots: &[CollectionHandle],
++        previous: Option<&Self>,
++    ) -> Result<Self, String> {
++        let mut sample = Self::begin(snapshot, record_roots, inventory_roots, previous)?;
++        loop {
++            if let Some(snapshot) = sample.step(4096)? {
++                return Ok(snapshot);
++            }
++        }
++    }
++
++    /// Read owner-maintained counts and prepare native byte-difference cursors.
++    /// Native roots share their exact count status, including replay
++    /// prefixes; this sample never warms or duplicates their canonical state.
++    /// Explicitly requested untracked roots retain the cold canonical fallback
++    /// and carry their source's replay-completion flag into its result. Resident
++    /// byte work is cooperative and bounded by `StorageSample::step`.
++    pub fn begin(
++        snapshot: R,
++        record_roots: &[CollectionHandle],
++        inventory_roots: &[CollectionHandle],
++        previous: Option<&Self>,
++    ) -> Result<StorageSample<R>, String> {
++        let mut next = Self {
++            snapshot,
++            direct: PATCH::new(),
++            count_statuses: PATCH::new(),
++            inventories: PATCH::new(),
++            ownership: previous.map_or_else(PATCH::new, |p| p.ownership.clone()),
++            exclusive: previous.map_or_else(PATCH::new, |p| p.exclusive.clone()),
++            composition: previous
++                .map_or_else(StorageComposition::default, |p| p.composition.clone()),
++            work: StorageWork::default(),
++        };
++        // One residency delta for this advance. Loss requires rebuilding direct
++        // availability; indexed presence is intentionally not payload validity.
++        let mut arrived = Handles::new();
++        let mut lost = false;
++        let local_roots: BTreeSet<_> = record_roots.iter().copied().filter(|root| {
++            matches!(next.snapshot.record_count_status(*root), RecordCountStatus::Untracked { .. })
++        }).collect();
++        for root in record_roots {
++            let status = next.snapshot.record_count_status(*root);
++            // Native count failure belongs to this root. Preserve it beside
++            // other Ready roots; it is not a byte-sample failure.
++            next.count_statuses.insert(&Entry::with_value(&root.raw, status));
++        }
++        if let Some(old) = previous.filter(|_| !local_roots.is_empty()) {
++            if next
++                .snapshot
++                .changes_since(&old.snapshot)
++                .contains(StoreChanges::BLOBS)
++            {
++                for info in next.snapshot.blobs_diff(&old.snapshot) {
++                    let info = info.map_err(|e| e.to_string())?;
++                    if !old
++                        .snapshot
++                        .contains_blob(info.handle)
++                        .map_err(|e| e.to_string())?
++                    {
++                        arrived.insert(&Entry::new(&info.handle.raw));
++                    }
++                }
++                for info in old.snapshot.blobs_diff(&next.snapshot) {
++                    let info = info.map_err(|e| e.to_string())?;
++                    if !next
++                        .snapshot
++                        .contains_blob(info.handle)
++                        .map_err(|e| e.to_string())?
++                    {
++                        lost = true;
++                        break;
++                    }
++                }
++            }
++        }
++        for root in local_roots {
++            let old = previous.and_then(|p| p.direct.get(&root.raw));
++            // The native updater checks source lineage before occurrence-key
++            // algebra and rebuilds for incomparable origins. Only its resulting
++            // canonical PATCHs are compared below, never physical coordinates.
++            let records = match (previous, old) {
++                (Some(p), Some(d)) => {
++                    update_collection_record_patch(&next.snapshot, &p.snapshot, &d.records)
++                }
++                _ => collection_record_patch(&next.snapshot, root),
++            }
++            .map_err(|e| e.to_string())?;
++            let mut state = Direct {
++                records,
++                present: Handles::new(),
++                waiting: Waiting::new(),
++            };
++            let mut check = Handles::new();
++            if let Some(old) = old.filter(|_| !lost) {
++                state.present = old.present.clone();
++                state.waiting = old.waiting.clone();
++                for id in old
++                    .records
++                    .commits()
++                    .difference(state.records.commits())
++                    .iter()
++                    .chain(
++                        old.records
++                            .derives()
++                            .difference(state.records.derives())
++                            .iter(),
++                    )
++                {
++                    state.present.remove(id);
++                    for blob in old.references(id) {
++                        state.waiting.remove(&pair(blob, *id));
++                    }
++                }
++                for id in state
++                    .records
++                    .commits()
++                    .difference(old.records.commits())
++                    .iter()
++                    .chain(
++                        state
++                            .records
++                            .derives()
++                            .difference(old.records.derives())
++                            .iter(),
++                    )
++                {
++                    check.insert(&Entry::new(id));
++                }
++                for blob in arrived.iter() {
++                    state.waiting.infixes(blob, |id: &Raw| {
++                        check.insert(&Entry::new(id));
++                    });
++                }
++            } else {
++                for id in state
++                    .records
++                    .commits()
++                    .iter()
++                    .chain(state.records.derives().iter())
++                {
++                    check.insert(&Entry::new(id));
++                }
++            }
++            for id in check.iter() {
++                state.check(&next.snapshot, *id, &mut next.work)?;
++            }
++            let replay_complete = match next.count_statuses.get(&root.raw) {
++                Some(RecordCountStatus::Untracked { replay_complete }) => *replay_complete,
++                _ => unreachable!("local roots are explicitly untracked"),
++            };
++            next.count_statuses.replace(&Entry::with_value(&root.raw, RecordCountStatus::Ready {
++                counts: state.counts(), replay_complete,
++            }));
++            next.direct.insert(&Entry::with_value(&root.raw, state));
++        }
++        // Hold the native immutable inventory roots, not copies of their rows.
++        let roots: BTreeSet<_> = inventory_roots.iter().copied().collect();
++        next.composition.known_inventories = 0;
++        next.composition.unknown_inventories = 0;
++        for root in &roots {
++            if let Some(held) = next.snapshot.held(*root) {
++                let bytes = previous
++                    .and_then(|p| p.inventories.get(&root.raw))
++                    .map_or(0, |i| i.bytes);
++                next.inventories
++                    .insert(&Entry::with_value(&root.raw, Inventory { held, bytes }));
++                next.composition.known_inventories += 1;
++            } else {
++                next.composition.unknown_inventories += 1;
++            }
++        }
++        let mut jobs = Vec::new();
++        if let Some(old) = previous {
++            for root in old.inventories.iter() {
++                let before = old.inventories.get(root).unwrap();
++                let removed = match next.inventories.get(root) {
++                    Some(after) => before.held.difference(&after.held),
++                    None => before.held.clone(),
++                };
++                if !removed.is_empty() {
++                    jobs.push(StorageJob {
++                        root: *root,
++                        add: false,
++                        handles: Box::new(removed.into_iter_ordered()),
++                    });
++                }
++            }
++        }
++        for root in next.inventories.iter() {
++            let after = next.inventories.get(root).unwrap();
++            let added = match previous.and_then(|p| p.inventories.get(root)) {
++                Some(before) => after.held.difference(&before.held),
++                None => after.held.clone(),
++            };
++            if !added.is_empty() {
++                jobs.push(StorageJob {
++                    root: *root,
++                    add: true,
++                    handles: Box::new(added.into_iter_ordered()),
++                });
++            }
++        }
++        Ok(StorageSample {
++            next: Some(next),
++            previous: previous.map(|p| p.snapshot.clone()),
++            jobs,
++            cursor: 0,
++        })
++    }
++    fn length(snapshot: &R, blob: Raw) -> Result<u64, String> {
++        snapshot
++            .blob_info(handle(blob))
++            .map_err(|e| e.to_string())?
++            .map(|info| info.length)
++            .ok_or_else(|| "Held content absent from sampled index".into())
++    }
++    fn adjust(value: &mut u64, bytes: u64, add: bool) -> Result<(), String> {
++        *value = if add {
++            value.checked_add(bytes)
++        } else {
++            value.checked_sub(bytes)
++        }
++        .ok_or_else(|| "Storage byte count overflow or inconsistent delta".to_owned())?;
++        Ok(())
++    }
++    fn exclusive_adjust(&mut self, root: Raw, bytes: u64, add: bool) -> Result<(), String> {
++        let mut value = self.exclusive.get(&root).copied().unwrap_or(0);
++        Self::adjust(&mut value, bytes, add)?;
++        self.exclusive.replace(&Entry::with_value(&root, value));
++        Ok(())
++    }
++    fn membership(&mut self, root: Raw, blob: Raw, bytes: u64, add: bool) -> Result<(), String> {
++        self.work.held_memberships += 1;
++        if let Some(mut inventory) = self.inventories.get(&root).cloned() {
++            Self::adjust(&mut inventory.bytes, bytes, add)?;
++            self.inventories
++                .replace(&Entry::with_value(&root, inventory));
++        }
++        let mut owner = self.ownership.get(&blob).copied().unwrap_or_default();
++        if owner.count == 1 {
++            self.exclusive_adjust(owner.owner_xor, bytes, false)?;
++        } else if owner.count >= 2 {
++            Self::adjust(&mut self.composition.shared_bytes, bytes, false)?;
++        }
++        if owner.count == 0 {
++            Self::adjust(&mut self.composition.known_bytes, bytes, true)?;
++        }
++        Self::adjust(&mut owner.count, 1, add)?;
++        for (a, b) in owner.owner_xor.iter_mut().zip(root) {
++            *a ^= b;
++        }
++        if owner.count == 0 {
++            Self::adjust(&mut self.composition.known_bytes, bytes, false)?;
++            self.ownership.remove(&blob);
++        } else {
++            if owner.count == 1 {
++                self.exclusive_adjust(owner.owner_xor, bytes, true)?;
++            } else {
++                Self::adjust(&mut self.composition.shared_bytes, bytes, true)?;
++            }
++            self.ownership.replace(&Entry::with_value(&blob, owner));
++        }
++        Ok(())
++    }
++    pub fn snapshot(&self) -> &R {
++        &self.snapshot
++    }
++    /// Exact count state for a requested root; None outside this sample's
++    /// explicit scope. Ready prefix counts retain `replay_complete: false`.
++    pub fn count_status(&self, root: CollectionHandle) -> Option<RecordCountStatus> {
++        self.count_statuses.get(&root.raw).cloned()
++    }
++    /// Full-replay counts for callers requiring the previous whole-store
++    /// contract. Prefix-aware callers use `count_status` instead.
++    pub fn counts(&self, root: CollectionHandle) -> Option<DirectCounts> {
++        match self.count_status(root)? {
++            RecordCountStatus::Ready { counts, replay_complete: true } => Some(counts),
++            _ => None,
++        }
++    }
++    pub fn resident_bytes(&self, root: CollectionHandle) -> Option<u64> {
++        self.inventories.get(&root.raw).map(|i| i.bytes)
++    }
++    pub fn exclusive_bytes(&self, root: CollectionHandle) -> Option<u64> {
++        self.inventories
++            .get(&root.raw)
++            .map(|_| self.exclusive.get(&root.raw).copied().unwrap_or(0))
++    }
++    pub fn composition(&self) -> &StorageComposition {
++        &self.composition
++    }
++    pub fn work(&self) -> StorageWork {
++        self.work
++    }
++}
++
++struct StorageJob {
++    root: Raw,
++    add: bool,
++    handles: Box<dyn Iterator<Item = Raw>>,
++}
++/// A disposable, bounded byte-aggregate update. No partial summary escapes.
++/// Dropping this job preserves the previous completed observation unchanged.
++pub struct StorageSample<R> {
++    next: Option<StorageSnapshot<R>>,
++    previous: Option<R>,
++    jobs: Vec<StorageJob>,
++    cursor: usize,
++}
++impl<R> StorageSample<R>
++where
++    R: StoreSnapshot + CollectionRead + BlobStoreList + HeldRead,
++    R::RecordsError: Display,
++    R::Err: Display,
++{
++    /// Exact count state for a requested root of this pinned observation,
++    /// including computed replay prefixes. This never drives native work.
++    pub fn count_status(&self, root: CollectionHandle) -> Option<RecordCountStatus> {
++        self.next.as_ref()?.count_status(root)
++    }
++
++    /// Full-replay direct-record counts from this job's pinned snapshot, if ready.
++    /// Pending native roots and computed prefixes return None. This never
++    /// drives native count work or publishes unfinished byte aggregates. Use
++    /// `count_status` to display exact prefix counts with their incomplete flag.
++    pub fn counts(&self, root: CollectionHandle) -> Option<DirectCounts> {
++        self.next.as_ref()?.counts(root)
++    }
++
++    /// An error is terminal: any partially updated aggregate is discarded.
++    /// Calling again after an error or completion cannot publish a result.
++    pub fn step(&mut self, budget: usize) -> Result<Option<StorageSnapshot<R>>, String> {
++        let result = self.step_inner(budget);
++        if result.is_err() {
++            self.next = None;
++        }
++        result
++    }
++    fn step_inner(&mut self, mut budget: usize) -> Result<Option<StorageSnapshot<R>>, String> {
++        let next = self
++            .next
++            .as_mut()
++            .ok_or_else(|| "Storage sample already finished".to_owned())?;
++        while self.cursor < self.jobs.len() {
++            if budget == 0 {
++                return Ok(None);
++            }
++            let job = &mut self.jobs[self.cursor];
++            if let Some(blob) = job.handles.next() {
++                budget -= 1;
++                let source = if job.add {
++                    &next.snapshot
++                } else {
++                    self.previous.as_ref().expect("removals have a predecessor")
++                };
++                let bytes = StorageSnapshot::length(source, blob)?;
++                next.membership(job.root, blob, bytes, job.add)?;
++            } else {
++                self.cursor += 1;
++            }
++        }
++        let gone: Vec<_> = next
++            .exclusive
++            .iter()
++            .filter(|root| next.inventories.get(root).is_none())
++            .copied()
++            .collect();
++        for root in gone {
++            next.exclusive.remove(&root);
++        }
++        Ok(self.next.take())
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/triblespace-net/src/storage_snapshot/tests.rs b/triblespace-net/src/storage_snapshot/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/triblespace-net/src/storage_snapshot/tests.rs
+@@ -0,0 +1,825 @@
++use super::*;
++use anyhow::Result;
++use ed25519_dalek::SigningKey;
++use triblespace_core::{
++    collection::{
++        CollectionCommit, CollectionDerive, CollectionRecord, CollectionRecordSelector,
++        CollectionStore, CollectionStoreExt, HeldStore, SourceLocator, private_policy,
++    },
++    prelude::*,
++    repo::{
++        BlobStorePut, SnapshotSource, StorageFlush,
++        pile::{Pile, PileSnapshot},
++    },
++};
++
++fn length(snapshot: &PileSnapshot, blob: Raw) -> Result<u64> {
++    Ok(snapshot
++        .blob_info(Inline::<inlineencodings::Handle<blobencodings::UnknownBlob>>::new(blob))?
++        .unwrap()
++        .length)
++}
++fn oracle(snapshot: &PileSnapshot, root: CollectionHandle) -> Result<DirectCounts> {
++    let records: BTreeSet<_> = snapshot
++        .select_records(&BTreeSet::from([CollectionRecordSelector::Foundations(
++            root,
++        )]))?
++        .into_iter()
++        .collect();
++    let mut direct_present = 0;
++    for record in &records {
++        if record
++            .blob_references()
++            .all(|blob| snapshot.contains_blob(blob).unwrap())
++        {
++            direct_present += 1;
++        }
++    }
++    Ok(DirectCounts {
++        records: records.len() as u64,
++        direct_present,
++    })
++}
++fn check_composition(
++    summary: &StorageSnapshot<PileSnapshot>,
++    roots: &[CollectionHandle],
++) -> Result<()> {
++    // Full scan oracle lives only in tests.
++    let snapshot = summary.snapshot();
++    let mut owners = std::collections::BTreeMap::<Raw, Vec<Raw>>::new();
++    let mut known = 0;
++    for root in roots {
++        if let Some(held) = snapshot.held(*root) {
++            known += 1;
++            let mut bytes = 0;
++            for blob in held.iter() {
++                bytes += length(snapshot, *blob)?;
++                owners.entry(*blob).or_default().push(root.raw);
++            }
++            assert_eq!(summary.resident_bytes(*root), Some(bytes));
++        } else {
++            assert_eq!(summary.resident_bytes(*root), None);
++        }
++    }
++    let mut union = 0;
++    let mut shared = 0;
++    let mut exclusive = std::collections::BTreeMap::<Raw, u64>::new();
++    for (blob, roots) in owners {
++        let bytes = length(snapshot, blob)?;
++        union += bytes;
++        if roots.len() > 1 {
++            shared += bytes;
++        } else {
++            *exclusive.entry(roots[0]).or_default() += bytes;
++        }
++    }
++    assert_eq!(
++        summary.composition(),
++        &StorageComposition {
++            known_bytes: union,
++            shared_bytes: shared,
++            known_inventories: known,
++            unknown_inventories: roots.len() - known
++        }
++    );
++    for root in roots {
++        if snapshot.held(*root).is_some() {
++            assert_eq!(
++                summary.exclusive_bytes(*root),
++                Some(exclusive.get(&root.raw).copied().unwrap_or(0))
++            );
++        }
++    }
++    Ok(())
++}
++fn observe(
++    snapshot: PileSnapshot,
++    records: &[CollectionHandle],
++    roots: &[CollectionHandle],
++    old: Option<&StorageSnapshot<PileSnapshot>>,
++) -> Result<StorageSnapshot<PileSnapshot>> {
++    StorageSnapshot::observe(snapshot, records, roots, old).map_err(anyhow::Error::msg)
++}
++
++#[test]
++fn ready_counts_precede_large_byte_job_and_stay_on_the_pinned_snapshot() -> Result<()> {
++    let dir = tempfile::tempdir()?;
++    let path = dir.path().join("ready-counts.pile");
++    std::fs::File::create(&path)?;
++    let key = SigningKey::from_bytes(&[12; 32]);
++    let mut pile = Pile::open(&path)?;
++    let root = pile.collection("ready counts", private_policy(key.verifying_key()))?.handle();
++    let data = pile.put::<blobencodings::UTF8String, _>("direct data")?;
++    let meta = pile.put::<blobencodings::SimpleArchive, _>(TribleSet::new())?;
++    pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
++        &key, root, *data.as_transmute(), meta,
++    )))?;
++    pile.track_held([root]);
++    // Many tiny members exceed the production per-turn budget without a
++    // large allocation or payload. Their bytes are not read by statistics.
++    for index in 0..4100 {
++        let blob = pile.put::<blobencodings::UTF8String, _>(format!("held {index}"))?;
++        pile.note_held(root, *blob.as_transmute());
++    }
++    pile.snapshot()?;
++    let mut work = pile.drive_held().unwrap();
++    assert!(work.run_until_idle());
++    let before = pile.snapshot()?;
++    assert!(before.held(root).unwrap().len() > 4096);
++    let expected = oracle(&before, root)?;
++    let mut sample = StorageSnapshot::begin(before.clone(), &[root], &[root], None)
++        .map_err(anyhow::Error::msg)?;
++    assert_eq!(sample.counts(root), Some(expected));
++    assert!(sample.step(4096).map_err(anyhow::Error::msg)?.is_none());
++
++    // Another writer's record changes the live source, not this observation.
++    let other = SigningKey::from_bytes(&[13; 32]);
++    pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
++        &other, root, *data.as_transmute(), meta,
++    )))?;
++    let after = pile.snapshot()?;
++    assert_eq!(oracle(&after, root)?.records, expected.records + 1);
++    assert_eq!(sample.counts(root), Some(expected));
++    let complete = sample.step(4096).map_err(anyhow::Error::msg)?.unwrap();
++    assert_eq!(complete.counts(root), Some(expected));
++    check_composition(&complete, &[root])?;
++    assert_eq!(sample.counts(root), None);
++
++    let unchanged = observe(before, &[root], &[root], Some(&complete))?;
++    assert_eq!(unchanged.work(), StorageWork::default());
++    let advanced = observe(after, &[root], &[root], Some(&complete))?;
++    assert_eq!(advanced.counts(root).unwrap().records, expected.records + 1);
++    assert_eq!(advanced.work().records_checked, 0);
++    pile.close()?;
++    Ok(())
++}
++
++#[test]
++fn direct_arrivals_are_incremental_and_old_snapshot_is_stable() -> Result<()> {
++    let dir = tempfile::tempdir()?;
++    let key = SigningKey::from_bytes(&[7; 32]);
++    let path = dir.path().join("test.pile");
++    std::fs::File::create(&path)?;
++    let mut pile = Pile::open(&path)?;
++    let root = pile
++        .collection("direct", private_policy(key.verifying_key()))?
++        .handle();
++    let data = IntoBlob::<blobencodings::UTF8String>::to_blob("data");
++    let meta = IntoBlob::<blobencodings::SimpleArchive>::to_blob(TribleSet::new());
++    let record = CollectionRecord::Commit(CollectionCommit::sign(
++        &key,
++        root,
++        *data.get_handle().as_transmute(),
++        meta.get_handle(),
++    ));
++    pile.insert(record)?;
++    let first = observe(pile.snapshot()?, &[root], &[], None)?;
++    assert_eq!(
++        first.counts(root),
++        Some(DirectCounts {
++            records: 1,
++            direct_present: 0
++        })
++    );
++    assert_eq!(first.work().records_checked, 0);
++    let warm = observe(pile.snapshot()?, &[root], &[], Some(&first))?;
++    assert_eq!(warm.work(), StorageWork::default());
++    pile.put::<blobencodings::UTF8String, _>("unrelated")?;
++    let unrelated = observe(pile.snapshot()?, &[root], &[], Some(&warm))?;
++    assert_eq!(unrelated.work(), StorageWork::default());
++    pile.put::<blobencodings::UTF8String, _>(data)?;
++    let data_only = observe(pile.snapshot()?, &[root], &[], Some(&unrelated))?;
++    assert_eq!(data_only.work().records_checked, 0);
++    assert_eq!(data_only.counts(root), first.counts(root));
++    pile.put::<blobencodings::SimpleArchive, _>(meta)?;
++    let full = observe(pile.snapshot()?, &[root], &[], Some(&data_only))?;
++    assert_eq!(full.work().records_checked, 0);
++    assert_eq!(full.counts(root), Some(oracle(full.snapshot(), root)?));
++    assert_eq!(full.counts(root).unwrap().direct_present, 1);
++    assert_eq!(first.counts(root).unwrap().direct_present, 0);
++    // A second assertion over the same data is distinct; replay owns its count work.
++    let other_key = SigningKey::from_bytes(&[8; 32]);
++    if let CollectionRecord::Commit(c) = record {
++        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
++            &other_key,
++            root,
++            c.data(),
++            c.metadata(),
++        )))?;
++    }
++    let second = observe(pile.snapshot()?, &[root], &[], Some(&full))?;
++    assert_eq!(second.work().records_checked, 0);
++    assert_eq!(second.counts(root), Some(oracle(second.snapshot(), root)?));
++    pile.close()?;
++    Ok(())
++}
++
++#[test]
++fn physical_duplicates_reopened_lineage_and_derive_locator() -> Result<()> {
++    let dir = tempfile::tempdir()?;
++    let path = dir.path().join("test.pile");
++    let key = SigningKey::from_bytes(&[9; 32]);
++    std::fs::File::create(&path)?;
++    let mut pile = Pile::open(&path)?;
++    let root = pile
++        .collection("derive", private_policy(key.verifying_key()))?
++        .handle();
++    let data = pile.put::<blobencodings::UTF8String, _>("output")?;
++    let absent =
++        IntoBlob::<blobencodings::UTF8String>::to_blob("locator is not a fetch").get_handle();
++    pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
++        &key,
++        root,
++        SourceLocator::of(absent.raw),
++        *data.as_transmute(),
++    )))?;
++    let first = observe(pile.snapshot()?, &[root], &[], None)?;
++    assert_eq!(
++        first.counts(root),
++        Some(DirectCounts {
++            records: 1,
++            direct_present: 1
++        })
++    );
++    pile.flush()?;
++    pile.close()?;
++    let bytes = std::fs::read(&path)?;
++    use std::io::Write;
++    std::fs::OpenOptions::new()
++        .append(true)
++        .open(&path)?
++        .write_all(&bytes)?;
++    let mut reopened = Pile::open(&path)?;
++    let duplicate = observe(reopened.snapshot()?, &[root], &[], Some(&first))?;
++    assert_eq!(duplicate.counts(root), first.counts(root));
++    assert_eq!(
++        duplicate.counts(root),
++        Some(oracle(duplicate.snapshot(), root)?)
++    );
++    let rewritten_path = dir.path().join("rewritten.pile");
++    std::fs::File::create(&rewritten_path)?;
++    let mut rewritten = Pile::open(&rewritten_path)?;
++    let mut keep = triblespace_core::repo::RetentionRoots::new();
++    keep.retain_recursive(root);
++    keep.retain_direct(data);
++    reopened.rewrite_retained_into(&mut rewritten, &keep, triblespace_core::repo::pile::WantRewritePolicy::Drop)?;
++    let rewritten_snapshot = rewritten.snapshot()?;
++    assert_eq!(rewritten_snapshot.record_count_status(root), RecordCountStatus::Ready {
++        counts: oracle(&rewritten_snapshot, root)?, replay_complete: true,
++    });
++    assert_eq!(oracle(&rewritten_snapshot, root)?, first.counts(root).unwrap());
++    assert_eq!(first.counts(root).unwrap().records, 1);
++    rewritten.close()?;
++    reopened.close()?;
++    Ok(())
++}
++
++#[test]
++fn held_deltas_scope_changes_and_two_to_one_match_oracle() -> Result<()> {
++    let dir = tempfile::tempdir()?;
++    let key = SigningKey::from_bytes(&[10; 32]);
++    let path = dir.path().join("test.pile");
++    std::fs::File::create(&path)?;
++    let mut pile = Pile::open(&path)?;
++    let roots = ["one", "two", "three"].map(|name| {
++        pile.collection(name, private_policy(key.verifying_key()))
++            .unwrap()
++            .handle()
++    });
++    let data = pile.put::<blobencodings::UTF8String, _>("shared")?;
++    let meta = pile.put::<blobencodings::SimpleArchive, _>(TribleSet::new())?;
++    for root in roots {
++        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
++            &key,
++            root,
++            *data.as_transmute(),
++            meta,
++        )))?;
++    }
++    let unknown = observe(pile.snapshot()?, &roots, &roots, None)?;
++    assert_eq!(unknown.composition().unknown_inventories, 3);
++    pile.track_held(roots);
++    pile.snapshot()?;
++    let mut work = pile.drive_held().unwrap();
++    assert!(work.run_until_idle());
++    let first = observe(pile.snapshot()?, &roots, &roots, Some(&unknown))?;
++    check_composition(&first, &roots)?;
++    let warm = observe(pile.snapshot()?, &roots, &roots, Some(&first))?;
++    assert_eq!(warm.work(), StorageWork::default());
++    let two = observe(pile.snapshot()?, &roots[..2], &roots[..2], Some(&warm))?;
++    check_composition(&two, &roots[..2])?;
++    let one = observe(pile.snapshot()?, &roots[..1], &roots[..1], Some(&two))?;
++    check_composition(&one, &roots[..1])?;
++    assert_eq!(one.composition().shared_bytes, 0);
++    let all_again = observe(pile.snapshot()?, &roots, &roots, Some(&one))?;
++    check_composition(&all_again, &roots)?;
++    let child = pile.put::<blobencodings::UTF8String, _>("late shared blob")?;
++    for root in roots {
++        pile.note_held(root, *child.as_transmute());
++    }
++    pile.snapshot()?;
++    assert!(work.run_until_idle());
++    let current = pile.snapshot()?;
++    let mut partial = StorageSnapshot::begin(current.clone(), &roots, &roots, Some(&all_again))
++        .map_err(anyhow::Error::msg)?;
++    assert!(partial.step(1).map_err(anyhow::Error::msg)?.is_none());
++    // Discarding the job cannot mutate its predecessor.
++    drop(partial);
++    check_composition(&all_again, &roots)?;
++    let after = observe(current, &roots, &roots, Some(&all_again))?;
++    assert_eq!(
++        after.work(),
++        StorageWork {
++            records_checked: 0,
++            held_memberships: 3
++        }
++    );
++    check_composition(&after, &roots)?;
++    check_composition(&first, &roots)?;
++    assert!(!first.snapshot().contains_blob(child)?);
++    assert_eq!(unknown.composition().unknown_inventories, 3);
++    let empty = observe(pile.snapshot()?, &[], &[], Some(&after))?;
++    check_composition(&empty, &[])?;
++    assert_eq!(empty.composition(), &StorageComposition::default());
++    drop(work);
++    pile.close()?;
++    Ok(())
++}
++
++#[test]
++fn replacement_residency_loss_rebuilds_only_availability() -> Result<()> {
++    let dir = tempfile::tempdir()?;
++    let key = SigningKey::from_bytes(&[11; 32]);
++    let a = dir.path().join("a.pile");
++    let b = dir.path().join("b.pile");
++    std::fs::File::create(&a)?;
++    std::fs::File::create(&b)?;
++    let mut full = Pile::open(&a)?;
++    let mut sparse = Pile::open(&b)?;
++    let root = full
++        .collection("replacement", private_policy(key.verifying_key()))?
++        .handle();
++    assert_eq!(
++        sparse
++            .collection("replacement", private_policy(key.verifying_key()))?
++            .handle(),
++        root
++    );
++    let data = IntoBlob::<blobencodings::UTF8String>::to_blob("resident in only one source");
++    let meta = full.put::<blobencodings::SimpleArchive, _>(TribleSet::new())?;
++    sparse.put::<blobencodings::SimpleArchive, _>(TribleSet::new())?;
++    let record = CollectionRecord::Commit(CollectionCommit::sign(
++        &key,
++        root,
++        *data.get_handle().as_transmute(),
++        meta,
++    ));
++    full.insert(record)?;
++    sparse.insert(record)?;
++    full.put::<blobencodings::UTF8String, _>(data.clone())?;
++    let first = observe(full.snapshot()?, &[root], &[], None)?;
++    let missing = observe(sparse.snapshot()?, &[root], &[], Some(&first))?;
++    assert_eq!(
++        missing.counts(root),
++        Some(DirectCounts {
++            records: 1,
++            direct_present: 0
++        })
++    );
++    assert_eq!(first.counts(root).unwrap().direct_present, 1);
++    sparse.put::<blobencodings::UTF8String, _>(data)?;
++    let recovered = observe(sparse.snapshot()?, &[root], &[], Some(&missing))?;
++    assert_eq!(recovered.counts(root), first.counts(root));
++    assert_eq!(recovered.work().records_checked, 0);
++    full.close()?;
++    sparse.close()?;
++    Ok(())
++}
++
++#[test]
++fn corrupt_indexed_content_is_present_but_not_held() -> Result<()> {
++    let dir = tempfile::tempdir()?;
++    let key = SigningKey::from_bytes(&[12; 32]);
++    let path = dir.path().join("corrupt.pile");
++    std::fs::File::create(&path)?;
++    let mut pile = Pile::open(&path)?;
++    let root = pile
++        .collection("corrupt", private_policy(key.verifying_key()))?
++        .handle();
++    let payload = "unique payload for corruption fixture -- only these bytes are damaged";
++    let data = pile.put::<blobencodings::UTF8String, _>(payload)?;
++    let meta = pile.put::<blobencodings::SimpleArchive, _>(TribleSet::new())?;
++    pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
++        &key,
++        root,
++        *data.as_transmute(),
++        meta,
++    )))?;
++    pile.flush()?;
++    pile.close()?;
++    // No live reader exists while the fixture's physical payload is damaged.
++    let mut bytes = std::fs::read(&path)?;
++    let offset = bytes
++        .windows(payload.len())
++        .position(|v| v == payload.as_bytes())
++        .unwrap();
++    bytes[offset] ^= 1;
++    std::fs::write(&path, bytes)?;
++    let mut pile = Pile::open(&path)?;
++    pile.track_held([root]);
++    pile.snapshot()?;
++    let mut work = pile.drive_held().unwrap();
++    assert!(work.run_until_idle());
++    let summary = observe(pile.snapshot()?, &[root], &[root], None)?;
++    assert!(summary.snapshot().contains_blob(data)?);
++    assert_eq!(
++        summary.counts(root),
++        Some(DirectCounts {
++            records: 1,
++            direct_present: 1
++        })
++    );
++    assert!(!summary.snapshot().held(root).unwrap().has_prefix(&data.raw));
++    check_composition(&summary, &[root])?;
++    drop(work);
++    pile.close()?;
++    Ok(())
++}
++
++#[derive(Clone)]
++struct FaultInventory {
++    enumerations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
++    held: triblespace_core::collection::HeldBlobs,
++    blobs: Vec<triblespace_core::repo::BlobInfo>,
++}
++impl triblespace_core::repo::StoreSnapshot for FaultInventory {}
++impl CollectionRead for FaultInventory {
++    type RecordsError = std::convert::Infallible;
++    type RecordIter<'a> = std::iter::Empty<Result<CollectionRecord, Self::RecordsError>>;
++    fn records(&self) -> Result<Self::RecordIter<'_>, Self::RecordsError> {
++        Ok(std::iter::empty())
++    }
++    fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
++        Ok(Vec::new())
++    }
++}
++impl BlobStoreList for FaultInventory {
++    type Err = std::convert::Infallible;
++    type Iter<'a> = std::vec::IntoIter<Result<triblespace_core::repo::BlobInfo, Self::Err>>;
++    fn blobs(&self) -> Self::Iter<'_> {
++        self.enumerations
++            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++        self.blobs
++            .iter()
++            .copied()
++            .map(Ok)
++            .collect::<Vec<_>>()
++            .into_iter()
++    }
++    fn blob_info<E>(
++        &self,
++        handle: Inline<inlineencodings::Handle<E>>,
++    ) -> Result<Option<triblespace_core::repo::BlobInfo>, Self::Err>
++    where
++        E: triblespace_core::blob::BlobEncoding + 'static,
++        inlineencodings::Handle<E>: triblespace_core::inline::InlineEncoding,
++    {
++        Ok(self
++            .blobs
++            .iter()
++            .find(|info| info.handle.raw == handle.raw)
++            .copied())
++    }
++}
++impl HeldRead for FaultInventory {
++    fn held(&self, _: CollectionHandle) -> Option<triblespace_core::collection::HeldBlobs> {
++        Some(self.held.clone())
++    }
++    fn held_generation(&self) -> u64 {
++        0
++    }
++}
++#[test]
++fn sample_errors_are_terminal_even_after_partial_progress() -> Result<()> {
++    use triblespace_core::{patch::Entry, repo::BlobInfo};
++    let root = CollectionHandle::new([9; 32]);
++    let mut held = triblespace_core::collection::HeldBlobs::new();
++    held.insert(&Entry::new(&[1; 32]));
++    held.insert(&Entry::new(&[2; 32]));
++    let missing = FaultInventory {
++        enumerations: Default::default(),
++        held: held.clone(),
++        blobs: Vec::new(),
++    };
++    let mut sample =
++        StorageSnapshot::begin(missing, &[], &[root], None).map_err(anyhow::Error::msg)?;
++    assert!(sample.step(1).err().unwrap().contains("absent"));
++    assert!(sample.step(4096).is_err());
++    let oversized = FaultInventory {
++        enumerations: Default::default(),
++        held,
++        blobs: vec![
++            BlobInfo {
++                handle: Inline::new([1; 32]),
++                length: u64::MAX,
++            },
++            BlobInfo {
++                handle: Inline::new([2; 32]),
++                length: 1,
++            },
++        ],
++    };
++    let mut sample =
++        StorageSnapshot::begin(oversized, &[], &[root], None).map_err(anyhow::Error::msg)?;
++    assert!(sample.step(1).map_err(anyhow::Error::msg)?.is_none());
++    assert!(sample.step(1).err().unwrap().contains("overflow"));
++    assert!(sample.step(4096).is_err());
++    Ok(())
++}
++
++#[test]
++fn composition_only_successors_do_not_enumerate_blob_inventory() -> Result<()> {
++    use triblespace_core::{patch::Entry, repo::BlobInfo};
++    let enumerations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
++    let root = CollectionHandle::new([7; 32]);
++    let mut source = FaultInventory {
++        enumerations: enumerations.clone(),
++        held: triblespace_core::collection::HeldBlobs::new(),
++        blobs: Vec::new(),
++    };
++    let first =
++        StorageSnapshot::observe(source.clone(), &[], &[root], None).map_err(anyhow::Error::msg)?;
++    source.held.insert(&Entry::new(&[1; 32]));
++    source.blobs.push(BlobInfo {
++        handle: Inline::new([1; 32]),
++        length: 17,
++    });
++    let second =
++        StorageSnapshot::observe(source, &[], &[root], Some(&first)).map_err(anyhow::Error::msg)?;
++    assert_eq!(second.composition().known_bytes, 17);
++    assert_eq!(second.work().held_memberships, 1);
++    assert_eq!(enumerations.load(std::sync::atomic::Ordering::SeqCst), 0);
++    Ok(())
++}
++
++#[test]
++fn native_counts_survive_dropped_samples_and_share_the_canonical_patch() -> Result<()> {
++    let dir = tempfile::tempdir()?;
++    let path = dir.path().join("native-count-owner.pile");
++    std::fs::File::create(&path)?;
++    let key = SigningKey::from_bytes(&[12; 32]);
++    let mut pile = Pile::open(&path)?;
++    let root = pile.collection("native counts", private_policy(key.verifying_key()))?.handle();
++    let data = pile.put::<blobencodings::UTF8String, _>("data")?;
++    let meta = pile.put::<blobencodings::SimpleArchive, _>(TribleSet::new())?;
++    let record = CollectionRecord::Commit(CollectionCommit::sign(&key, root, *data.as_transmute(), meta));
++    pile.insert(record)?;
++    let ready = pile.snapshot()?;
++    let expected = oracle(&ready, root)?;
++    let sample = StorageSnapshot::begin(ready.clone(), &[root], &[], None).map_err(anyhow::Error::msg)?;
++    assert_eq!(sample.counts(root), Some(expected));
++    drop(sample);
++    let again = StorageSnapshot::observe(ready.clone(), &[root], &[], None).map_err(anyhow::Error::msg)?;
++    assert_eq!(again.counts(root), Some(expected));
++    assert_eq!(again.work().records_checked, 0, "sample recreation performs no record work");
++    let native = ready.cached_record_patch(root).unwrap();
++    let repair = collection_record_patch(&ready, root)?;
++    let id = record.fingerprint().raw();
++    assert!(std::ptr::eq(native.commits().get(&id).unwrap(), repair.commits().get(&id).unwrap()));
++    pile.close()?;
++    Ok(())
++}
++
++#[test]
++fn every_published_prefix_has_exact_native_counts_without_a_count_worker() -> Result<()> {
++    let dir = tempfile::tempdir()?;
++    let path = dir.path().join("prefix-count-status.pile");
++    std::fs::File::create(&path)?;
++    let key = SigningKey::from_bytes(&[12; 32]);
++    let mut writer = Pile::open(&path)?;
++    let root = writer.collection("prefix counts", private_policy(key.verifying_key()))?.handle();
++    let data = writer.put::<blobencodings::UTF8String, _>("data")?;
++    let meta = writer.put::<blobencodings::SimpleArchive, _>(TribleSet::new())?;
++    writer.insert(CollectionRecord::Commit(CollectionCommit::sign(&key, root, *data.as_transmute(), meta)))?;
++    writer.flush()?;
++    let mut reader = Pile::open(&path)?;
++    let whole = reader.snapshot()?;
++    let expected = oracle(&whole, root)?;
++    // A separate writer extends the source beyond the reader's previous EOF.
++    for n in 0..32 {
++        writer.put::<blobencodings::UTF8String, _>(format!("later replay blob {n}"))?;
++    }
++    writer.flush()?;
++    let (prefix, reached_end) = reader.snapshot_step(256)?;
++    assert!(!reached_end);
++    let prefix_status = RecordCountStatus::Ready { counts: expected, replay_complete: false };
++    assert_eq!(prefix.record_count_status(root), prefix_status);
++    let sample = StorageSnapshot::begin(prefix.clone(), &[root], &[], None).map_err(anyhow::Error::msg)?;
++    assert_eq!(sample.count_status(root), Some(prefix_status.clone()));
++    assert_eq!(sample.counts(root), None, "whole-only API does not expose prefix counts");
++    let outside = Inline::new([222; 32]);
++    assert_eq!(sample.count_status(outside), None, "sample scope remains explicit");
++    let eof = reader.snapshot()?;
++    let complete = StorageSnapshot::observe(eof, &[root], &[], None).map_err(anyhow::Error::msg)?;
++    assert_eq!(complete.counts(root), Some(expected));
++    assert_eq!(complete.count_status(root), Some(RecordCountStatus::Ready { counts: expected, replay_complete: true }));
++    assert_eq!(sample.count_status(root), Some(prefix_status.clone()));
++    assert_eq!(whole.record_count_status(root), RecordCountStatus::Ready { counts: expected, replay_complete: true });
++    reader.close()?;
++    writer.close()?;
++    Ok(())
++}
++
++#[test]
++fn native_root_failure_preserves_mixed_sample_statuses_and_old_observation() -> Result<()> {
++    use std::convert::Infallible;
++    use std::sync::Arc;
++    use triblespace_core::repo::BlobInfo;
++
++    // A native-status-only source: consulting record or blob inventories is a
++    // defect here, not an alternative way to recover from a failed root.
++    #[derive(Clone)]
++    struct NativeStatuses(Vec<(CollectionHandle, RecordCountStatus)>);
++    impl StoreSnapshot for NativeStatuses {}
++    impl CollectionRead for NativeStatuses {
++        type RecordsError = Infallible;
++        type RecordIter<'a> = std::iter::Empty<Result<CollectionRecord, Infallible>>;
++        fn records(&self) -> Result<Self::RecordIter<'_>, Infallible> {
++            panic!("native status consumption must not rebuild canonical records")
++        }
++        fn collections(&self) -> Result<Vec<CollectionHandle>, Infallible> {
++            panic!("sample scope must not discover roots")
++        }
++        fn record_count_status(&self, root: CollectionHandle) -> RecordCountStatus {
++            self.0.iter().find(|(candidate, _)| *candidate == root)
++                .map(|(_, status)| status.clone())
++                .unwrap_or(RecordCountStatus::Untracked { replay_complete: true })
++        }
++    }
++    impl BlobStoreList for NativeStatuses {
++        type Err = Infallible;
++        type Iter<'a> = std::iter::Empty<Result<BlobInfo, Infallible>>;
++        fn blobs(&self) -> Self::Iter<'_> {
++            panic!("count failure must not trigger a blob inventory scan")
++        }
++    }
++    impl HeldRead for NativeStatuses {
++        fn held(&self, _root: CollectionHandle) -> Option<HeldBlobs> {
++            panic!("empty inventory scope must remain empty")
++        }
++        fn held_generation(&self) -> u64 { 0 }
++    }
++
++    let failed_root = Inline::new([31; 32]);
++    let healthy_root = Inline::new([32; 32]);
++    let empty_root = Inline::new([33; 32]);
++    let prefix_root = Inline::new([34; 32]);
++    let outside = Inline::new([35; 32]);
++    let healthy_counts = DirectCounts { records: 8, direct_present: 5 };
++    let prefix_counts = DirectCounts { records: 3, direct_present: 1 };
++    let failure = RecordCountStatus::Failed(Arc::from("one root's canonical selection failed"));
++    let healthy = RecordCountStatus::Ready { counts: healthy_counts, replay_complete: true };
++    let prefix = RecordCountStatus::Ready { counts: prefix_counts, replay_complete: false };
++    let source = NativeStatuses(vec![
++        (failed_root, failure.clone()),
++        (healthy_root, healthy.clone()),
++        (empty_root, RecordCountStatus::Ready { counts: DirectCounts::default(), replay_complete: true }),
++        (prefix_root, prefix.clone()),
++    ]);
++    // Failure comes first: begin must still collect every later root.
++    let scope = [failed_root, healthy_root, empty_root, prefix_root];
++    let mut sample = StorageSnapshot::begin(source.clone(), &scope, &[], None)
++        .map_err(anyhow::Error::msg)?;
++    assert_eq!(sample.count_status(failed_root), Some(failure.clone()));
++    assert_eq!(sample.count_status(healthy_root), Some(healthy.clone()));
++    assert_eq!(sample.count_status(empty_root), Some(RecordCountStatus::Ready { counts: DirectCounts::default(), replay_complete: true }));
++    assert_eq!(sample.count_status(prefix_root), Some(prefix.clone()));
++    assert_eq!(sample.count_status(outside), None);
++    assert_eq!(sample.counts(healthy_root), Some(healthy_counts));
++    assert_eq!(sample.counts(failed_root), None, "failure must not invent zero");
++    assert_eq!(sample.counts(empty_root), Some(DirectCounts::default()));
++    assert_eq!(sample.counts(prefix_root), None, "whole-only getter remains whole-only");
++    let completed = sample.step(0).map_err(anyhow::Error::msg)?.unwrap();
++    assert_eq!(completed.count_status(failed_root), Some(failure.clone()));
++    assert_eq!(completed.count_status(healthy_root), Some(healthy.clone()));
++    assert_eq!(completed.count_status(prefix_root), Some(prefix.clone()));
++    assert_eq!(completed.work(), StorageWork::default());
++
++    let recovered_counts = DirectCounts { records: 2, direct_present: 1 };
++    let recovered = RecordCountStatus::Ready { counts: recovered_counts, replay_complete: true };
++    let mut successor = source;
++    successor.0[0].1 = recovered.clone();
++    let next = StorageSnapshot::observe(successor, &scope, &[], Some(&completed))
++        .map_err(anyhow::Error::msg)?;
++    assert_eq!(next.count_status(failed_root), Some(recovered));
++    assert_eq!(next.counts(failed_root), Some(recovered_counts));
++    assert_eq!(next.count_status(healthy_root), Some(healthy));
++    assert_eq!(next.count_status(empty_root), Some(RecordCountStatus::Ready { counts: DirectCounts::default(), replay_complete: true }));
++    assert_eq!(next.count_status(prefix_root), Some(prefix));
++    assert_eq!(next.work(), StorageWork::default());
++    assert_eq!(completed.count_status(failed_root), Some(failure), "old observation is immutable");
++    Ok(())
++}
++
++#[test]
++fn continuously_appending_writer_cannot_starve_exact_prefix_counts() -> Result<()> {
++    let dir = tempfile::tempdir()?;
++    let path = dir.path().join("growing-prefix-counts.pile");
++    std::fs::File::create(&path)?;
++    let key = SigningKey::from_bytes(&[42; 32]);
++    let mut writer = Pile::open(&path)?;
++    let root = writer.collection("growing prefix", private_policy(key.verifying_key()))?.handle();
++    let meta = writer.put::<blobencodings::SimpleArchive, _>(TribleSet::new())?;
++    writer.flush()?;
++    let mut reader = Pile::open_prefix(&path, 0)?;
++    // A bounded reader is deliberately fixed, so reopen the zero observation
++    // as an ordinary incremental reader for the continuously growing source.
++    let zero = reader.snapshot()?;
++    assert_eq!(zero.record_count_status(root), RecordCountStatus::Ready {
++        counts: DirectCounts::default(), replay_complete: true,
++    });
++    reader.close()?;
++    let mut reader = Pile::open(&path)?;
++    let old = reader.snapshot()?;
++    let mut largest = 0;
++    for n in 0..64 {
++        let data = writer.put::<blobencodings::UTF8String, _>(format!("arriving {n}"))?;
++        writer.insert(CollectionRecord::Commit(CollectionCommit::sign(&key, root, *data.as_transmute(), meta)))?;
++        writer.flush()?;
++        // One record boundary per turn, while the writer appends two frames.
++        let (prefix, complete) = reader.snapshot_step(1)?;
++        assert!(!complete, "writer stays ahead on every publication");
++        let expected = oracle(&prefix, root)?;
++        assert_eq!(prefix.record_count_status(root), RecordCountStatus::Ready {
++            counts: expected, replay_complete: false,
++        });
++        assert_eq!(prefix.inner().record_count_status(root), prefix.record_count_status(root));
++        largest = largest.max(expected.records);
++        let sample = StorageSnapshot::begin(prefix, &[root], &[], None).map_err(anyhow::Error::msg)?;
++        assert_eq!(sample.count_status(root), Some(RecordCountStatus::Ready {
++            counts: expected, replay_complete: false,
++        }));
++    }
++    assert!(largest >= 16, "useful exact counts publish while writer remains ahead");
++    assert_eq!(old.record_count_status(root), RecordCountStatus::Ready {
++        counts: DirectCounts::default(), replay_complete: true,
++    });
++    let end = reader.snapshot()?;
++    assert_eq!(end.record_count_status(root), RecordCountStatus::Ready {
++        counts: DirectCounts { records: 64, direct_present: 64 }, replay_complete: true,
++    });
++    reader.close()?;
++    writer.close()?;
++    Ok(())
++}
++
++#[test]
++fn generic_backend_fallback_retains_canonical_and_presence_removal_semantics() -> Result<()> {
++    use std::convert::Infallible;
++    use triblespace_core::repo::BlobInfo;
++    #[derive(Clone)]
++    struct Generic { records: Vec<CollectionRecord>, blobs: Vec<Raw>, complete: bool }
++    impl StoreSnapshot for Generic {}
++    impl CollectionRead for Generic {
++        fn record_count_status(&self, _root: CollectionHandle) -> RecordCountStatus {
++            RecordCountStatus::Untracked { replay_complete: self.complete }
++        }
++        type RecordsError = Infallible;
++        type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
++        fn records(&self) -> Result<Self::RecordIter<'_>, Infallible> {
++            Ok(self.records.iter().copied().map(Ok).collect::<Vec<_>>().into_iter())
++        }
++        fn collections(&self) -> Result<Vec<CollectionHandle>, Infallible> { panic!("explicit scope") }
++    }
++    impl BlobStoreList for Generic {
++        type Err = Infallible;
++        type Iter<'a> = std::vec::IntoIter<Result<BlobInfo, Infallible>>;
++        fn blobs(&self) -> Self::Iter<'_> {
++            self.blobs.iter().map(|raw| Ok(BlobInfo { handle: Inline::new(*raw), length: 1 }))
++                .collect::<Vec<_>>().into_iter()
++        }
++    }
++    impl HeldRead for Generic {
++        fn held(&self, _root: CollectionHandle) -> Option<HeldBlobs> { None }
++        fn held_generation(&self) -> u64 { 0 }
++    }
++    let root = Inline::new([1; 32]);
++    let a = CollectionRecord::Commit(CollectionCommit::sign(&SigningKey::from_bytes(&[7; 32]),
++        root, Inline::new([2; 32]), Inline::new([3; 32])));
++    let b = CollectionRecord::Commit(CollectionCommit::sign(&SigningKey::from_bytes(&[8; 32]),
++        root, Inline::new([2; 32]), Inline::new([3; 32])));
++    let now = Generic { records: vec![a, a, b], blobs: vec![[1; 32], [2; 32], [3; 32]], complete: true };
++    let first = StorageSnapshot::observe(now, &[root], &[], None).map_err(anyhow::Error::msg)?;
++    assert_eq!(first.counts(root), Some(DirectCounts { records: 2, direct_present: 2 }));
++    let now = Generic { records: vec![a], blobs: vec![[1; 32], [2; 32]], complete: true };
++    let second = StorageSnapshot::observe(now, &[root], &[], Some(&first)).map_err(anyhow::Error::msg)?;
++    assert_eq!(second.counts(root), Some(DirectCounts { records: 1, direct_present: 0 }));
++    let prefix = Generic { records: vec![a], blobs: vec![[1; 32], [2; 32]], complete: false };
++    let prefix = StorageSnapshot::observe(prefix, &[root], &[], Some(&second)).map_err(anyhow::Error::msg)?;
++    assert_eq!(prefix.count_status(root), Some(RecordCountStatus::Ready {
++        counts: DirectCounts { records: 1, direct_present: 0 }, replay_complete: false,
++    }));
++    assert_eq!(prefix.counts(root), None);
++    assert_eq!(first.counts(root), Some(DirectCounts { records: 2, direct_present: 2 }));
++    Ok(())
++}
+diff --git a/triblespace-net/src/transport.rs b/triblespace-net/src/transport.rs
+--- a/triblespace-net/src/transport.rs
++++ b/triblespace-net/src/transport.rs
+@@ -87,6 +87,17 @@ pub trait RecvStream: AsyncRead + Unpin + Send + 'static {
+     fn stop(&mut self, code: u32);
+ }
+ 
++/// Passive transport counters for one connection's lifetime, across all paths.
++/// QUIC datagram payload bytes include protocol overhead and retransmissions,
++/// but not UDP/IP headers or a relay's outer transport. These are not blob bytes.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct TrafficStats {
++    pub received_bytes: u64,
++    pub sent_bytes: u64,
++    /// Current selected-path QUIC estimate, not an active ping.
++    pub rtt: Option<std::time::Duration>,
++}
++
+ /// A bidirectional connection to one remote peer on one ALPN.
+ ///
+ /// Mirrors the slice of iroh's `Connection` the protocol actually
+@@ -107,6 +118,13 @@ pub trait Conn: Clone + Send + Sync + 'static {
+     /// exercised honestly.
+     fn remote_id(&self) -> PeerId;
+ 
++    /// Passive closure state; does not open streams or send probes.
++    fn is_closed(&self) -> bool;
++
++    /// None when this transport does not provide network counters.
++    fn traffic_stats(&self) -> Option<TrafficStats> { None }
++
++
+     /// Open an outgoing bidirectional stream.
+     fn open_bi(
+         &self,
+diff --git a/triblespace-net/src/transport/iroh.rs b/triblespace-net/src/transport/iroh.rs
+--- a/triblespace-net/src/transport/iroh.rs
++++ b/triblespace-net/src/transport/iroh.rs
+@@ -103,6 +103,18 @@ impl Conn for IrohConn {
+         *self.0.remote_id().as_bytes()
+     }
+ 
++    fn is_closed(&self) -> bool { self.0.close_reason().is_some() }
++
++    fn traffic_stats(&self) -> Option<super::TrafficStats> {
++        let stats = self.0.stats();
++        let rtt = self.0.paths().iter().find(|path| path.is_selected()).map(|path| path.rtt());
++        Some(super::TrafficStats {
++            received_bytes: stats.udp_rx.bytes,
++            sent_bytes: stats.udp_tx.bytes,
++            rtt,
++        })
++    }
++
+     async fn open_bi(&self) -> anyhow::Result<(Self::SendHalf, Self::RecvHalf)> {
+         self.0
+             .open_bi()
+diff --git a/triblespace-net/src/transport/sim.rs b/triblespace-net/src/transport/sim.rs
+--- a/triblespace-net/src/transport/sim.rs
++++ b/triblespace-net/src/transport/sim.rs
+@@ -720,6 +720,8 @@ impl Conn for SimConn {
+         self.remote
+     }
+ 
++    fn is_closed(&self) -> bool { self.closed.load(Ordering::SeqCst) }
++
+     async fn open_bi(&self) -> anyhow::Result<(SimSendStream, SimRecvStream)> {
+         // As in accept_bi, capture close before checking the flag.
+         let on_close = self.notify_close.notified();
+@@ -1000,6 +1002,9 @@ impl Conn for TappedConn {
+         self.inner.remote_id()
+     }
+ 
++    fn is_closed(&self) -> bool { self.inner.is_closed() }
++    fn traffic_stats(&self) -> Option<super::TrafficStats> { self.inner.traffic_stats() }
++
+     async fn open_bi(&self) -> anyhow::Result<(TappedSend, TappedRecv)> {
+         Ok(self.halves(self.inner.open_bi().await?, true))
+     }

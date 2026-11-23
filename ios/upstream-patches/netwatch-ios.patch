@@ -1,0 +1,181 @@
+diff --git a/netwatch/src/interfaces.rs b/netwatch/src/interfaces.rs
+--- a/netwatch/src/interfaces.rs
++++ b/netwatch/src/interfaces.rs
+@@ -8,8 +8,7 @@ use n0_future::time::Instant;
+     target_os = "freebsd",
+     target_os = "openbsd",
+     target_os = "netbsd",
+-    target_os = "macos",
+-    target_os = "ios"
++    target_os = "macos"
+ ))]
+ pub(super) mod bsd;
+ #[cfg(any(target_os = "linux", target_os = "android"))]
+@@ -17,6 +16,13 @@ mod linux;
+ #[cfg(target_os = "windows")]
+ mod windows;
+ 
++// The prototype uses public interface enumeration on iOS. Route metadata is
++// unavailable; do not decode a macOS routing ABI or infer a default interface.
++#[cfg(target_os = "ios")]
++async fn default_route() -> Option<DefaultRouteDetails> {
++    None
++}
++
+ pub(crate) use ipnet::{Ipv4Net, Ipv6Net};
+ pub use netdev::interface::ipv6_addr_flags::Ipv6AddrFlags;
+ 
+@@ -24,8 +30,7 @@ pub use netdev::interface::ipv6_addr_flags::Ipv6AddrFlags;
+     target_os = "freebsd",
+     target_os = "openbsd",
+     target_os = "netbsd",
+-    target_os = "macos",
+-    target_os = "ios"
++    target_os = "macos"
+ ))]
+ use self::bsd::default_route;
+ #[cfg(any(target_os = "linux", target_os = "android"))]
+@@ -455,8 +460,7 @@ impl HomeRouter {
+         target_os = "freebsd",
+         target_os = "openbsd",
+         target_os = "netbsd",
+-        target_os = "macos",
+-        target_os = "ios"
++        target_os = "macos"
+     ))]
+     fn get_default_gateway() -> Option<IpAddr> {
+         // netdev doesn't work yet
+@@ -464,6 +468,11 @@ impl HomeRouter {
+         bsd::likely_home_router()
+     }
+ 
++    #[cfg(target_os = "ios")]
++    fn get_default_gateway() -> Option<IpAddr> {
++        None
++    }
++
+     #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
+     fn get_default_gateway() -> Option<IpAddr> {
+         let gateway = netdev::get_default_gateway().ok()?;
+diff --git a/netwatch/src/netmon.rs b/netwatch/src/netmon.rs
+--- a/netwatch/src/netmon.rs
++++ b/netwatch/src/netmon.rs
+@@ -6,14 +6,15 @@ use n0_watcher::Watchable;
+ use tokio::sync::{mpsc, oneshot};
+ 
+ mod actor;
++#[cfg(target_os = "ios")]
++mod ios_polling;
+ #[cfg(target_os = "android")]
+ mod android;
+ #[cfg(any(
+     target_os = "freebsd",
+     target_os = "openbsd",
+     target_os = "netbsd",
+-    target_os = "macos",
+-    target_os = "ios"
++    target_os = "macos"
+ ))]
+ mod bsd;
+ #[cfg(target_os = "linux")]
+diff --git a/netwatch/src/netmon/actor.rs b/netwatch/src/netmon/actor.rs
+--- a/netwatch/src/netmon/actor.rs
++++ b/netwatch/src/netmon/actor.rs
+@@ -13,10 +13,11 @@ use super::android as os;
+     target_os = "freebsd",
+     target_os = "openbsd",
+     target_os = "netbsd",
+-    target_os = "macos",
+-    target_os = "ios"
++    target_os = "macos"
+ ))]
+ use super::bsd as os;
++#[cfg(target_os = "ios")]
++use super::ios_polling as os;
+ #[cfg(target_os = "linux")]
+ use super::linux as os;
+ #[cfg(posix_minimal)]
+diff --git a/netwatch/src/netmon/ios_polling.rs b/netwatch/src/netmon/ios_polling.rs
+new file mode 100644
+--- /dev/null
++++ b/netwatch/src/netmon/ios_polling.rs
+@@ -0,0 +1,79 @@
++//! Foreground prototype fallback using public interface state, not AF_ROUTE.
++//!
++//! Every five seconds the existing actor samples State::new(), compares it to
++//! its previous state, and publishes changes. This cannot observe route-only
++//! changes or guarantee a callback while iOS suspends the application.
++
++use n0_error::stack_error;
++use n0_future::task::AbortOnDropHandle;
++use tokio::{sync::mpsc, time::{self, Duration, MissedTickBehavior}};
++
++use super::actor::NetworkMessage;
++
++#[stack_error(derive, add_meta)]
++pub struct Error;
++
++#[derive(Debug)]
++pub(super) struct RouteMonitor {
++    _handle: AbortOnDropHandle<()>,
++}
++
++impl RouteMonitor {
++    pub(super) fn new(sender: mpsc::Sender<NetworkMessage>) -> Result<Self, Error> {
++        let handle = tokio::spawn(async move {
++            let period = Duration::from_secs(5);
++            let mut ticks = time::interval_at(time::Instant::now() + period, period);
++            ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
++            loop {
++                tokio::select! {
++                    _ = sender.closed() => break,
++                    _ = ticks.tick() => {
++                        if sender.send(NetworkMessage::Change).await.is_err() {
++                            break;
++                        }
++                    }
++                }
++            }
++        });
++        Ok(Self { _handle: AbortOnDropHandle::new(handle) })
++    }
++}
++
++// Preserve all public interfaces; no assumptions about Apple interface names.
++pub(crate) fn is_interesting_interface(_name: &str) -> bool {
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn polls_and_drop_stops_the_task() {
++        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap()
++            .block_on(async {
++                let (tx, mut rx) = mpsc::channel(2);
++                let monitor = RouteMonitor::new(tx).unwrap();
++                assert!(time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
++                assert!(time::timeout(Duration::from_secs(6), rx.recv()).await.unwrap().is_some());
++                drop(monitor);
++                assert!(time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().is_none());
++            });
++    }
++
++    #[test]
++    fn closed_receiver_stops_the_task() {
++        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap()
++            .block_on(async {
++                let (tx, rx) = mpsc::channel(2);
++                let witness = tx.clone();
++                let _monitor = RouteMonitor::new(tx).unwrap();
++                drop(rx);
++                time::timeout(Duration::from_secs(1), async {
++                    while witness.strong_count() != 1 {
++                        tokio::task::yield_now().await;
++                    }
++                }).await.unwrap();
++            });
++    }
++}

@@ -1,0 +1,36 @@
+// !$*UTF8*$!
+{ archiveVersion = 1; classes = {}; objectVersion = 56; objects = {
+38DE4D7A356A7CFA86CE2990 = { isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+0AC6E4CD0F21F3081F9449CF = { isa = PBXBuildFile; fileRef = 38DE4D7A356A7CFA86CE2990; };
+BA145F828B474C048DEEE384 = { isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+E9D804FE7A4143EA9855A81B = { isa = PBXBuildFile; fileRef = BA145F828B474C048DEEE384; };
+A7B6FC22D161420EBCFDF34B = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ErlkonigPhone.swift; sourceTree = "<group>"; };
+D02DA1C83ACA41B3AC048341 = { isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ErlkonigBridge.h; sourceTree = "<group>"; };
+E89E375F7C834C789B476EB6 = { isa = PBXFileReference; explicitFileType = wrapper.application; path = ErlkonigPhone.app; sourceTree = BUILT_PRODUCTS_DIR; };
+6E462B7F7B09476F9B8BA006 = { isa = PBXGroup; children = (38DE4D7A356A7CFA86CE2990, BA145F828B474C048DEEE384, A7B6FC22D161420EBCFDF34B, D02DA1C83ACA41B3AC048341, E8AA7565D8654410B4B98596); sourceTree = "<group>"; };
+E8AA7565D8654410B4B98596 = { isa = PBXGroup; children = (E89E375F7C834C789B476EB6); name = Products; sourceTree = "<group>"; };
+80B472DC42FA46F5A8F8E95D = { isa = PBXBuildFile; fileRef = A7B6FC22D161420EBCFDF34B; };
+467535EFD40E45C5916B500A = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (80B472DC42FA46F5A8F8E95D); runOnlyForDeploymentPostprocessing = 0; };
+48242820EEC8497FB2163E9A = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+EF373ED3F3364B5AAD2C0252 = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (0AC6E4CD0F21F3081F9449CF, E9D804FE7A4143EA9855A81B); runOnlyForDeploymentPostprocessing = 0; };
+474A0075AFCB43619FDF969B = { isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
+CE732CE050B249E4ABFC8EFD = { isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; }; name = Release; };
+688AD5CD0E9F4A56A7855EE9 = { isa = XCConfigurationList; buildConfigurations = (474A0075AFCB43619FDF969B, CE732CE050B249E4ABFC8EFD); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+83D1335CABC4454BA52324A8 = { isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos;
+SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2";
+PRODUCT_NAME = "$(TARGET_NAME)"; PRODUCT_BUNDLE_IDENTIFIER = "ai.erlkonig.replica.prototype";
+ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; INFOPLIST_FILE = Info.plist; SWIFT_OBJC_BRIDGING_HEADER = ErlkonigBridge.h;
+CODE_SIGN_ENTITLEMENTS = ErlkonigPhone.entitlements; CODE_SIGN_STYLE = Automatic;
+OTHER_LDFLAGS = ("$(inherited)", "-L$(RUST_LIBRARY_DIR)", "-lerlkonig_ios", "-framework", Security, "-framework", SystemConfiguration);
+LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks"); SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
+21C9B0E1727241E894E874FC = { isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos;
+SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2";
+PRODUCT_NAME = "$(TARGET_NAME)"; PRODUCT_BUNDLE_IDENTIFIER = "ai.erlkonig.replica.prototype";
+ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; INFOPLIST_FILE = Info.plist; SWIFT_OBJC_BRIDGING_HEADER = ErlkonigBridge.h;
+CODE_SIGN_ENTITLEMENTS = ErlkonigPhone.entitlements; CODE_SIGN_STYLE = Automatic;
+OTHER_LDFLAGS = ("$(inherited)", "-L$(RUST_LIBRARY_DIR)", "-lerlkonig_ios", "-framework", Security, "-framework", SystemConfiguration);
+LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks"); }; name = Release; };
+902AED8DC018451FB11D44DC = { isa = XCConfigurationList; buildConfigurations = (83D1335CABC4454BA52324A8, 21C9B0E1727241E894E874FC); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+C817D49CE3D54F0CB958887A = { isa = PBXNativeTarget; buildConfigurationList = 902AED8DC018451FB11D44DC; buildPhases = (467535EFD40E45C5916B500A, 48242820EEC8497FB2163E9A, EF373ED3F3364B5AAD2C0252); buildRules = (); dependencies = (); name = ErlkonigPhone; productName = ErlkonigPhone; productReference = E89E375F7C834C789B476EB6; productType = "com.apple.product-type.application"; };
+55AA7FCBBD5E45148B80264D = { isa = PBXProject; attributes = { LastUpgradeCheck = 2600; }; buildConfigurationList = 688AD5CD0E9F4A56A7855EE9; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = 6E462B7F7B09476F9B8BA006; productRefGroup = E8AA7565D8654410B4B98596; projectDirPath = ""; projectRoot = ""; targets = (C817D49CE3D54F0CB958887A); };
+}; rootObject = 55AA7FCBBD5E45148B80264D; }
