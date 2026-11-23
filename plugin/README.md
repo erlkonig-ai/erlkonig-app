@@ -1,5 +1,9 @@
 # Erlkonig package sources
 
+For Mistral Vibe CLI in the headless node's pod, see the
+[Vibe setup](vibe/README.md). It uses the shared Faculties skill and the
+node's authenticated HTTP endpoint.
+
 This directory is source material, not an installable mixed-provider package.
 The app generates one OpenAI package and one Claude package with the same
 `skills/faculties/SKILL.md`. Each receives only its provider manifest and an
