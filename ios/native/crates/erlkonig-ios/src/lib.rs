@@ -128,10 +128,10 @@ impl SyncProgress {
         self.unknown_roots += 1;
     }
 }
-fn sync_progress(snapshot: &PileSnapshot, key: &SigningKey) -> Result<SyncProgress> {
+fn sync_progress(snapshot: &PileSnapshot, key: &SigningKey, selected: &[CollectionHandle]) -> Result<SyncProgress> {
     let proofs = snapshot.proofs()?.collect::<Result<Vec<_>, _>>()?;
     let mut progress = SyncProgress::default();
-    for root in selected_in(snapshot, key)? {
+    for &root in selected {
         if root == selection::config_handle(key.verifying_key()) { continue; }
         if matches!(triblespace_core::collection::collection_reader_is_admitted_by(
             snapshot, root, key.verifying_key(), &proofs), Ok(QuorumOutcome::Met)) {
@@ -444,10 +444,10 @@ fn worker_with_cleanup(
                         let pile = opening.as_mut().expect("local owner");
                         let result = collections::choose(pile, &key, root_handle, &expected, enabled);
                         let snapshot = pile.snapshot()?;
+                        let selected = selected_in(&snapshot, &key)?;
+                        let sync = sync_progress(&snapshot, &key, &selected)?;
                         inactive_view = Some((collections::project(&snapshot, key.verifying_key(), page_offset, collections::PAGE_SIZE)?,
-                            selected_in(&snapshot, &key)?,
-                            ReplayProgress::observe(&snapshot, pile.observed_length()?, requested_activity),
-                            sync_progress(&snapshot, &key)?));
+                            selected, ReplayProgress::observe(&snapshot, pile.observed_length()?, requested_activity), sync));
                         result
                     };
                     let error = choice.err().map(|error| format!("{error:#}"));
@@ -527,9 +527,13 @@ fn worker_with_cleanup(
                         } else {
                             collections::project_prefix(&snapshot, key.verifying_key(), page_offset, collections::PAGE_SIZE)?
                         };
-                        let selected = if complete { selected_in(&snapshot, &key)?.len() } else { 0 };
+                        let (selected, sync) = if complete {
+                            let selected = selected_in(&snapshot, &key)?;
+                            (selected.len(), Some(sync_progress(&snapshot, &key, &selected)?))
+                        } else {
+                            (0, None)
+                        };
                         let listening = complete && collections::listening_in(&snapshot, key.verifying_key())?;
-                        let sync = if complete { Some(sync_progress(&snapshot, &key)?) } else { None };
                         // Backing extent is a current observation, not snapshot state. An
                         // append after the replay step can make this denominator grow.
                         let observed_bytes = opening.as_ref().unwrap().observed_length()?;
@@ -572,8 +576,7 @@ fn worker_with_cleanup(
                     let snapshot = current.store().snapshot()?;
                     let observed_bytes = current.store().observed_length()?;
                     let snapshot_progress = ReplayProgress::observe(&snapshot, observed_bytes, requested_activity);
-                    let sync = sync_progress(&snapshot, &key)?;
-                    let mut changed_page = None;
+                    let mut changed_view = None;
                     if storage_generation != Some(snapshot.held_generation()) {
                         storage_changed = true;
                         chart_changed = true;
@@ -586,8 +589,9 @@ fn worker_with_cleanup(
                         storage_changed = true;
                         chart_changed = true;
                         listening = collections::listening(&mut current.store(), &key)?;
-                        changed_page = Some(collections::project(&snapshot, key.verifying_key(), page_offset, collections::PAGE_SIZE)?);
+                        let page = collections::project(&snapshot, key.verifying_key(), page_offset, collections::PAGE_SIZE)?;
                         let next = selected_in(&snapshot, &key)?;
+                        changed_view = Some((page, sync_progress(&snapshot, &key, &next)?));
                         if previous.is_none() || roots != next {
                             current.set_replication(ReplicationMode::Full, next.iter().copied());
                             if !next.is_empty() {
@@ -603,9 +607,11 @@ fn worker_with_cleanup(
                     // Publish snapshot-native rows/counts before optional inventory
                     // setup or byte steps. No byte batch owns their readiness.
                     publish(&status, |s| {
-                        if let Some(page) = changed_page.take() { s.collections = page; }
+                        if let Some((page, sync)) = changed_view {
+                            s.collections = page;
+                            s.sync_progress = Some(sync);
+                        }
                         s.replay_progress = Some(snapshot_progress);
-                        s.sync_progress = Some(sync);
                     });
                     // Only visible roots; arrivals coalesce into a five-second sample.
                     // No periodic scan while Storage is hidden (empty request set).
