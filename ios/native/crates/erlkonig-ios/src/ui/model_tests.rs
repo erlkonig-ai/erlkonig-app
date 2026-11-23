@@ -43,7 +43,7 @@ fn sync_shows_the_last_observed_membership_until_its_host_is_retired() {
     {
         let _busy_writer = shared.lock().unwrap();
         model.tick();
-        assert_eq!(model.phase(), "Last observed · no connected nodes");
+        assert_eq!(model.phase(), "No connected nodes · observed over 5 s ago");
         assert!(Arc::ptr_eq(model.status.network.as_ref().unwrap(), &first));
     }
     model.tick();

@@ -819,12 +819,15 @@ impl Model {
             let fresh = self.fresh_network();
             let count = match n.connections.len() {
                 0 if fresh && s.listening => return "Listening".into(),
-                0 if fresh => return "No connected nodes".into(),
-                0 => "no connected nodes".into(),
+                0 => "No connected nodes".into(),
                 1 => "1 connected node".into(),
                 count => format!("{count} connected nodes"),
             };
-            return if fresh { count } else { format!("Last observed · {count}") };
+            return if fresh {
+                count
+            } else {
+                format!("{count} · observed over 5 s ago")
+            };
         }
         if s.running && (s.listening || s.selected > 0) {
             "Starting network"
