@@ -193,6 +193,23 @@ private struct ChoiceQueue {
     mutating func discard() { pending.removeAll(); order.removeAll(); flight = nil }
 }
 
+// The native command sender and status mutex allow concurrent reads and
+// commands. Each in-flight read retains this owner for the entire FFI call.
+private final class NativeReplica: @unchecked Sendable {
+    let pointer: OpaquePointer
+    init(_ pointer: OpaquePointer) { self.pointer = pointer }
+    deinit { erl_ios_release(pointer) }
+
+    func readStatus() -> (ReplicaStatus, TimeInterval)? {
+        guard let value = erl_ios_status(pointer) else { return nil }
+        defer { erl_ios_string_free(value) }
+        let readAt = ProcessInfo.processInfo.systemUptime
+        let bytes = Data(bytesNoCopy: UnsafeMutableRawPointer(value), count: strlen(value), deallocator: .none)
+        guard let status = try? JSONDecoder().decode(ReplicaStatus.self, from: bytes) else { return nil }
+        return (status, readAt)
+    }
+}
+
 @MainActor
 private final class ReplicaModel: ObservableObject {
     @Published var status = ReplicaStatus()
@@ -206,7 +223,9 @@ private final class ReplicaModel: ObservableObject {
     @Published var volumeError: String?
     private var volumeURL: URL?
     private var volumeTask: Task<Void, Never>?
-    private var handle: OpaquePointer?
+    private var native: NativeReplica?
+    private var handle: OpaquePointer? { native?.pointer }
+    private var readingStatus = false
     private var timer: Timer?
     private var copyTask: Task<Void, Never>?
     private var background: UIBackgroundTaskIdentifier = .invalid
@@ -347,16 +366,15 @@ private final class ReplicaModel: ObservableObject {
     deinit {
         timer?.invalidate()
         volumeTask?.cancel()
-        if let handle { erl_ios_release(handle) }
     }
 
     private func open(_ path: String) {
-        handle = path.withCString { erl_ios_open($0) }
+        native = path.withCString { erl_ios_open($0) }.map(NativeReplica.init)
         guard let handle else { status.error = "Could not start replica worker"; return }
         if foreground && proofOnly { pendingActivity = erl_ios_local_active(handle) }
         else { pendingActivity = erl_ios_active(handle, foreground) }
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.poll() }
+            Task { @MainActor [weak self] in await self?.poll() }
         }
     }
 
@@ -372,11 +390,18 @@ private final class ReplicaModel: ObservableObject {
         status.message = "Synthetic copy verified with source offline"
     }
 
-    private func poll() {
-        guard let handle, let value = erl_ios_status(handle) else { return }
-        defer { erl_ios_string_free(value) }
-        guard let data = String(cString: value).data(using: .utf8),
-              let next = try? JSONDecoder().decode(ReplicaStatus.self, from: data) else { return }
+    private func poll() async {
+        guard !readingStatus, let native else { return }
+        readingStatus = true
+        defer { readingStatus = false }
+        let sample = await Task.detached(priority: .utility) { native.readStatus() }.value
+        guard let (status, readAt) = sample, native === self.native else { return }
+        var next = status
+        if let age = next.network?.age_ms {
+            let delay = UInt64((ProcessInfo.processInfo.systemUptime - readAt) * 1000)
+            let sum = age.addingReportingOverflow(delay)
+            next.network?.age_ms = sum.overflow ? UInt64.max : sum.partialValue
+        }
         apply(next)
     }
 
