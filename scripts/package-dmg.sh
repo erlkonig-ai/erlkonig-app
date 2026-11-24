@@ -61,7 +61,7 @@ files = {
     "Contents/Resources/provenance.txt",
 }
 plugin_files = {"README.md", ".codex-plugin/plugin.json", ".claude-plugin/plugin.json",
-                "skills/faculties/SKILL.md"}
+                "skills/faculties/SKILL.md", "vibe/README.md", "vibe/plugin.json"}
 files |= {"Contents/Resources/plugin/" + p for p in plugin_files}
 # Trust the selected source notice manifest, never a modified bundled manifest.
 # Supporting evidence has exact source bytes too; neither side may add files.
@@ -106,7 +106,7 @@ assert files <= seen, f"missing bundle files: {sorted(files - seen)}"
 for relative in notice_files:
     assert (app / "Contents/Resources/notices" / relative).read_bytes() == (notices / relative).read_bytes(), f"not the source notice: {relative}"
 PY
-for file in README.md .codex-plugin/plugin.json .claude-plugin/plugin.json skills/faculties/SKILL.md; do
+for file in README.md .codex-plugin/plugin.json .claude-plugin/plugin.json skills/faculties/SKILL.md vibe/README.md vibe/plugin.json; do
     cmp -s "$app/Contents/Resources/plugin/$file" "$repo/plugin/$file" || fail "not the source plugin template: $file"
 done
 codesign --verify --deep --strict "$app"
