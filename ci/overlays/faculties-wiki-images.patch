@@ -1,22 +1,13 @@
-diff --git a/src/widgets/wiki.rs b/src/widgets/wiki.rs
-index 6b4bcd1248c719530939c896506403d1ca238f0b..ea49b1a24b62a7c144324de9ea3d0169b4075ddd 100644
---- a/src/widgets/wiki.rs
-+++ b/src/widgets/wiki.rs
-@@ -23,7 +23,7 @@
- //!   writes it to `$TMPDIR/faculties-files/`, and opens it via the platform
- //!   `open` command.
-
--use std::collections::{BTreeMap, BTreeSet, HashSet};
-+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-
- use super::storage::WidgetReader as PileSnapshot;
- use triblespace::core::blob::Blob;
-@@ -727,9 +727,15 @@ fn parse_wiki_link_target(target: &str) -> Option<(Id, bool)> {
+diff --git a/src/widgets/knowledge.rs b/src/widgets/knowledge.rs
+index 847c373d02edf6329c44abc38acdd51d0a914f5a..1a4222a3dd915a79d47347b9d4a9cec319c38638 100644
+--- a/src/widgets/knowledge.rs
++++ b/src/widgets/knowledge.rs
+@@ -890,9 +890,15 @@ fn parse_knowledge_link_target(target: &str) -> Option<(Id, bool)> {
  /// output queue; we peek at the commands added during `ctx.typst(…)`,
  /// keep the non-matching ones (so e.g. `https:` links still open the
  /// browser), and pull out the `wiki:` / `files:` ones as `LinkClick`s.
--pub(crate) fn render_wiki_content(ctx: &mut CardCtx<'_>, content: &str) -> Option<LinkClick> {
-+pub(crate) fn render_wiki_content(
+-pub(crate) fn render_knowledge_content(ctx: &mut CardCtx<'_>, content: &str) -> Option<LinkClick> {
++pub(crate) fn render_knowledge_content(
 +    ctx: &mut CardCtx<'_>,
 +    content: &str,
 +    files: Option<DatasetView<'_>>,
@@ -29,7 +20,7 @@ index 6b4bcd1248c719530939c896506403d1ca238f0b..ea49b1a24b62a7c144324de9ea3d0169
 
      let mut clicked = None;
      ctx.ctx().output_mut(|o| {
-@@ -767,6 +773,98 @@ pub(crate) fn render_wiki_content(ctx: &mut CardCtx<'_>, content: &str) -> Optio
+@@ -934,6 +940,98 @@ pub(crate) fn render_knowledge_content(ctx: &mut CardCtx<'_>, content: &str) ->
      clicked
  }
 
@@ -125,37 +116,31 @@ index 6b4bcd1248c719530939c896506403d1ca238f0b..ea49b1a24b62a7c144324de9ea3d0169
 +    }
 +}
 +
- // ── browser state (absorbed into WikiViewer) ─────────────────────────
+ // ── browser state (absorbed into KnowledgeViewer) ─────────────────────────
 
- /// An open canonical Wiki revision.
-@@ -819,6 +917,8 @@ pub struct WikiViewer {
+ /// An open canonical Knowledge revision.
+@@ -986,6 +1084,8 @@ pub struct KnowledgeViewer {
      /// build). Dropped whenever `live` is rebuilt.
-     graph: Option<WikiGraph>,
+     graph: Option<KnowledgeGraph>,
      open_pages: Vec<OpenPage>,
 +    /// Bytes of the `files:` images open pages show.
 +    inline_images: InlineImages,
+     /// Colouring the graph by meaning, when the host can embed a query.
+     semantic: Semantic,
  }
-
- impl WikiViewer {
-@@ -1264,7 +1364,12 @@ impl WikiViewer {
-                         g.full(|ctx| { ctx.separator(); });
-
-                         g.full(|ctx| {
--                            match render_wiki_content(ctx, &content) {
-+                            match render_wiki_content(
-+                                ctx,
-+                                &content,
-+                                files_view,
-+                                &self.inline_images,
-+                            ) {
-                                 Some(LinkClick::Wiki(id)) => {
+@@ -1522,7 +1622,7 @@ impl KnowledgeViewer {
+                             let displayed = crate::knowledge::content_with_original_sources(
+                                 knowledge_view.facts, revision_id, content.clone(),
+                             );
+-                            match render_knowledge_content(ctx, &displayed) {
++                            match render_knowledge_content(ctx, &displayed, files_view, &self.inline_images) {
+                                 Some(LinkClick::Knowledge(id)) => {
                                      to_open_from_link.push((id, false))
                                  }
-@@ -1547,4 +1652,185 @@ mod tests {
-             crate::files::content_hash_hex(content)
-         );
-     }
-+
+@@ -1581,6 +1681,187 @@ mod tests {
+     use triblespace::macros::{find, pattern};
+     use triblespace::prelude::*;
+
 +    /// A 4x2 red PNG.
 +    const RED_PNG: &[u8] = &[
 +        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
@@ -267,7 +252,7 @@ index 6b4bcd1248c719530939c896506403d1ca238f0b..ea49b1a24b62a7c144324de9ea3d0169
 +    }
 +
 +    #[test]
-+    fn a_wiki_page_lays_out_its_files_images() {
++    fn a_knowledge_page_lays_out_its_files_images() {
 +        use typst::layout::{Frame, FrameItem};
 +        use typst::visualize::ImageKind;
 +
@@ -336,4 +321,7 @@ index 6b4bcd1248c719530939c896506403d1ca238f0b..ea49b1a24b62a7c144324de9ea3d0169
 +        world.set_source("#image(\"red.png\")".to_owned());
 +        assert!(world.compile_with_files(&resolve).is_err());
 +    }
- }
++
+     fn semantic_id(byte: u8) -> Id {
+         Id::new([byte; 16]).expect("non-nil id")
+     }

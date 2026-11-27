@@ -828,7 +828,14 @@ generation and navigation while invalidating workspace presentation caches once
 per relevant update. Native snapshots remain frozen; a missing resident payload
 that arrives through sync triggers a fresh observation without a viewer fetch.
 
-Wiki links and Files preview actions run on the worker against the exact clicked
+The pinned Dashboard includes Colony lives and observed Archive history, and
+Rules patterns and conclusions. These are workspace-scoped readers; viewing a
+life or a rule does not launch a zooid or execute an effect. The retained inline
+Files-image overlay is rebased onto the renamed Knowledge viewer. This app
+composition still requires its own compilation and native acceptance; standalone
+viewer qualification does not establish app-window behavior.
+
+Knowledge links and Files preview actions run on the worker against the exact clicked
 Files observation. Every export gets a fresh owned preview folder. Actions check
 selection and cancellation before filesystem effects and again immediately before
 launching the system viewer. Failed or cancelled exports remove their own partial

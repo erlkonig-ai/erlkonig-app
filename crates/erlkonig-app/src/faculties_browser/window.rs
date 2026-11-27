@@ -3,7 +3,7 @@ use GORBIE::{prelude::CardCtx, state::StateId};
 use erlkonig_core::{runtime::Runtime, faculties_browser::{ViewerInterest, ViewerNode, ViewerWorker}, workspace::Workspace};
 use faculties::widgets::storage::WorkspaceObservation;
 use faculties::viewer::{self, Host, HostAction, Target};
-use faculties::widgets::{FilesViewer, GameWrite, SourceKey, WidgetContext, WikiViewer};
+use faculties::widgets::{FilesViewer, GameWrite, KnowledgeViewer, SourceKey, WidgetContext};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -334,8 +334,8 @@ fn work(
                             .ok_or_else(|| "Files are unavailable in this workspace.".to_owned())
                     };
                     let write = match action {
-                        HostAction::WikiLink(selector) => {
-                            WikiViewer::open_file_with(files_view()?, &selector, &mut before_export)?;
+                        HostAction::KnowledgeLink(selector) => {
+                            KnowledgeViewer::open_file_with(files_view()?, &selector, &mut before_export)?;
                             return Ok(None);
                         }
                         HostAction::Entity(entity) => {
@@ -349,7 +349,7 @@ fn work(
                     let cancelled = || stop.load(Ordering::Acquire)
                         || node.is_stopping() || generation != desired.load(Ordering::Acquire);
                     node.with_workspace(&selected, cancelled, |pile, signer| {
-                        use faculties::compass::operations;
+                        use faculties::goals::operations;
                         let route = selected.routes.get(&faculties::schemas::compass::DEFAULT_SCOPE_ID)
                             .ok_or_else(|| std::io::Error::other("Compass is unavailable in this workspace."))?;
                         let before_commit = || {
@@ -477,7 +477,7 @@ impl Host for WorkspaceHost {
             let status = match action {
                 HostAction::Prioritize { .. } => "Recording priority…",
                 HostAction::MarkGoalUnclear { .. } => "Marking goal unclear…",
-                HostAction::WikiLink(_) | HostAction::Entity(_) => {
+                HostAction::KnowledgeLink(_) | HostAction::Entity(_) => {
                     if !data.loaded_context().contains(SourceKey::Files) {
                         return Err("Files are unavailable in this workspace.".into());
                     }

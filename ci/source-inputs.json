@@ -42,21 +42,21 @@
     {
       "path": "faculties",
       "url": "https://github.com/triblespace/faculties.git",
-      "commit": "5c3495d58854ff204a38c7f3ff2457cf008ea112",
-      "tree": "18427cc1d7a4c1d6c84dc30337f467ead82aac6b",
+      "commit": "cfeb187d6bbe804f5f4c98357eb6e3b4d92d4ca5",
+      "tree": "0310661dc4c1485964922b7b13753230a22572c3",
       "public_ref_verified": true,
-      "public_ref_status": "Exact local frozen source verified; public availability of this successor revision not rechecked in this source-only step.",
+      "public_ref_status": "Exact revision verified as advertised public main after its normal fast-forward landing on 2026-11-27; app compilation remains pending.",
       "overlay": {
         "path": "ci/overlays/faculties-wiki-images.patch",
-        "sha256": "ed173858e385c36bac6249e3f3a8b6985c2bea15016f1ad6fcef4ee6b9017650",
-        "tree": "1888744b69c3faab4841c288b289cb2e5c23aee3"
+        "sha256": "2e5fa95b7748b9edd1cb6aa40c1a6d54415b4259861ce7c8a35e1d2d004b7ae4",
+        "tree": "ebf939976c425373abf4fa4a418560af076c4915"
       }
     },
     {
       "path": "triblespace-rs",
       "url": "https://github.com/erlkonig-ai/triblespace.git",
-      "commit": "c2984d23a0dfa97e951bdfe5fc1abfb0a27aebee",
-      "tree": "0559ca49331d2c481798dc2d052085ce48e54a3c",
+      "commit": "48dde7d86b1cc0d6bc8b37af7b32b99306caa9eb",
+      "tree": "0b697d1944b54bc04928e99ac7217c9a9379217a",
       "public_ref_verified": true
     },
     {
