@@ -42,14 +42,14 @@
     {
       "path": "faculties",
       "url": "https://github.com/triblespace/faculties.git",
-      "commit": "6de7c165a9335691f2fc8e1cb7a3038ad12e1875",
-      "tree": "316bbe21677ed8fb2875a4a980f9d499d0910019",
+      "commit": "ee8405ec6b852ac71a6fd465cf783f7e1e0d1ecf",
+      "tree": "2dd815d92f85210a8587720f870baf6c47460f73",
       "public_ref_verified": true,
-      "public_ref_status": "Published and read back at review/dashboard-capture-labels-20261127, commit6de7c165a9335691f2fc8e1cb7a3038ad12e1875. Linux ARM64 app-graph qualification completed; Faculties main landing and native release qualification remain separate.",
+      "public_ref_status": "Published and read back at review/dashboard-capture-labels-20261127, commitee8405ec6b852ac71a6fd465cf783f7e1e0d1ecf. Adds only the missing widgets guard on the capture-label test; prior app-graph qualification remains attributed to its parent. Full landing rerun and explicit named-widget execution are pending; native release qualification is separate.",
       "overlay": {
         "path": "ci/overlays/faculties-wiki-images.patch",
         "sha256": "2e5fa95b7748b9edd1cb6aa40c1a6d54415b4259861ce7c8a35e1d2d004b7ae4",
-        "tree": "557f74e95fa67c95f0cc79d3ba5cae55f0e9abd5"
+        "tree": "ffdd97ece0c32a41051ce99ab17bb800c316c391"
       }
     },
     {
