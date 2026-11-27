@@ -1,7 +1,7 @@
 //! Synthetic Wiki/browser seed for the acceptance helper only.
 use anyhow::Result;
 use erlkonig_core::{config::Bootstrap, node_store::NodeStore};
-use faculties::{files::Files, storage::Storage, wiki::{self, RevisionDraft, Wiki}};
+use faculties::{files::Files, storage::Storage, knowledge::{self, RevisionDraft, Knowledge}};
 use hifitime::Epoch;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -31,7 +31,7 @@ pub fn seed(bootstrap: &Bootstrap, first: Id, full_viewer: bool) -> Result<Value
                 format!("PUBLIC SYNTHETIC {marker} BOM\npart,quantity\nwasher,4\n").into_bytes().into(),
                 "bom.txt", "text/plain", &[],
             )?;
-            let page = Wiki::with_storage(storage.clone());
+            let page = Knowledge::with_storage(storage.clone());
             let original = page.create(
                 &format!("{marker} Design"),
                 &format!("= {marker} original design\nPUBLIC SYNTHETIC old revision."),
@@ -49,20 +49,20 @@ pub fn seed(bootstrap: &Bootstrap, first: Id, full_viewer: bool) -> Result<Value
                     store, faculties::schemas::wiki::DEFAULT_SCOPE_ID,
                     signer.verifying_key(), runtime,
                 )?;
-                let (mut fragment, author) = wiki::author_record(&signer.verifying_key());
+                let (mut fragment, author) = knowledge::author_record(&signer.verifying_key());
                 let instant = Epoch::from_tai_seconds(1.0);
                 let authored_at = (instant, instant).try_to_inline()
                     .map_err(|_| anyhow::anyhow!("synthetic timestamp encoding"))?;
                 let draft = |title: String, content: String, predecessors: BTreeSet<Id>| RevisionDraft {
                     title, content, predecessors, author, authored_at, tags: BTreeSet::new(),
                 };
-                let (root_fragment, root) = wiki::revision_record(draft(
+                let (root_fragment, root) = knowledge::revision_record(draft(
                     format!("{marker} concurrent BOM"), "= Common BOM\nBase.".into(), BTreeSet::new(),
                 ))?;
-                let (left_fragment, left) = wiki::revision_record(draft(
+                let (left_fragment, left) = knowledge::revision_record(draft(
                     format!("{marker} concurrent BOM left"), "= Left tip\nUse four washers.".into(), BTreeSet::from([root]),
                 ))?;
-                let (right_fragment, right) = wiki::revision_record(draft(
+                let (right_fragment, right) = knowledge::revision_record(draft(
                     format!("{marker} concurrent BOM right"), "= Right tip\nUse six washers.".into(), BTreeSet::from([root]),
                 ))?;
                 fragment += root_fragment;
@@ -84,9 +84,9 @@ pub fn seed(bootstrap: &Bootstrap, first: Id, full_viewer: bool) -> Result<Value
                         ..Default::default()
                     }, None, &[],
                 )?;
-                let compass = faculties::compass::Compass::with_storage(storage.clone());
+                let goals = faculties::goals::Goals::with_storage(storage.clone());
                 for (title, status) in [("Inspect workspace graph", "doing"), ("Check file preview", "todo"), ("Seed synthetic content", "done")] {
-                    compass.add(&format!("{marker} {title}"), faculties::compass::AddOptions {
+                    goals.add(&format!("{marker} {title}"), faculties::goals::AddOptions {
                         status, persona: Some("fixture-operator"), note: Some("PUBLIC SYNTHETIC fixture only"),
                         ..Default::default()
                     })?;
@@ -108,14 +108,14 @@ pub fn seed(bootstrap: &Bootstrap, first: Id, full_viewer: bool) -> Result<Value
                         store, faculties::schemas::wiki::DEFAULT_SCOPE_ID,
                         signer.verifying_key(), runtime,
                     )?;
-                    let (mut fragment, author) = wiki::author_record(&signer.verifying_key());
+                    let (mut fragment, author) = knowledge::author_record(&signer.verifying_key());
                     let instant = Epoch::from_tai_seconds(2.0);
                     let authored_at = (instant, instant).try_to_inline()
                         .map_err(|_| anyhow::anyhow!("synthetic timestamp encoding"))?;
                     let content = "= AMBER arrived body\nPUBLIC SYNTHETIC payload arrived without Refresh.";
                     let body: Blob<blobencodings::UTF8String> = content.to_blob();
                     let body_handle = body.get_handle();
-                    let (native, revision) = wiki::revision_record(RevisionDraft {
+                    let (native, revision) = knowledge::revision_record(RevisionDraft {
                         title: "AMBER delayed payload".into(), content: content.into(),
                         predecessors: BTreeSet::new(), tags: BTreeSet::new(), author, authored_at,
                     })?;

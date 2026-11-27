@@ -351,10 +351,10 @@ fn work(
                     node.with_workspace(&selected, cancelled, |pile, signer| {
                         use faculties::goals::operations;
                         let route = selected.routes.get(&faculties::schemas::compass::DEFAULT_SCOPE_ID)
-                            .ok_or_else(|| std::io::Error::other("Compass is unavailable in this workspace."))?;
+                            .ok_or_else(|| std::io::Error::other("Goals are unavailable in this workspace."))?;
                         let before_commit = || {
                             if cancelled() {
-                                return Err(std::io::Error::other("The Compass request was cancelled.").into());
+                                return Err(std::io::Error::other("The Goals request was cancelled.").into());
                             }
                             Ok(())
                         };
