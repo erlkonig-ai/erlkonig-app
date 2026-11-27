@@ -1445,7 +1445,7 @@ fn search_uses_only_explicit_workspace_roots_and_reports_each_source() {
     };
     let methods = [
         (
-            "wiki",
+            "knowledge",
             faculties::schemas::wiki::DEFAULT_SCOPE_ID,
             "ascii_substring_current_title_and_body",
         ),
@@ -1490,7 +1490,7 @@ fn search_uses_only_explicit_workspace_roots_and_reports_each_source() {
             assert_eq!(hit["kind"], *role);
             let reading = &hit["reading"];
             match *role {
-                "wiki" => {
+                "knowledge" => {
                     assert_eq!(reading["title"], format!("{marker} page"));
                     assert_eq!(reading["open"]["operation"], "knowledge_show");
                     assert_eq!(reading["open"]["arguments"]["id"], reading["revision"]);
