@@ -20,7 +20,15 @@ env.update(HOME=home, CODEX_HOME=codex_home)
 p = subprocess.Popen([codex, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                      stderr=open(os.path.join(codex_home, "appserver.err"), "w"), env=env, cwd=home, text=True)
 q = queue.Queue()
-threading.Thread(target=lambda: [q.put(json.loads(l)) for l in p.stdout], daemon=True).start()
+def read_output():
+    try:
+        for line in p.stdout:
+            q.put(json.loads(line))
+    except (ValueError, OSError) as error:
+        q.put(error)
+    finally:
+        q.put(None)
+threading.Thread(target=read_output, daemon=True).start()
 def send(m): p.stdin.write(json.dumps(m) + "\n"); p.stdin.flush()
 def call(i, method, params, timeout=90):
     send({"id": i, "method": method, "params": params})
@@ -28,29 +36,45 @@ def call(i, method, params, timeout=90):
     while time.time() < end:
         try: m = q.get(timeout=1)
         except queue.Empty: continue
+        if m is None:
+            raise RuntimeError(f"app-server closed output before {method} completed")
+        if isinstance(m, Exception):
+            raise RuntimeError("invalid app-server output") from m
+        if not isinstance(m, dict):
+            raise RuntimeError("app-server response must be an object")
         if m.get("id") == i: return m
     raise TimeoutError(method)
-r = call(1, "initialize", {"clientInfo": {"name": "erlkonig-test", "version": "0"}})
-print("initialize:", "ok" if "result" in r else r)
-send({"method": "initialized"})
-r = call(2, "mcpServerStatus/list", {"serverName": "erlkonig"})
-if "error" in r:
-    print("mcpServerStatus/list ERROR", r["error"])
-else:
-    for s in r["result"]["data"]:
+def required_result(response, method):
+    if "error" in response or not isinstance(response.get("result"), dict):
+        raise RuntimeError(f"{method} did not return a successful result")
+    return response["result"]
+try:
+    required_result(call(1, "initialize", {"clientInfo": {"name": "erlkonig-test", "version": "0"}}), "initialize")
+    print("initialize: ok")
+    send({"method": "initialized"})
+    status = required_result(call(2, "mcpServerStatus/list", {"serverName": "erlkonig"}), "mcpServerStatus/list")
+    if not isinstance(status.get("data"), list):
+        raise RuntimeError("mcpServerStatus/list omitted its server list")
+    for s in status["data"]:
         tools = s.get("tools") or {}
         print(f"mcpServerStatus/list: server={s['name']} plugin={s.get('pluginId')} serverInfo={json.dumps(s.get('serverInfo'))} "
               f"tools={len(tools)} toolsError={s.get('toolsError')}")
         print("  sample tools:", sorted(tools)[:6])
-    assert any(s["name"] == "erlkonig" and s.get("tools") for s in r["result"]["data"]), "native HTTP server absent"
-r = call(3, "thread/start", {"ephemeral": True, "cwd": home})
-if "error" in r:
-    print("thread/start ERROR", json.dumps(r["error"])[:300])
-else:
-    tid = r["result"]["thread"]["id"]
+    if not any(s["name"] == "erlkonig" and "goals_list" in (s.get("tools") or {})
+               and not s.get("toolsError") for s in status["data"]):
+        raise RuntimeError("native goals_list tool absent or unavailable")
+    started = required_result(call(3, "thread/start", {"ephemeral": True, "cwd": home}), "thread/start")
+    tid = started.get("thread", {}).get("id")
+    if not isinstance(tid, str) or not tid:
+        raise RuntimeError("thread/start omitted its thread id")
     c = call(4, "mcpServer/tool/call", {"server": "erlkonig", "threadId": tid, "tool": "goals_list", "arguments": {"workspace": args.workspace}})
-    print("goals_list in a thread:", json.dumps(c.get("result", c.get("error")))[:200])
-    assert "result" in c and not c["result"].get("isError"), "native tool call failed"
-p.stdin.close()
-p.wait(timeout=30)
+    result = required_result(c, "goals_list")
+    if result.get("isError") or not isinstance(result.get("content"), list):
+        raise RuntimeError("native goals_list call did not succeed")
+    print("goals_list in a thread: successful result")
+finally:
+    p.stdin.close()
+    p.wait(timeout=30)
+if p.returncode != 0:
+    raise RuntimeError(f"app-server exited with status {p.returncode}")
 print("app-server exit:", p.returncode)
