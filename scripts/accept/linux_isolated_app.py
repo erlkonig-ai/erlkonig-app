@@ -76,7 +76,7 @@ def exercise(name, configured):
     if not configured:
         created = json.loads(protocol.text_result(client.call('config_create_workspace',{'observation':inspected['observation'],'label':'Fresh Linux smoke'})))
         assert 'workspace' in created
-        protocol.text_result(client.call('compass_list',{'workspace':created['workspace']}))
+        protocol.text_result(client.call('goals_list',{'workspace':created['workspace']}))
     if configured:
         assert node == fixture['node_id']
         assert not inspected['settings']['sync_enabled'] and not inspected['settings']['maintenance_enabled']
@@ -84,12 +84,12 @@ def exercise(name, configured):
         listing = json.loads(protocol.text_result(client.call('list_workspaces',{})))
         assert any(row['workspace']==fixture['workspace'] for row in listing['workspaces'])
         selection = {'workspace':fixture['workspace']}
-        protocol.text_result(client.call('compass_list',selection))
+        protocol.text_result(client.call('goals_list',selection))
         forwarding = protocol.Forwarder(binary,fixture,client.url,env,log,children)
         forwarding.send(protocol.initialize())
         assert 'result' in forwarding.response(0)
         forwarding.send({'jsonrpc':'2.0','method':'notifications/initialized'})
-        forwarding.send({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'compass_list','arguments':selection}})
+        forwarding.send({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'goals_list','arguments':selection}})
         protocol.text_result(forwarding.response(1))
         assert not listener(forwarding.process.pid)
     duplicate = subprocess.Popen([str(binary)],env=env,cwd=env["HOME"],stdin=subprocess.DEVNULL,stdout=log,stderr=log)

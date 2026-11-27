@@ -1197,7 +1197,7 @@ fn erp_missing_role_keeps_the_catalog_and_older_workspace_available() {
     );
     assert!(
         f.call(
-            "compass_add",
+            "goals_add",
             json!({
                 "workspace":format!("{:X}",workspace.id),"title":"Public tools still work",
             })
@@ -1407,7 +1407,7 @@ fn search_uses_only_explicit_workspace_roots_and_reports_each_source() {
     for (workspace, marker) in [(&a, "amberneedle"), (&b, "blueneedle")] {
         let selected = format!("{:X}", workspace.id);
         f.call(
-            "wiki_create",
+            "knowledge_create",
             json!({
                 "workspace":selected, "title":format!("{marker} page"),
                 "content":format!("= {marker}\nPublic synthetic body."), "force":true
@@ -1492,7 +1492,7 @@ fn search_uses_only_explicit_workspace_roots_and_reports_each_source() {
             match *role {
                 "wiki" => {
                     assert_eq!(reading["title"], format!("{marker} page"));
-                    assert_eq!(reading["open"]["operation"], "wiki_show");
+                    assert_eq!(reading["open"]["operation"], "knowledge_show");
                     assert_eq!(reading["open"]["arguments"]["id"], reading["revision"]);
                     assert_eq!(reading["open"]["arguments"]["exact"], true);
                     assert!(reading.get("matching_lines").is_none());
@@ -1577,7 +1577,7 @@ fn list_is_config_only_and_mutating_faculty_never_runs_without_an_accepted_works
         json!({"workspace":null, "title":"must not exist"}),
         json!({"workspace":format!("{:X}", configured.id), "title":"must not exist"}),
     ] {
-        assert!(f.call("compass_add", args).is_err());
+        assert!(f.call("goals_add", args).is_err());
     }
     assert_eq!(fs::read(f.dir.path().join("node.pile")).unwrap(), before);
     // A failed role lookup may retain its dormant adapter, never an endpoint.
@@ -1596,7 +1596,7 @@ fn interleaved_calls_in_two_protocol_sessions_do_not_set_a_current_workspace() {
     ] {
         let response = rpc_call(
             server,
-            "compass_add",
+            "goals_add",
             json!({"workspace":format!("{:X}",workspace.id),"title":title}),
         );
         assert!(response.get("error").is_none(), "{response}");
@@ -1605,29 +1605,29 @@ fn interleaved_calls_in_two_protocol_sessions_do_not_set_a_current_workspace() {
     // Deliberately use B's previous session for A, and A's for B.
     let response = rpc_call(
         &mut second,
-        "compass_add",
+        "goals_add",
         json!({"workspace":format!("{:X}",a.id),"title":"Only A second"}),
     );
     assert_ne!(response["result"]["isError"], true, "{response}");
-    let response = rpc_call(&mut first, "compass_list", selection(&b));
+    let response = rpc_call(&mut first, "goals_list", selection(&b));
     assert!(response.to_string().contains("Only B"));
     assert!(!response.to_string().contains("Only A"));
     assert_eq!(
-        rpc_call(&mut first, "compass_list", json!({}))["error"]["code"],
+        rpc_call(&mut first, "goals_list", json!({}))["error"]["code"],
         -32602
     );
-    let a_result = f.call("compass_list", selection(&a)).unwrap();
-    let b_result = f.call("compass_list", selection(&b)).unwrap();
+    let a_result = f.call("goals_list", selection(&a)).unwrap();
+    let b_result = f.call("goals_list", selection(&b)).unwrap();
     assert!(a_result.contains("Only A first") && a_result.contains("Only A second"));
     assert!(!a_result.contains("Only B"));
     assert!(b_result.contains("Only B") && !b_result.contains("Only A"));
-    assert!(f.call("compass_list", json!({})).is_err());
+    assert!(f.call("goals_list", json!({})).is_err());
     assert_eq!(f.dispatch.owners.borrow().len(), 2);
     f.dispatch.close().unwrap();
     assert!(f.dispatch.owners.borrow().is_empty());
     // Closing flushes successful writes. Independent request owners can reopen.
     assert!(
-        f.call("compass_list", selection(&a))
+        f.call("goals_list", selection(&a))
             .unwrap()
             .contains("Only A first")
     );
@@ -1663,22 +1663,22 @@ fn same_name_roots_are_exact_and_old_binding_never_retargets() {
     b.id = node.put_workspace(&view, &b).unwrap();
     drop(guard);
     f.call(
-        "compass_add",
+        "goals_add",
         json!({"workspace":format!("{:X}", a.id), "title":"First exact root"}),
     )
     .unwrap();
     f.call(
-        "compass_add",
+        "goals_add",
         json!({"workspace":format!("{:X}", b.id), "title":"Second exact root"}),
     )
     .unwrap();
     assert!(
-        !f.call("compass_list", selection(&a))
+        !f.call("goals_list", selection(&a))
             .unwrap()
             .contains("Second exact root")
     );
     assert!(
-        !f.call("compass_list", selection(&b))
+        !f.call("goals_list", selection(&b))
             .unwrap()
             .contains("First exact root")
     );
@@ -1693,13 +1693,13 @@ fn same_name_roots_are_exact_and_old_binding_never_retargets() {
     assert_ne!(replacement.id, a.id);
     assert!(
         f.call(
-            "compass_add",
+            "goals_add",
             json!({"workspace":format!("{:X}", a.id),"title":"Must not retarget"})
         )
         .is_err()
     );
     assert!(!f.dispatch.owners.borrow().contains_key(&a.id));
-    let after = f.call("compass_list", selection(&replacement)).unwrap();
+    let after = f.call("goals_list", selection(&replacement)).unwrap();
     assert!(after.contains("Second exact root") && !after.contains("Must not retarget"));
 }
 
@@ -1712,7 +1712,7 @@ fn request_cannot_inject_routing_and_duplicate_arguments_are_not_normalized() {
         let mut args = selection(&a);
         args["title"] = json!("Never written");
         args[field] = json!("/untrusted/target");
-        assert!(f.call("compass_add", args).is_err(), "{field}");
+        assert!(f.call("goals_add", args).is_err(), "{field}");
     }
     assert_eq!(fs::read(&f.dispatch.node.pile).unwrap(), before);
     let id = format!("{:X}", a.id);
@@ -1720,7 +1720,7 @@ fn request_cannot_inject_routing_and_duplicate_arguments_are_not_normalized() {
         format!(r#"{{"workspace":"{id}","workspace":"{id}","title":"no"}}"#),
         format!(r#"{{"workspace":"{id}","title":"first","title":"second"}}"#),
     ] {
-        assert!(f.raw("compass_add", &raw).is_err());
+        assert!(f.raw("goals_add", &raw).is_err());
     }
     let nested =
         format!(r#"{{"workspace":"{id}","label":"no","profile":{{"note":"one","note":"two"}}}}"#);
@@ -1739,7 +1739,7 @@ fn missing_role_and_replaced_signer_fail_without_node_or_private_root_fallback()
     let view = node.config().unwrap();
     a.id = node.put_workspace(&view, &a).unwrap();
     drop(guard);
-    let error = f.call("compass_list", selection(&a)).unwrap_err();
+    let error = f.call("goals_list", selection(&a)).unwrap_err();
     assert!(format!("{error:#}").contains("role"), "{error:#}");
     let before = fs::read(&f.dispatch.node.pile).unwrap();
     // Replace only the scratch key at the same selected path.
@@ -1751,7 +1751,7 @@ fn missing_role_and_replaced_signer_fail_without_node_or_private_root_fallback()
     signing_key_file::init(&f.dispatch.node.key).unwrap();
     let error = f
         .call(
-            "compass_add",
+            "goals_add",
             json!({"workspace":format!("{:X}",a.id),"title":"no"}),
         )
         .unwrap_err();
@@ -1814,7 +1814,7 @@ fn same_id_annotation_replaces_warm_owner_and_matches_a_fresh_request() {
         }),
     )
     .unwrap();
-    assert!(f.call("compass_list", selection(&workspace)).is_err());
+    assert!(f.call("goals_list", selection(&workspace)).is_err());
     let before = f.node.lock().unwrap().as_mut().unwrap().config().unwrap();
     let revision = workspace.id;
     f.annotate(
@@ -1833,7 +1833,7 @@ fn same_id_annotation_replaces_warm_owner_and_matches_a_fresh_request() {
             .contains_key(&compass::DEFAULT_SCOPE_ID)
     );
     f.call(
-        "compass_add",
+        "goals_add",
         json!({
             "workspace":format!("{revision:X}"),"title":"Newly configured role",
         }),
@@ -1851,7 +1851,7 @@ fn same_id_annotation_replaces_warm_owner_and_matches_a_fresh_request() {
             .unwrap()
             .contains("Retained before annotation")
     );
-    let warm = f.call("compass_list", selection(&workspace)).unwrap();
+    let warm = f.call("goals_list", selection(&workspace)).unwrap();
     let node = f.node.clone();
     let fresh = WorkspaceDispatch::new(f.dispatch.node.clone(), move || {
         node.lock().unwrap().as_mut().unwrap().config()
@@ -1860,7 +1860,7 @@ fn same_id_annotation_replaces_warm_owner_and_matches_a_fresh_request() {
     let mut text = String::new();
     fresh
         .call(
-            "compass_list",
+            "goals_list",
             Bytes::from(serde_json::to_vec(&selection(&workspace)).unwrap()),
             &mut Out::new(&mut |part| {
                 if let Part::Text { text: value } = part {
@@ -1881,7 +1881,7 @@ fn unavailable_revision_does_not_hide_healthy_workspaces_and_can_be_withdrawn() 
     let f = Fixture::new();
     let healthy = f.workspace("healthy");
     let bad = f.workspace("conflicted");
-    f.call("compass_list", selection(&bad)).unwrap();
+    f.call("goals_list", selection(&bad)).unwrap();
     let revision = bad.id;
     f.annotate(
         entity! { ExclusiveId::force_ref(&revision) @ attrs::workspace_route*: entity! {
@@ -1915,7 +1915,7 @@ fn unavailable_revision_does_not_hide_healthy_workspaces_and_can_be_withdrawn() 
         assert!(view.workspace_revision(revision).is_err());
         node.remove_workspace_revision(&view, revision).unwrap();
     }
-    assert!(f.call("compass_list", selection(&bad)).is_err());
+    assert!(f.call("goals_list", selection(&bad)).is_err());
     let listed: Value =
         serde_json::from_str(&f.call("list_workspaces", json!({})).unwrap()).unwrap();
     assert_eq!(listed["unavailable"], json!([]));

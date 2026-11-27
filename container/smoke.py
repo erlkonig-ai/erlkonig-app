@@ -67,7 +67,7 @@ def main():
         before = call("config_inspect", {})
         created = call("config_create_workspace", {"observation": before["observation"], "label": "Podman smoke"})
         workspace = created["workspace"]
-        client("call", "compass_list", "--workspace", workspace)
+        client("call", "goals_list", "--workspace", workspace)
 
         podman("stop", "--time", "45", owner)
         assert podman("inspect", "--format", "{{.State.ExitCode}}", owner).stdout.strip() == "0"
@@ -75,7 +75,7 @@ def main():
         start()
         assert call("config_inspect", {})["node_id"] == before["node_id"]
         assert any(row["workspace"] == workspace for row in client("workspaces", "list")["workspaces"])
-        client("call", "compass_list", "--workspace", workspace)
+        client("call", "goals_list", "--workspace", workspace)
         print("Rootless UID 10001, authenticated MCP and workspace retention after owner recreation passed.")
 
 

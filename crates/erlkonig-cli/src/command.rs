@@ -246,14 +246,14 @@ mod tests {
         for words in [
             vec!["serve", "--url", "http://127.0.0.1:1/"],
             vec!["tools", "list", "--workspace", "x"],
-            vec!["call", "wiki_list", "--json", "{}", "--json", "{}"],
+            vec!["call", "knowledge_list", "--json", "{}", "--json", "{}"],
             vec!["daemon"],
         ] {
             assert!(args(&words).is_err());
         }
         let parsed = args(&[
             "call",
-            "wiki_list",
+            "knowledge_list",
             "--json",
             "-",
             "--workspace",

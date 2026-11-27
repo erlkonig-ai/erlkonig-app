@@ -9,7 +9,7 @@ The `faculties` tools come from the Erlkonig app on this computer. One node
 identity and one append-only local store serve every workspace. A workspace
 is a named bundle of collections for the tools, not another pile or key.
 Collection capabilities determine access. Faculty tool names include
-`compass_add` and `wiki_search`.
+`goals_add` and `knowledge_search`.
 
 ## Agent-led setup
 
@@ -194,22 +194,22 @@ its app chooser and local passphrase flow.
 | The user has | Put it in | Start with |
 |---|---|---|
 | A paper, PDF, dataset or other document | files | `files_add`, `files_search`, `files_show` |
-| Knowledge: a finding, a method, a written-down belief, a how-to | wiki (Typst text) | `wiki_search`, `wiki_show`, `wiki_create`, `wiki_edit` |
-| A task, goal or piece of work that outlives this chat | compass | `compass_list`, `compass_add`, `compass_move`, `compass_note` |
+| Knowledge: a finding, a method, a written-down belief, a how-to | knowledge (Typst text) | `knowledge_search`, `knowledge_show`, `knowledge_create`, `knowledge_edit` |
+| A task, goal or piece of work that outlives this chat | goals | `goals_list`, `goals_add`, `goals_move`, `goals_note` |
 | A journal entry: what happened and what it was like | memory | `memory_create`, `memory_search`, `memory_context` |
 | People, organisations and groups | relations | `relations_list`, `relations_show`, `relations_add` |
-| A choice with options and factors | decide | `decide_propose`, `decide_factor`, `decide_resolve` |
+| A choice with options and factors | decisions | `decisions_propose`, `decisions_factor`, `decisions_resolve` |
 | A message to another person or agent | message | `message_send`, `message_list`, `message_ack` |
 | A question about the current situation | orient | `orient_show` |
 
 A paper goes into `files` first, and what the user learns from it goes into
-the `wiki`, linking the file. A decision about what to do next is a `compass`
-goal, not a wiki page.
+`knowledge`, linking the file. A decision about what to do next is a `goals`
+goal, not a knowledge page.
 
 ## Rules
 
 - **Never ask for a secret in chat.** Some tools need an API key, a token or
-  a model (web search, mail, discord, linkedin, voice, hear, triage and
+  a model (web search, mail, discord, linkedin, voice, hear, diagnostics and
   others). When one answers that it is not set up, tell the user in one
   sentence that it needs to be set up in the Erlkonig app or by their admin.
   For requested local credential entry, use `secrets_enter_local` with the exact
@@ -234,7 +234,7 @@ goal, not a wiki page.
   the exact child handle and encoding and discloses that child's plaintext to the
   caller. Do not silently choose a body alternative or collapse repeated or
   unknown roles. Old raw versions retain the `secrets_get` byte contract.
-- **Read before you write.** Search the wiki and list goals before creating
+- **Read before you write.** Search knowledge and list goals before creating
   an entry, so you add to existing work instead of duplicating it.
 - **First use.** Empty results describe the selected roots, not the entire
   pile. If the user wants starter content in this workspace, ask once whether
@@ -243,7 +243,7 @@ goal, not a wiki page.
 - **Attribution.** A `persona` or `from` argument must name someone who
   already exists in relations, or the call fails with `no persona matches`.
   Leave it out unless the user wants entries attributed.
-- **Wiki text is Typst.** Put identifiers containing `_` or `<...>` in
+- **Knowledge text is Typst.** Put identifiers containing `_` or `<...>` in
   backticks, or the parser reports `unclosed delimiter`.
 - **Tool errors are answers.** A tool that returns an error has said what is
   missing. Tell the user in one sentence and continue; do not retry the same

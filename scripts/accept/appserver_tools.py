@@ -1,8 +1,20 @@
 """Ask `codex app-server` (the engine inside ChatGPT) for the faculties
 server's tool list, and call one native tool in a scratch thread.
-Usage: appserver_tools.py <codex> <HOME> <CODEX_HOME>"""
-import json, os, queue, subprocess, sys, threading, time
-codex, home, codex_home = sys.argv[1:4]
+Usage: appserver_tools.py <codex> <HOME> <CODEX_HOME> <workspace-revision>
+
+Manual client probe: supply an existing exact workspace revision from the
+configured app. This probe neither chooses nor creates a workspace.
+"""
+import argparse, json, os, queue, re, subprocess, threading, time
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("codex")
+parser.add_argument("home")
+parser.add_argument("codex_home")
+parser.add_argument("workspace")
+args = parser.parse_args()
+if not re.fullmatch(r"[0-9A-Fa-f]{32}", args.workspace):
+    parser.error("workspace must be an exact 32-hex revision returned by list_workspaces")
+codex, home, codex_home = args.codex, args.home, args.codex_home
 env = {k: v for k, v in os.environ.items() if not k.startswith("TRIBLESPACE_") and k not in ("PILE", "PERSONA")}
 env.update(HOME=home, CODEX_HOME=codex_home)
 p = subprocess.Popen([codex, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -36,8 +48,8 @@ if "error" in r:
     print("thread/start ERROR", json.dumps(r["error"])[:300])
 else:
     tid = r["result"]["thread"]["id"]
-    c = call(4, "mcpServer/tool/call", {"server": "erlkonig", "threadId": tid, "tool": "compass_list", "arguments": {}})
-    print("compass_list in a thread:", json.dumps(c.get("result", c.get("error")))[:200])
+    c = call(4, "mcpServer/tool/call", {"server": "erlkonig", "threadId": tid, "tool": "goals_list", "arguments": {"workspace": args.workspace}})
+    print("goals_list in a thread:", json.dumps(c.get("result", c.get("error")))[:200])
     assert "result" in c and not c["result"].get("isError"), "native tool call failed"
 p.stdin.close()
 p.wait(timeout=30)

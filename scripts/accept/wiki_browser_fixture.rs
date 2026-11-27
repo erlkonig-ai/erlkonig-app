@@ -43,7 +43,7 @@ pub fn seed(bootstrap: &Bootstrap, first: Id, full_viewer: bool) -> Result<Value
                 None, &[], false,
             )?;
             // Native DAG constructors reproduce the existing fork unit fixture.
-            // Sequential wiki_edit calls would join the frontier, not fork it.
+            // Sequential knowledge_edit calls would join the frontier, not fork it.
             let (fork_root, left, right) = storage.with_store(|store, signer, runtime| {
                 let destination = storage.open_collection_write(
                     store, faculties::schemas::wiki::DEFAULT_SCOPE_ID,

@@ -165,14 +165,16 @@ fn authenticated_native_mcp_quit_and_restart() {
             .unwrap()
     };
     let tools: Value = request("tools/list", json!({})).json().unwrap();
-    assert!(
-        tools["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t["name"] == "compass_list")
-    );
-    let native: Value = request("tools/call", json!({"name":"compass_list","arguments":{}}))
+    let catalog = tools["result"]["tools"].as_array().unwrap();
+    for (current, removed) in [
+        ("goals_list", "compass_list"),
+        ("knowledge_show", "wiki_show"),
+        ("decisions_propose", "decide_propose"),
+    ] {
+        assert!(catalog.iter().any(|tool| tool["name"] == current), "{current}");
+        assert!(!catalog.iter().any(|tool| tool["name"] == removed), "{removed}");
+    }
+    let native: Value = request("tools/call", json!({"name":"goals_list","arguments":{}}))
         .json()
         .unwrap();
     assert_eq!(
@@ -204,10 +206,16 @@ fn authenticated_native_mcp_quit_and_restart() {
     let created: Value = request("tools/call",json!({"name":"config_create_workspace","arguments":{
         "observation":inspected["observation"],"label":"First through MCP"}})).json().unwrap();
     let created: Value = serde_json::from_str(created["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    let usable: Value = request("tools/call",json!({"name":"compass_list","arguments":{
+    let usable: Value = request("tools/call",json!({"name":"goals_list","arguments":{
         "workspace":created["workspace"]}})).json().unwrap();
     assert!(usable.get("error").is_none(),"{usable}");
     assert_ne!(usable["result"]["isError"],true,"{usable}");
+    // A real hosted call distinguishes the intentional no-alias contract
+    // from an omitted-workspace rejection. No retired operation is invoked.
+    let retired: Value = request("tools/call", json!({"name":"compass_list","arguments":{
+        "workspace":created["workspace"]}})).json().unwrap();
+    assert_eq!(retired["error"]["code"], -32602, "{retired}");
+    assert_eq!(retired["error"]["message"], "Unknown tool", "{retired}");
     let before = Instant::now();
     app.begin_shutdown();
     while !app.is_finished() && before.elapsed() < Duration::from_secs(5) {

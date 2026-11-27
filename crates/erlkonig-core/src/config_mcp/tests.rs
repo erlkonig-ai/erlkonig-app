@@ -378,7 +378,7 @@ fn sharing_read_only_enrolls_same_roots_and_reads_without_write_or_delegation() 
         "workspace": id, "observation": owner.inspect()["observation"],
     })).is_err());
     assert!(call(&owner.dispatch, "erp_review", json!({"workspace":id, "month":"2026-09"})).is_ok());
-    call(&owner.dispatch, "compass_add", json!({"workspace":id,"title":"Shared evidence"})).unwrap();
+    call(&owner.dispatch, "goals_add", json!({"workspace":id,"title":"Shared evidence"})).unwrap();
     let before = owner.inspect();
     let shared = owner.share(&id, &recipient, "read_only", None).unwrap();
     let key = triblespace::core::signing_key_file::load_existing(&owner.config.binding.key).unwrap();
@@ -423,10 +423,10 @@ fn sharing_read_only_enrolls_same_roots_and_reads_without_write_or_delegation() 
     assert!(local.routes.values().all(|root| selected.sync.contains(root)));
     assert!(recipient.admission(&local).iter().all(|value| *value == (true, false)));
     // Native evidence acquisition and local enrollment did not copy member data.
-    assert!(!call(&recipient.dispatch, "compass_list", json!({"workspace":local_id})).unwrap().contains("Shared evidence"));
+    assert!(!call(&recipient.dispatch, "goals_list", json!({"workspace":local_id})).unwrap().contains("Shared evidence"));
     owner.replicate_to(&recipient, &original);
-    assert!(call(&recipient.dispatch, "compass_list", json!({"workspace":local_id})).unwrap().contains("Shared evidence"));
-    assert!(call(&recipient.dispatch, "compass_add", json!({"workspace":local_id,"title":"Denied write"})).is_err());
+    assert!(call(&recipient.dispatch, "goals_list", json!({"workspace":local_id})).unwrap().contains("Shared evidence"));
+    assert!(call(&recipient.dispatch, "goals_add", json!({"workspace":local_id,"title":"Denied write"})).is_err());
     assert!(call(&recipient.dispatch, "erp_review", json!({"workspace":local_id,"month":"2026-09"})).is_ok());
     assert!(call(&recipient.dispatch, "erp_account_add", json!({
         "workspace":local_id, "label":"Denied ERP write", "actor":format!("{:X}",genid().id),
@@ -477,12 +477,12 @@ fn sharing_read_write_admits_authored_commit_and_opt_in_delegation_is_bounded() 
     assert_eq!(recipient.inspect()["node_id"], hex::encode(recipient.config.binding.signer));
     assert_eq!(std::fs::read(&recipient.config.binding.key).unwrap(), key_bytes);
     assert!(recipient.admission(&local).iter().all(|value| *value == (true, true)));
-    call(&recipient.dispatch, "compass_add", json!({"workspace":local_id,"title":"Recipient authored"})).unwrap();
-    assert!(call(&recipient.dispatch, "compass_list", json!({"workspace":local_id})).unwrap().contains("Recipient authored"));
+    call(&recipient.dispatch, "goals_add", json!({"workspace":local_id,"title":"Recipient authored"})).unwrap();
+    assert!(call(&recipient.dispatch, "goals_list", json!({"workspace":local_id})).unwrap().contains("Recipient authored"));
     // The grantor already persisted recipient evidence; an imported recipient
     // foundation is admitted without re-signing or copying a key.
     recipient.replicate_to(&owner, &local);
-    assert!(call(&owner.dispatch, "compass_list", json!({"workspace":id})).unwrap().contains("Recipient authored"));
+    assert!(call(&owner.dispatch, "goals_list", json!({"workspace":id})).unwrap().contains("Recipient authored"));
     recipient.share(local_id, &third, "read_only", Some(true)).unwrap();
     let accepted_third = third.enroll_native(&recipient, &local).unwrap();
     let third_id = &accepted_third["workspace"]["workspace"];
@@ -576,7 +576,7 @@ fn sharing_freezes_current_bundle_and_never_resurrects_or_overwrites_enrollment(
     assert_eq!(after["runtime"], before["runtime"]);
     assert_eq!(key_before, std::fs::read(&recipient.config.binding.key).unwrap());
     assert_eq!(after["workspaces"], json!([]));
-    assert!(call(&recipient.dispatch, "compass_list", json!({})).is_err(), "no global default after accepting");
+    assert!(call(&recipient.dispatch, "goals_list", json!({})).is_err(), "no global default after accepting");
 }
 
 #[test]
@@ -828,15 +828,15 @@ fn zero_workspaces_bootstrap_without_paths_keys_tokens_or_grants() {
         proofs,
         "workspace creation issues no sharing grant"
     );
-    assert!(call(&f.dispatch, "compass_list", json!({})).is_err());
+    assert!(call(&f.dispatch, "goals_list", json!({})).is_err());
     call(
         &f.dispatch,
-        "compass_add",
+        "goals_add",
         json!({"workspace":id,"title":"first task"}),
     )
     .unwrap();
     assert!(
-        call(&f.dispatch, "compass_list", json!({"workspace":id}))
+        call(&f.dispatch, "goals_list", json!({"workspace":id}))
             .unwrap()
             .contains("first task")
     );
@@ -872,7 +872,7 @@ fn missing_label_is_redacted_and_arrival_invalidates_stateless_observation() {
     );
     let error = call(
         &f.dispatch,
-        "compass_list",
+        "goals_list",
         json!({"workspace":format!("{:X}",item.id)}),
     )
     .unwrap_err();
@@ -955,15 +955,15 @@ fn stale_invalid_edits_append_nothing_and_old_revisions_never_retarget() {
         .unwrap()["workspace"]
         .clone();
     assert_ne!(next, id);
-    assert!(call(&f.dispatch, "compass_list", json!({"workspace":id})).is_err());
-    call(&f.dispatch, "compass_list", json!({"workspace":next})).unwrap();
+    assert!(call(&f.dispatch, "goals_list", json!({"workspace":id})).is_err());
+    call(&f.dispatch, "goals_list", json!({"workspace":next})).unwrap();
     let proofs = f.proofs();
     f.call(
         "config_remove_workspace",
         json!({"observation":f.inspect()["observation"],"workspace":next}),
     )
     .unwrap();
-    assert!(call(&f.dispatch, "compass_list", json!({"workspace":next})).is_err());
+    assert!(call(&f.dispatch, "goals_list", json!({"workspace":next})).is_err());
     assert_eq!(f.inspect()["workspaces"], json!([]));
     assert_eq!(f.proofs(), proofs);
 }
@@ -989,16 +989,16 @@ fn existing_roots_use_explicit_roles_admission_and_never_grant_access() {
     let shared = f.call("config_create_workspace",json!({"observation":inspected["observation"],"label":"Same goals","routes":[{"role":"compass","root":root}]})).unwrap()["workspace"].clone();
     call(
         &f.dispatch,
-        "compass_add",
+        "goals_add",
         json!({"workspace":shared,"title":"same exact root"}),
     )
     .unwrap();
     assert!(
-        call(&f.dispatch, "compass_list", json!({"workspace":first}))
+        call(&f.dispatch, "goals_list", json!({"workspace":first}))
             .unwrap()
             .contains("same exact root")
     );
-    assert!(call(&f.dispatch, "wiki_list", json!({"workspace":shared})).is_err());
+    assert!(call(&f.dispatch, "knowledge_list", json!({"workspace":shared})).is_err());
     assert_eq!(f.proofs(), proofs);
     let denied = {
         let mut guard = f.config.node.lock().unwrap();
@@ -1123,7 +1123,7 @@ fn independent_concurrent_clients_never_share_a_workspace_selection() {
                 barrier.wait();
                 call(
                     &dispatch,
-                    "compass_add",
+                    "goals_add",
                     json!({"workspace":workspace,"title":title}),
                 )
                 .unwrap();
@@ -1134,8 +1134,8 @@ fn independent_concurrent_clients_never_share_a_workspace_selection() {
     for worker in workers {
         worker.join().unwrap();
     }
-    let a = call(&f.dispatch, "compass_list", json!({"workspace":a})).unwrap();
-    let b = call(&f.dispatch, "compass_list", json!({"workspace":b})).unwrap();
+    let a = call(&f.dispatch, "goals_list", json!({"workspace":a})).unwrap();
+    let b = call(&f.dispatch, "goals_list", json!({"workspace":b})).unwrap();
     assert!(a.contains("only alpha") && !a.contains("only beta"));
     assert!(b.contains("only beta") && !b.contains("only alpha"));
 }
@@ -1255,7 +1255,7 @@ fn native_grants_list_by_workspace_anchor_and_enroll_without_bootstrap() {
     let local_b = recipient.workspace(&accepted_b["workspace"]["workspace"]);
     assert_eq!(local_b.routes, original_b.routes);
     assert!(recipient.admission(&local_b).iter().all(|value| *value == (true, true)));
-    call(&recipient.dispatch, "compass_add", json!({"workspace":accepted_b["workspace"]["workspace"],"title":"Recipient authored"})).unwrap();
+    call(&recipient.dispatch, "goals_add", json!({"workspace":accepted_b["workspace"]["workspace"],"title":"Recipient authored"})).unwrap();
     assert_eq!(recipient.list_pending()["shares"], json!([]));
     assert_eq!(recipient.list_pending()["ungrouped"], json!([]));
 }

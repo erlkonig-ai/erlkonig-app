@@ -863,7 +863,19 @@ workspace and target through the existing dispatcher, validate bounded image
 output before rendering, and return PNGs. No GUI/GPU is opened during discovery or
 startup. Capture remains synchronous; disconnect does not cancel an admitted
 call, and the app's existing shutdown grace applies. Its image-byte bounds do not
-bound all GPU allocations or total render time. The viewer window adds no MCP tool. The pinned Faculty upgrade also brings upstream catalog changes, including Alarm; release acceptance compares tool names and schemas against the preceding app.
+bound all GPU allocations or total render time. The viewer window adds no MCP tool.
+
+The pinned Faculty upgrade adopts the upstream registered names without aliases:
+hard-coded `compass_*`, `wiki_*`, and `decide_*` calls must use the corresponding
+`goals_*`, `knowledge_*`, and `decisions_*` operations. Rediscover `tools/list`
+when updating clients; old names are refused, not rewritten. Search now advertises
+`knowledge_show` for opening Knowledge results. The `viewer_capture` targets
+`atlas`, `gauge`, `headspace`, `planner`, and `triage` become `schemas`,
+`knowledge-health`, `profiles`, `events`, and `diagnostics`; `rules` is added.
+Stored schema anchors, collection routes and legacy `wiki:` links are unchanged.
+Alarm was already registered in the preceding app. Release acceptance compares
+the actual tool names and schemas; this source adaptation is not a native
+package acceptance run.
 
 Mac and Linux route the new window through their existing application loops.
 Linux's status window remains independent. No desktop adapter is added to iOS.
@@ -893,7 +905,7 @@ ports, launch an owner, reconnect, retry a call or persist workspace selection.
 erlkonig serve
 erlkonig workspaces list --url http://127.0.0.1:PORT/
 erlkonig tools list --url http://127.0.0.1:PORT/ --output json
-erlkonig call wiki_list --url http://127.0.0.1:PORT/ --workspace 'My workspace' --json '{}'
+erlkonig call knowledge_list --url http://127.0.0.1:PORT/ --workspace 'My workspace' --json '{}'
 ```
 
 `call` accepts the owner's advertised tools and schemas, with no local Faculty
