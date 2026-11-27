@@ -42,14 +42,14 @@
     {
       "path": "faculties",
       "url": "https://github.com/triblespace/faculties.git",
-      "commit": "ee8405ec6b852ac71a6fd465cf783f7e1e0d1ecf",
-      "tree": "2dd815d92f85210a8587720f870baf6c47460f73",
+      "commit": "ab8d26fb7cf97f211a84986ed2ed536470ef0f07",
+      "tree": "f141ed5ee1bcaa93cbbf7ed1da3997e5384835ef",
       "public_ref_verified": true,
-      "public_ref_status": "Published and read back at review/dashboard-capture-labels-20261127, commitee8405ec6b852ac71a6fd465cf783f7e1e0d1ecf. Adds only the missing widgets guard on the capture-label test; prior app-graph qualification remains attributed to its parent. Full landing rerun and explicit named-widget execution are pending; native release qualification is separate.",
+      "public_ref_status": "Public main ab8d26fb7cf97f211a84986ed2ed536470ef0f07 verified after normal fast-forward on 2026-11-27. Includes reviewed viewers/capture, qualified Quota and unchanged eab6076f foundation/Vibe behavior. Same-source standalone full landing gates and 68 widget controls passed; this app composition and native release have separate qualification.",
       "overlay": {
         "path": "ci/overlays/faculties-wiki-images.patch",
         "sha256": "2e5fa95b7748b9edd1cb6aa40c1a6d54415b4259861ce7c8a35e1d2d004b7ae4",
-        "tree": "ffdd97ece0c32a41051ce99ab17bb800c316c391"
+        "tree": "2a7904298b1c651b20720ccb81ed4845c734416c"
       }
     },
     {
